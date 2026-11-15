@@ -754,7 +754,7 @@ fn run_first_userspace() {
     let chan_ref = Ref::new(chan);
     proc_box.set_notification_channel(chan_ref.clone());
     // pid 1's handles, closed again by any return before init is spawned.
-    let mut installed = Installed::<3>::new(global::get(), 1);
+    let mut installed = Installed::<4>::new(global::get(), 1);
     let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
     let Ok(notif_h) = installed.install(chan_ref.erase(), notif_rights) else {
         kprintln!("init: notification handle alloc failed");
@@ -884,21 +884,17 @@ fn run_first_userspace() {
         return;
     };
 
-    // The power node, to stop the machine, in `rdx`: init holds no right to give it away.
-    let power = DeviceNode::try_new_char(ResourceDescriptor::ZERO, nitrox_kernel::power::BACKEND);
-    let power_h = match power {
-        Ok(node) => match installed.install(ObjectRef::new(node), nitrox_kernel::power::INIT_RIGHTS) {
-            Ok(h) => h.bits(),
-            Err(_) => {
-                kprintln!("init: power node handle alloc failed");
-                0
-            }
-        },
-        Err(_) => {
-            kprintln!("init: power node alloc failed");
-            0
-        }
+    // The power node in `rdx`, to stop the machine, and init holds no right to give it away; the
+    // clock node in `rcx`, to set the wall clock, which init moves on and a view binds.
+    let mut node = |backend, rights| {
+        let node = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok();
+        node.and_then(|n| installed.install(ObjectRef::new(n), rights).ok()).map_or(0, |h| h.bits())
     };
+    let power_h = node(nitrox_kernel::power::BACKEND, nitrox_kernel::power::INIT_RIGHTS);
+    let clock_h = node(nitrox_kernel::clock::BACKEND, nitrox_kernel::clock::INIT_RIGHTS);
+    if power_h == 0 || clock_h == 0 {
+        kprintln!("init: no power node or no clock node (power={power_h}, clock={clock_h})");
+    }
 
     let proc_ref = Ref::new(proc_box);
 
@@ -906,7 +902,7 @@ fn run_first_userspace() {
         proc_ref,
         info.entry_point.as_u64(),
         info.stack_top.as_u64(),
-        [notif_h.bits(), ns_h.bits(), power_h, 0],
+        [notif_h.bits(), ns_h.bits(), power_h, clock_h],
     )
     .is_err()
     {

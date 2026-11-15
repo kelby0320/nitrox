@@ -92,10 +92,10 @@ mod tests {
     fn a_program_is_moved_both_ends_in_the_view_and_the_syscaps_it_is_given() {
         let root = root();
         let view_ns = Handle::<Namespace, NsMutable>::create().unwrap();
-        let started = spawn_program(&root, "ls", &view_ns, 5, SysCaps::SYSTEM_CLOCK).unwrap();
+        let started = spawn_program(&root, "ls", &view_ns, 5, SysCaps::REAL_TIME).unwrap();
         let args = mock::spawned().pop().unwrap();
         assert_eq!((args.handle_count, args.move_mask, args.arg0), (2, 0b11, 5));
-        assert_eq!((args.namespace, args.syscaps), (view_ns.raw().0, SysCaps::SYSTEM_CLOCK.bits()));
+        assert_eq!((args.namespace, args.syscaps), (view_ns.raw().0, SysCaps::REAL_TIME.bits()));
         assert_eq!(args.rights[..2], [u64::MAX, 0]);
         assert!(mock::is_open(view_ns.raw().0), "the view is the broker's still");
         assert!(mock::is_open(started.setup.raw().0) && mock::is_open(started.life.raw().0));

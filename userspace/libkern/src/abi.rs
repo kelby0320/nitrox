@@ -277,16 +277,16 @@ pub const CLOCK_MONOTONIC: u64 = 0;
 
 /// `ClockId::Realtime` — nanoseconds since the Unix epoch (UTC).
 ///
-/// Monotonic plus an offset anchored from the hardware RTC at boot. **`sys_clock_set` steps it**,
+/// Monotonic plus an offset anchored from the hardware RTC at boot. **A set steps it**,
 /// backwards as readily as forwards, so an interval is measured on [`CLOCK_MONOTONIC`]. Returns
 /// `Unsupported` on a machine whose RTC could not be read, until it is set.
 pub const CLOCK_REALTIME: u64 = 1;
 
-/// `sys_clock_set` set the clock, and the machine's hardware clock holds it: the next boot anchors
-/// to it.
+/// A write to the clock node set the clock, and the machine's hardware clock holds it: the next
+/// boot anchors to it. The write's `result`.
 pub const CLOCK_SET_KEPT: u64 = 0;
-/// `sys_clock_set` set the clock, but the hardware clock did not take the time — there is none,
-/// or it did not read back — so it lasts until the next boot.
+/// A write to the clock node set the clock, but the hardware clock did not take the time — there
+/// is none, or it did not read back — so it lasts until the next boot.
 pub const CLOCK_SET_THIS_BOOT: u64 = 1;
 
 /// One completion record `sys_wait` writes per signaled handle; 24 bytes.

@@ -304,18 +304,22 @@ construct:
 - Make the **power node** — the capability to stop the machine, a char `DeviceNode` — and a handle
   to it with `WRITE` and `INSPECT` and neither `DUPLICATE` nor `TRANSFER` (administration Part
   E.3, [`power.md`](power.md); a `SystemControl` object until 2026-11-15).
-- Spawn with exactly three handles — the notification channel in `rdi`, the namespace root in
-  `rsi`, and the power node in `rdx`.
+- Make the **clock node** — the capability to set the wall clock, a char `DeviceNode` — and a
+  handle to it with `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE` (`kernel/src/clock.rs`;
+  [`io-operation.md`](../spec/io-operation.md); a `SYSTEM_CLOCK` syscap on `sys_clock_set` until 2026-11-15).
+- Spawn with exactly four handles — the notification channel in `rdi`, the namespace root in
+  `rsi`, the power node in `rdx`, and the clock node in `rcx`.
 
-**init receives three handles and no more.** Everything else it obtains, it obtains by
+**init receives four handles and no more.** Everything else it obtains, it obtains by
 lookup in the namespace it was given, which is the capability model's opening move rather
-than an implementation detail. The third is the one thing a lookup must never yield: nothing
-binds it anywhere, and `init` cannot give it away.
+than an implementation detail. The last two are what a lookup must never yield: nothing binds
+either at boot. `init` cannot give the power node away; **it moves the clock node on** to
+`service-mgr`, as the fourth handoff of step 4, and holds it no longer.
 
 ## 5. init (pid 1)
 
-`_start(notif, root_ns, power, …)` in `userspace/init/src/main.rs`, which first checks that `rdx`
-holds a `DeviceNode` with `WRITE` and keeps it, saying `init: holds the power node`, then:
+`_start(notif, root_ns, power, clock, …)` in `userspace/init/src/main.rs`, which first checks that
+`rdx` holds a `DeviceNode` with `WRITE` and keeps it, saying `init: holds the power node`, then:
 
 1. **Read the manifest** — `/initramfs/etc/init.toml`, the whole object to its first NUL, as the
    storage service reads it (`libinittoml::manifest::text`), parsed into an ordered list of
@@ -334,8 +338,8 @@ holds a `DeviceNode` with `WRITE` and keeps it, saying `init: holds the power no
 3. **Bind the profile server at `/bin`**, by the same spawn → `Ready` → bind handshake, projecting
    the store. Critical-path: `service-mgr` and every server are spawned from `/bin`.
 4. **Hand off** to `service-mgr` — a root handle with `init`'s own rights and the root filesystem's
-   and profile server's endpoints, down a channel `init` then keeps as the **terminal channel** —
-   and stay resident, reaping.
+   and profile server's endpoints, and then the clock node, down a channel `init` then keeps as the
+   **terminal channel** — and stay resident, reaping.
 
 **The servers are `service-mgr`'s, since administration Part E.1a (2026-09-28).** `init` used to
 start nine more here, between the profile server and the hand-off: `auth-service`,

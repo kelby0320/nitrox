@@ -1,11 +1,9 @@
 //! Calls that pass what no libos type names: a handle that is not one, or of the wrong kind, a
-//! mapping that asks for no right, a handle listed twice, a lookup's own `PendingOperation`, and
-//! the monotonic clock.
+//! mapping that asks for no right, a handle listed twice, and a lookup's own `PendingOperation`.
 
 use libkern::{
-    CLOCK_MONOTONIC, IO_OPCODE_WRITE, IoOp, Rights, SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_CLOCK_SET,
-    SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_IO_SUBMIT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT,
-    syscall1, syscall2, syscall4, syscall5,
+    IO_OPCODE_WRITE, IoOp, Rights, SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_IO_SUBMIT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4, syscall5,
 };
 use libos::{Channel, Handle, MapReadWrite, Memory, Namespace, NsReadOnly, Only, Ref};
 
@@ -18,13 +16,6 @@ pub(crate) fn power(h: u64) -> i64 {
     // SAFETY: `op` is a live `IoOp` the kernel copies in; refused before anything happens, which
     // is the point.
     unsafe { syscall2(SYS_IO_SUBMIT, h, &op as *const IoOp as u64) }
-}
-
-/// What `sys_clock_set` answers for `ns` on the monotonic clock, which libos's `set_clock` never
-/// names.
-pub(crate) fn set_monotonic_clock(ns: u64) -> i64 {
-    // SAFETY: register-only syscall.
-    unsafe { syscall2(SYS_CLOCK_SET, CLOCK_MONOTONIC, ns) }
 }
 
 /// What mapping `len` bytes of `h` asking for `rights` answers: the address, unmapped at once, or

@@ -150,16 +150,17 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   through the same `PendingOperation`; no device-specific syscall exists.
 
   **A char device takes a `Write` only where its driver does** — today a keyboard's raw node,
-  for its lights ([Keyboard lights](#keyboard-lights)), and the power node
-  ([below](#the-power-node)). Every other char node refuses one,
-  `Unsupported`, synchronously and with no PO: the console's output stays on the kernel log
-  path, and a mouse has nothing to set. **A zero-length `Write` is the exception**, to this and
+  for its lights ([Keyboard lights](#keyboard-lights)), the power node
+  ([below](#the-power-node)) and the clock node ([below](#the-clock-node)). Every other char
+  node refuses one, `Unsupported`, synchronously and with no PO: the console's output stays on
+  the kernel log path, and a mouse has nothing to set. **A zero-length `Write` is the exception**, to this and
   to everything below: like every zero-length request it completes at once, `result` `0`,
   before any device's rule is asked (`length` above).
 
   Today's char nodes are the serial console at `/dev/console`, the raw input devices at
   `/dev/input/raw/<n>`, the registry's change node at `/dev/registry/changes`, the kernel
-  generator at `/dev/entropy`, and the power node, which is bound nowhere.
+  generator at `/dev/entropy`, the power node, which is bound nowhere, and the clock node, which
+  is bound nowhere at boot.
 
   **`/dev/entropy` answers at most 256 bytes a read, and may answer none.** A read before the
   generator is seeded, which only a CPU with neither `RDSEED` nor `RDRAND` sees, waits for the
@@ -242,6 +243,22 @@ first and completes it later. The machine is stopping, so there is no PO to hand
 machine that cannot stop for want of memory to make one is the worse outcome. It is also the one
 write that may wait inside the call, on its flush, which is bounded. A write needs `WRITE` on the
 node and `MAP_READ` on the buffer, as any write does.
+
+### The clock node
+
+*(2026-11-15.)* **Setting the wall clock is a `Write` to the clock node.** One char node, made at
+boot and handed to `init` in `rcx` with `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE`, and bound
+in no namespace at boot. It moves on, a hop at a time, to `service-mgr` and then the view broker,
+whose `clock` grant binds it at `/dev/clock` in a program's view. A `Write` of **exactly eight
+bytes**, little-endian nanoseconds since the Unix epoch, **in 2000-01-01 to 2099-12-31**, steps
+`Realtime` and writes the RTC under it. Any other length, or a time outside the range, is refused
+`InvalidArgument`. A read is `Unsupported`.
+
+**It is an ordinary write**: a PO is made, and completes at once. Its **`result` is the clock's
+answer, not a byte count**: `CLOCK_SET_KEPT` (`0`) when the RTC read back what was written, or
+`CLOCK_SET_THIS_BOOT` (`1`) when it did not, and the clock then lasts until the next boot. The
+kernel logs each set (`wall clock: set to <secs> (Unix epoch seconds, UTC); …`). A write needs
+`WRITE` on the node and `MAP_READ` on the buffer, as any write does.
 
 ### The registry's change node
 

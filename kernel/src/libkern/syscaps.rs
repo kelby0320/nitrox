@@ -28,14 +28,12 @@ impl SysCaps {
     pub const PHYSICAL_MEMORY: SysCaps = SysCaps(1 << 2);
     /// Request the `RealTime` scheduling class.
     pub const REAL_TIME: SysCaps = SysCaps(1 << 3);
-    /// Set the realtime-clock offset (time-sync service).
-    pub const SYSTEM_CLOCK: SysCaps = SysCaps(1 << 4);
     /// Manage the audit subsystem.
     pub const AUDIT_CONTROL: SysCaps = SysCaps(1 << 5);
 
     /// The bitmask of all defined capabilities — the set the kernel grants init at boot.
     /// Update alongside the constants above.
-    const ALL_BITS: u64 = (1 << 6) - 1;
+    const ALL_BITS: u64 = ((1 << 6) - 1) & !(1 << 4);
 
     /// The empty set (no authority).
     pub const fn empty() -> Self {
@@ -107,7 +105,7 @@ mod tests {
     #[test]
     fn empty_and_all() {
         assert_eq!(SysCaps::empty().bits(), 0);
-        assert_eq!(SysCaps::all().bits(), 0b11_1111); // six caps
+        assert_eq!(SysCaps::all().bits(), 0b10_1111, "five caps, bit 4 the clock's until it was a node");
         assert!(SysCaps::all().contains(SysCaps::BIND_NAMESPACE));
         assert!(!SysCaps::empty().contains(SysCaps::BIND_NAMESPACE));
     }
@@ -119,7 +117,6 @@ mod tests {
             SysCaps::BIND_NAMESPACE,
             SysCaps::PHYSICAL_MEMORY,
             SysCaps::REAL_TIME,
-            SysCaps::SYSTEM_CLOCK,
             SysCaps::AUDIT_CONTROL,
         ];
         let mut seen = 0u64;

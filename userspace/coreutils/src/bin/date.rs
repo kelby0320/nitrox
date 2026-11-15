@@ -12,7 +12,7 @@
 //!   machine whose RTC could not be read, and this passes that through instead of printing 1970.
 //! - **`--set` takes one form, in UTC**: `YYYY-MM-DDTHH:MM:SSZ` ([`coreutils::time::parse_utc`]),
 //!   from 2000 to 2099, which is what the hardware clock holds. It needs the `clock` grant — the
-//!   kernel's `SYSTEM_CLOCK`, given at spawn — and then reports the time as `date` does, so what
+//!   clock node a view binds at `/dev/clock` — and then reports the time as `date` does, so what
 //!   it prints is the clock read after the set. A hardware clock that did not take the time is
 //!   said, since the time then lasts until the next boot.
 
@@ -24,11 +24,12 @@ extern crate alloc;
 use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use coreutils::time::{civil_from_unix, format_civil, parse_utc};
+use libkern::Rights;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
 use libos::boot::Start;
-use libos::system::{ClockSet, set_clock};
-use libos::{exit, log, time};
+use libos::system::{CLOCK_PATH, ClockSet, set_clock};
+use libos::{Resource, WriteOnly, block_on, exit, log, time};
 use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -116,9 +117,11 @@ fn set(stage: &Stage, time: &str) {
     // `parse_utc` reads four digits of year, so a time before 1970 is the only negative, and the
     // kernel refuses it with everything else outside 2000-2099.
     let ns = u64::try_from(secs).unwrap_or(0).saturating_mul(1_000_000_000);
-    // The kernel checks the clock, the time and `SYSTEM_CLOCK`.
-    match set_clock(ns) {
-        Err(e) if e.code() == KError::NoAccess => stage.die(
+    // The clock node is the authority, bound only where the `clock` grant put it; the kernel
+    // checks the time.
+    let clock = block_on(stage.namespace.lookup::<Resource, WriteOnly>(CLOCK_PATH, Rights::WRITE));
+    match clock.and_then(|clock| set_clock(&clock, ns)) {
+        Err(e) if e.code() == KError::NotFound || e.code() == KError::NoAccess => stage.die(
             b"date: cannot set the clock here -- that needs the clock grant: `with admin date --set ...`\n",
             EXIT_FAILURE,
         ),

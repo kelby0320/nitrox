@@ -100,15 +100,15 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `28` | `sys_io_submit` |
 | `30` | `sys_ns_enumerate` |
 | `36` | `sys_process_terminate` |
-| `41` | `sys_clock_set` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. **Thirteen are
+Numbers are assigned in landing order, not in the order syscalls appear below. **Fourteen are
 vacant**, and answer `Unsupported`, as any number nothing holds does, until they are assigned
 again: `31` to `35`, `38` and `39` went when a resolve came to carry its operation and a file's
 flush became an `io_submit` (pre-Phase-7 E.7); `18` (`thread_set_affinity`) and `29`
 (`io_cancel`) went for want of a caller, `26` and `27` (`entropy_create`, `entropy_read`) when
 entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9); `40` (`power`) when the power node
-came to take a one-byte write (2026-11-15).
+came to take a one-byte write, and `41` (`clock_set`) when the clock became a node (both
+2026-11-15).
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -588,28 +588,10 @@ Reads the current value of the specified clock (Monotonic, Realtime, ProcessCpu,
 
 **`Monotonic` and `Realtime` are serviced**; `ProcessCpu` and `ThreadCpu` return `Unsupported`, since the per-CPU clocks need scheduler CPU accounting (`TODO(sched-acct)`). `Realtime` is the monotonic counter plus an offset anchored from the RTC at boot (2026-07-24), and returns `Unsupported` on a machine whose RTC could not be read, until something sets it. The selector and the `out` pointer are validated before any clock is read, so an unknown `ClockId` returns `InvalidArgument` and an unsupported clock returns `Unsupported` without touching `*out`. (This paragraph said `Monotonic` only until 2026-09-29.)
 
-```rust
-fn sys_clock_set(clock: ClockId, ns: u64) -> isize
-```
-**Set the wall clock to `ns` nanoseconds since the Unix epoch, and the machine's RTC under it**
-(administration Part E.5), so the next boot anchors to what was set. (Syscall number `41`.)
-
-- `clock` must be `Realtime`, or `InvalidArgument`: `Monotonic` never steps, and the CPU clocks
-  are counts, not times.
-- `ns` must fall in 2000-01-01T00:00:00Z to 2099-12-31T23:59:59Z, or `InvalidArgument`. That is
-  what the RTC holds on every machine: a two-digit year, read as 2000–2099 where the FADT names no
-  century register.
-- Then **`SYSTEM_CLOCK`**, or `NoAccess`. The arguments come first, and say nothing about the
-  clock, so both refusals are reachable without the capability.
-
-The offset is stored first, then the RTC written in the chip's own BCD or binary, 12- or 24-hour
-form with `SET` holding its updates, and read back. Returns `CLOCK_SET_KEPT` (`0`) when the chip
-read back within two seconds of what was written, or `CLOCK_SET_THIS_BOOT` (`1`) when it did not:
-the clock is set either way, and in the second case lasts until the next boot. Every set is logged
-with the second it set and which of the two it was.
-
-**It steps `Realtime`**, backwards as readily as forwards. An interval is measured on `Monotonic`,
-which nothing sets.
+**No syscall sets the clock** (`sys_clock_set`, number `41`, until 2026-11-15). The **clock node**
+does: a char node `init` holds from boot and moves on to the view broker, written with
+**eight bytes**, little-endian nanoseconds since the Unix epoch, by `sys_io_submit`
+([`io-operation.md`](io-operation.md) § *The clock node*). `sys_clock_read` is unchanged.
 
 ```rust
 fn sys_device_map_mmio(

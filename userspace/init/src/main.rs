@@ -14,7 +14,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use init::manifest::{self, BindSpec, Manifest, Mode, MountSpec};
 use libkern::{
-    KError, KIND_CHILD_EXITED, KOBJ_DEVICE_NODE, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH,
+    KError, KIND_CHILD_EXITED, KOBJ_DEVICE_NODE, RawHandle, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH,
 };
 use libos::FLUSH_TIMEOUT_NS;
 use libos::boot::Start;
@@ -37,6 +37,7 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 /// Init's root namespace, with every right: it binds the mounts and `/bin` in it.
 type Root = Handle<Namespace, NsMutable>;
 type Endpoint = Handle<Channel, Only>;
+type Clock = Handle<Resource, WriteOnly>;
 
 /// What a shutdown's [`finish`] needs: init's mounts, as made, and the power node.
 struct Finish {
@@ -57,14 +58,12 @@ struct Kept {
 /// their `rdx`. They share init's root, `LOOKUP` only, and hold no ambient capabilities.
 const SERVER_CONTROL: Rights =
     Rights::from_bits(Rights::SEND.bits() | Rights::RECV.bits() | Rights::TRANSFER.bits() | Rights::WAIT.bits());
-/// The service manager's **handoff channel** end: init sends the bind-righted root, then the
-/// fs-server and profile-server endpoints, so it carries `TRANSFER`, to hand those on, and
-/// `SEND`/`RECV`/`WAIT`.
+/// The service manager's **handoff channel** end: init sends the bind-righted root, the
+/// fs-server and profile-server endpoints and the clock node, so it carries `TRANSFER`, to hand
+/// those on, and `SEND`/`RECV`/`WAIT`.
 const SERVICE_MGR_HANDOFF: Rights = Rights::from_bits(SERVER_CONTROL.bits() | Rights::DUPLICATE.bits());
-/// The service manager's capabilities: `BIND_NAMESPACE`, its supervisor capability, and
-/// `SYSTEM_CLOCK`, only to pass to the view broker.
-const SERVICE_MGR_CAPS: SysCaps =
-    SysCaps::from_bits_truncate(SysCaps::BIND_NAMESPACE.bits() | SysCaps::SYSTEM_CLOCK.bits());
+/// The service manager's capability: `BIND_NAMESPACE`, its supervisor capability.
+const SERVICE_MGR_CAPS: SysCaps = SysCaps::BIND_NAMESPACE;
 
 /// Resolve `path` to its ELF image and spawn it, granting `grant` as its `rdx`: the child, or
 /// `None`. The image closes as it drops; the child has its own copy. A refused spawn hands its
@@ -387,11 +386,16 @@ fn spawn_eshell(root: &Root) {
 /// Spawn the service manager, the normal boot handoff, and hand it the endpoints: the terminal
 /// channel, or `None`. Its process handle closes at once: the channel closing names its death.
 /// Only one grant reaches a child (`rdx`), so the endpoints travel on a channel.
-fn spawn_service_mgr(root: &Root, fs_endpoint: Option<Endpoint>, profile_endpoint: Endpoint) -> Option<Endpoint> {
+fn spawn_service_mgr(
+    root: &Root,
+    fs_endpoint: Option<Endpoint>,
+    profile_endpoint: Endpoint,
+    clock: Option<Clock>,
+) -> Option<Endpoint> {
     log::write(b"init: handing off to service manager\n");
-    // **The terminal channel.** Depth 4: three handoffs, queued before `service-mgr` runs — a ring
+    // **The terminal channel.** Depth 5: four handoffs, queued before `service-mgr` runs — a ring
     // shorter than the sends drops the last one silently — and then the ops it sends back.
-    let Ok((init_end, child_end)) = Handle::pair(4) else {
+    let Ok((init_end, child_end)) = Handle::pair(5) else {
         log::write(b"init: service-mgr handoff channel FAIL\n");
         return None;
     };
@@ -404,7 +408,8 @@ fn spawn_service_mgr(root: &Root, fs_endpoint: Option<Endpoint>, profile_endpoin
     }
     // The handoffs, in the order service-mgr receives them: 1. **the root, with init's own rights**
     // (`BIND` and `UNBIND`: a spawned process gets only a lookup-only root, and `service-mgr` binds
-    // the servers); 2. the root filesystem's endpoint; 3. the profile server's.
+    // the servers); 2. the root filesystem's endpoint; 3. the profile server's; 4. **the clock
+    // node, moved**, so this process holds nothing it had only to pass on.
     let root_copy = root.duplicate(Rights::from_bits(u64::MAX)).ok();
     if root_copy.is_none() {
         log::write(b"init: root handle duplicate FAIL -- service-mgr will bind nothing\n");
@@ -412,6 +417,7 @@ fn spawn_service_mgr(root: &Root, fs_endpoint: Option<Endpoint>, profile_endpoin
     send_handle(&init_end, root_copy);
     send_handle(&init_end, fs_endpoint);
     send_handle(&init_end, Some(profile_endpoint));
+    send_handle(&init_end, clock);
     Some(init_end)
 }
 
@@ -444,11 +450,11 @@ fn send_handle<T, M>(ctrl: &Endpoint, handle: Option<Handle<T, M>>) {
 fn supervise(
     notify: Option<Handle<Notify, Only>>,
     root: Root,
-    fs_endpoint: Option<Endpoint>,
-    profile_endpoint: Endpoint,
+    (fs_endpoint, profile_endpoint): (Option<Endpoint>, Endpoint),
+    clock: Option<Clock>,
     held: Finish,
 ) -> ! {
-    let Some(terminal) = spawn_service_mgr(&root, fs_endpoint, profile_endpoint) else {
+    let Some(terminal) = spawn_service_mgr(&root, fs_endpoint, profile_endpoint, clock) else {
         // No `service-mgr` is no server at all (`auth-service`, `logging-service`): console free.
         emergency(notify, root, held);
     };
@@ -637,13 +643,17 @@ fn keep_power(h: Option<Handle<Resource, WriteOnly>>) -> Option<Power<WriteOnly>
     }
 }
 
-/// Registers: `rdi` = notification channel, `rsi` = root namespace, `rdx` = the power node.
+/// Registers: `rdi` = notification channel, `rsi` = root namespace, `rdx` = the power node, `rcx`
+/// = the clock node, which goes on to `service-mgr`.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, power: u64, arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, power: u64, clock: u64) -> ! {
     log::write(b"init: up (pid 1)\n");
     // SAFETY: the kernel's bootstrap registers, read once, here.
-    let mut start = unsafe { Start::from_registers(notif, root_ns, power, arg0) };
+    let mut start = unsafe { Start::from_registers(notif, root_ns, power, clock) };
     let kept_power = keep_power(start.take_handle0());
+    // SAFETY: `rcx` is the kernel's handle to the clock node, this process's and wrapped nowhere
+    // else; `0` if it made none.
+    let clock: Option<Clock> = (clock != 0).then(|| unsafe { Handle::from_raw(RawHandle(clock), Rights::empty()) });
     let count = (notif != 0) as u64 + (root_ns != 0) as u64 + (power != 0) as u64;
     Line::new()
         .s(b"init: received ")
@@ -693,7 +703,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, power: u64, arg0: u64) -> ! {
     // starts. The test image's self-test, terminal and test clients are declarations too, which
     // `check-display` and `check-terminal` need without a login, so this file is identical in both
     // images; `nxterm` precedes `ui-testclient`, which raises its windows over the terminal's.
-    supervise(notify, root, fs_endpoint, profile_endpoint, held);
+    supervise(notify, root, (fs_endpoint, profile_endpoint), clock, held);
 }
 
 #[panic_handler]

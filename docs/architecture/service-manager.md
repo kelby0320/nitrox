@@ -59,7 +59,7 @@ kernel_main
        ├─ read /etc/init.toml, process critical-path mounts (fs-server-ext4 → bind /)
        ├─ read /system/current-generation, spawn + bind the system profile server
        ├─ spawn service-mgr; hand it a full-rights root,     ← THE HANDOFF
-       │  the fs and profile endpoints, down the terminal channel
+       │  the fs and profile endpoints and the clock node, down the terminal channel
        └─ reap loop (orphans + the terminal channel)
                                     │
 service-mgr ────────────────────────┘
@@ -234,9 +234,9 @@ servers is an emergency too** (`bringup::unfit`, PR #340 review): a critical dec
 skipped, a missing or empty file, or none critical — each would otherwise go straight to a login
 chain with no `auth-service` behind it. Every skipped declaration is logged by name.
 
-**The terminal channel** is the handoff channel `init` keeps open: three handoffs down it — a root
-handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
-then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
+**The terminal channel** is the handoff channel `init` keeps open: four handoffs down it — a root
+handle with `init`'s rights, the root filesystem's and the profile server's endpoints, and the
+clock node — and then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
 **`TERMINAL_OP_FINISH`** (Part E.4a), with a byte saying whether to reboot, is a shutdown's last
 word to `init`, which unmounts its own filesystems and writes the power node, sent as a shutdown's
 last step (§ *Shutdown*, Part E.4b).
@@ -323,10 +323,15 @@ amplify — a child can never gain a capability its parent lacks).
 | SysCap | service-mgr holds? | Why |
 |---|---|---|
 | `BIND_NAMESPACE` | **yes — own use** | It registers each service's endpoint into the system namespace (the RS protocol's bind step). This is the defining supervisor capability. It also *re-delegates* `BIND_NAMESPACE` to **both login supervisors** — `session-mgr` and, since M7 Part D, `desktop-session-mgr` — each of which needs it to construct a session namespace. |
-| `SYSTEM_CLOCK` | **yes — pass-through** (since administration Part E.5) | Not used by service-mgr; held so it can *delegate* it to the view broker, whose declaration asks for it and whose `clock` grant passes it to a program at spawn (delegation can only attenuate — to grant a cap, you must hold it). `syscaps.md` follows the chain. |
-| `LOAD_MODULE` | **no**, until there is a module loader | This table said *yes — pass-through, for the device manager* until 2026-09-29, and `init` has never given it: its spawn of service-mgr asks for `BIND_NAMESPACE` alone, and now `SYSTEM_CLOCK`. Nothing loads a module, so nothing needs it passed on. |
+| `LOAD_MODULE` | **no**, until there is a module loader | This table said *yes — pass-through, for the device manager* until 2026-09-29, and `init` has never given it: its spawn of service-mgr asks for `BIND_NAMESPACE` alone. Nothing loads a module, so nothing needs it passed on. |
 | `PHYSICAL_MEMORY` | **no** | Only `init` keeps this, for extreme recovery. A supervisor has no business with raw physical memory (called out explicitly in `userspace/init/CLAUDE.md`). |
 | `REAL_TIME` / `AUDIT_CONTROL` | **no** | No service-mgr need; a service wanting `REAL_TIME` acquires it another way, `AUDIT_CONTROL` belongs to the audit service's own grant path. |
+
+**The clock is not a syscap** (`SYSTEM_CLOCK` until 2026-11-15). `service-mgr` holds the clock node,
+the fourth handoff, and **moves it on** to the one service whose declaration says `clock = true`,
+the view broker, as a message on its control channel right after its spawn (after the log
+endpoint, for a non-server). It holds it until then and does not use it
+([`service-toml-schema.md`](../spec/service-toml-schema.md) § `clock`).
 
 Each *service* receives `service_syscaps = servicemgr_syscaps & decl.syscaps`, enforced
 **once**, by the kernel at spawn time (`child = parent & args`). That masking is silent: a

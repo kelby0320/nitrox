@@ -55,10 +55,9 @@ pub mod policy {
         /// at `/dev/power`. A session opened there takes `Shutdown` and nothing else. The seeded
         /// policy gives it to everyone, for `shutdown` only, as a desktop's power button would.
         Power,
-        /// **Setting the clock**: `SYSTEM_CLOCK` in the program's spawn, which `sys_clock_set`
-        /// asks for. The one grant that binds nothing — the kernel checks a process-wide
-        /// capability here, not a handle — so the program's children get it only if it passes it
-        /// on.
+        /// **Setting the clock**: the clock node, bound at `/dev/clock`, which a program writes the
+        /// time to. A direct handle with `TRANSFER`, so a program in the view can hand it on, as
+        /// it can a disk.
         Clock,
         /// **Reading the log back**: the logging service's read endpoint, bound at `/dev/logs`,
         /// where a resolve opens a session that answers `Log::Read` — every service's records,

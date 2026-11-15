@@ -211,12 +211,6 @@ pub fn timer_set(timer: u64, at: u64, interval: u64) -> i64 {
     unsafe { syscall3(libkern::SYS_TIMER_SET, timer, at, interval) }
 }
 
-/// `sys_clock_set(CLOCK_REALTIME, ns)`: `CLOCK_SET_KEPT` or `CLOCK_SET_THIS_BOOT`, or an error.
-pub fn clock_set(ns: u64) -> i64 {
-    // SAFETY: a register-only call.
-    unsafe { syscall2(libkern::SYS_CLOCK_SET, libkern::CLOCK_REALTIME, ns) }
-}
-
 /// `sys_test_exit(code)`: under the kernel's test harness it ends the run, and returns elsewhere.
 pub fn test_exit(code: u64) -> i64 {
     // SAFETY: a register-only call.

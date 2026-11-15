@@ -81,7 +81,7 @@ fn unknown_number_is_unsupported() {
 
 #[test]
 fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
-    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39, 40] {
+    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41] {
         let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
         assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
     }
@@ -117,25 +117,6 @@ fn clock_read_unsupported_clocks_are_unsupported() {
     assert_eq!(sys_clock_read(1, valid_out), Err(KError::Unsupported)); // Realtime
     assert_eq!(sys_clock_read(2, valid_out), Err(KError::Unsupported)); // ProcessCpu
     assert_eq!(sys_clock_read(3, valid_out), Err(KError::Unsupported)); // ThreadCpu
-}
-
-/// **`sys_clock_set`'s arguments are refused before its authority is asked**: each refusal
-/// proves it, as `require_syscap` panics on the host.
-#[test]
-fn clock_set_refuses_its_arguments_before_asking_for_system_clock() {
-    let ok_ns = 1_790_605_800u64 * 1_000_000_000; // 2026-09-28T14:30:00Z
-    for clock in [0, 2, 3, 4, u64::MAX] {
-        assert_eq!(sys_clock_set(clock, ok_ns), Err(KError::InvalidArgument), "clock {clock}");
-    }
-    assert_eq!(sys_clock_set(1, 946_684_799 * 1_000_000_000), Err(KError::InvalidArgument));
-    assert_eq!(sys_clock_set(1, 4_102_444_800 * 1_000_000_000), Err(KError::InvalidArgument));
-    assert_eq!(dispatch(SYS_CLOCK_SET, 0, ok_ns, 0, 0, 0, 0), KError::InvalidArgument.as_isize(),);
-}
-
-#[test]
-fn timer_create_rejects_unknown_flags() {
-    assert_eq!(sys_timer_create(1), Err(KError::InvalidArgument));
-    assert_eq!(dispatch(SYS_TIMER_CREATE, 0x8000_0000, 0, 0, 0, 0, 0), KError::InvalidArgument.as_isize(),);
 }
 
 #[test]

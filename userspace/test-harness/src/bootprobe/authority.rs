@@ -1,7 +1,7 @@
 //! Binds, derived namespaces, and the calls a missing syscap refuses.
 
 use super::*;
-use libos::{MapReadWrite, Memory, NsMutable, ReadWrite, Resource};
+use libos::{MapReadWrite, Memory, NsMutable, ReadWrite, Resource, WriteOnly};
 
 /// **A stop from anything but `init` is refused**, and the machine goes on: the halt byte written
 /// to no handle, to a namespace this process may only look up in, and to a disk it may write — a
@@ -43,28 +43,18 @@ pub(super) fn power_refused_test(root: Root<'_>) -> bool {
     true
 }
 
-/// **`sys_clock_set` is refused without `SYSTEM_CLOCK`**, which this process does not hold, and
-/// the clock does not move: a set to 2031 refused `NoAccess`, and the clock read either side of it
-/// within a minute of itself. Before the authority, the arguments: `Monotonic` never steps, and
-/// 1999 is before what the hardware clock holds — both `InvalidArgument`.
-pub(super) fn clock_set_refused_test() -> bool {
-    use libkern::KError;
-    use libos::system::set_clock;
+/// **The clock is set only where the `clock` grant bound its node**: the root, which this process
+/// was spawned with, binds no `/dev/clock`, as a kernel node there would give it to every process,
+/// and the clock does not move: read either side of the lookup, within a minute of itself.
+pub(super) fn clock_set_refused_test(root: Root<'_>) -> bool {
+    use libos::system::CLOCK_PATH;
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: clock FAIL: ").s(why).end();
         false
     };
-    let set = |secs: u64| set_clock(secs * 1_000_000_000).map_err(|e| e.code());
-    let in_2031 = 1_925_078_400; // 2031-01-02T00:00:00Z
-    if refused::authority::set_monotonic_clock(in_2031 * 1_000_000_000) != KError::InvalidArgument.as_i32() as i64 {
-        return fail(b"setting the monotonic clock was not refused InvalidArgument");
-    }
-    if set(946_684_799) != Err(KError::InvalidArgument) {
-        return fail(b"a time in 1999 was not refused InvalidArgument");
-    }
     let before = time::wall().ok();
-    if set(in_2031) != Err(KError::NoAccess) {
-        return fail(b"a set without SYSTEM_CLOCK was not refused NoAccess");
+    if lookup::<Resource, WriteOnly, _>(root, CLOCK_PATH, Rights::WRITE).is_ok() {
+        return fail(b"the root binds a clock node");
     }
     let (Some(before), Some(after)) = (before, time::wall().ok()) else {
         return fail(b"the wall clock does not read");
@@ -72,7 +62,7 @@ pub(super) fn clock_set_refused_test() -> bool {
     if after < before || after - before > 60_000_000_000 {
         return fail(b"the wall clock moved across a refused set");
     }
-    log::write(b"boot-probe: sys_clock_set refused the monotonic clock, 1999 and no SYSTEM_CLOCK ok\n");
+    log::write(b"boot-probe: the root binds no clock node, and the clock did not move ok\n");
     true
 }
 

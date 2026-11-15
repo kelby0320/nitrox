@@ -108,7 +108,7 @@ it. A revision-1 FADT ends at byte 116, before the reset register:
 The hardware report prints them as four `fadt:` lines, so the laptop's report says whether it can
 reset by register. The RTC reads the century register when the FADT names one, in the chip's own
 BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as before. **A set writes
-it** (`sys_clock_set`, Part E.5), in the same encoding — which is why a set is refused outside
+it** (the clock node's write; `sys_clock_set` until 2026-11-15), in the same encoding — which is why a set is refused outside
 2000–2099: a machine with no century register would read a later year back as another century.
 
 ## What gates it

@@ -143,7 +143,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U64Const,
         one_sided: &[],
     },
-    // What `sys_clock_set` says: the clock set and kept by the RTC, or
+    // What a write to the clock node says: the clock set and kept by the RTC, or
     // set for this boot only. The kernel's `u64` consts in `clock.rs` are these alone; `libkern`
     // keeps them beside `CLOCK_REALTIME`.
     AbiFamily {

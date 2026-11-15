@@ -4,9 +4,9 @@ use libkern::{
     CLOCK_SET_THIS_BOOT, IO_OPCODE_WRITE, IoOp, KError, POWER_HALT, POWER_REBOOT, TEST_EXIT_FAILURE, TEST_EXIT_SUCCESS,
 };
 
-use crate::error::{Error, Result, check};
-use crate::exec::Op;
-use crate::handle::{CanWrite, Handle, MapReadWrite, Memory, Resource};
+use crate::error::{Error, Result};
+use crate::exec::{Op, block_on};
+use crate::handle::{CanWrite, Handle, MapReadWrite, Memory, Ref, Resource};
 use crate::sys;
 
 /// How to stop the machine.
@@ -68,12 +68,17 @@ pub enum ClockSet {
     ThisBoot,
 }
 
-/// Set the wall clock to `ns` since the Unix epoch, stepping it either way: refused `NoAccess`
-/// without the `SYSTEM_CLOCK` grant, and `InvalidArgument` for a time outside 2000 to 2099.
-pub fn set_clock(ns: u64) -> Result<ClockSet> {
-    // TODO(surface-shape): a write to the clock node, once the clock is a char node.
-    let r = check(sys::clock_set(ns))?;
-    Ok(if r == CLOCK_SET_THIS_BOOT { ClockSet::ThisBoot } else { ClockSet::Kept })
+/// Where a view the `clock` grant made binds the clock node.
+pub const CLOCK_PATH: &str = "/dev/clock";
+
+/// Set the wall clock to `ns` since the Unix epoch, stepping it either way, by a write of its
+/// eight bytes to `clock`, the clock node: refused `NoAccess` without `WRITE`, and
+/// `InvalidArgument` for a time outside 2000 to 2099.
+pub fn set_clock<'a, M: CanWrite + 'a>(clock: impl Into<Ref<'a, Resource, M>>, ns: u64) -> Result<ClockSet> {
+    let page = Handle::<Memory, MapReadWrite>::create(8)?;
+    page.map(8)?.write_from(0, &ns.to_le_bytes())?;
+    let answer = block_on(clock.into().write(&page, 0, 0, 8))?;
+    Ok(if answer as u64 == CLOCK_SET_THIS_BOOT { ClockSet::ThisBoot } else { ClockSet::Kept })
 }
 
 /// Report a test run's verdict to the harness that booted the machine, which ends the run: this
@@ -99,14 +104,15 @@ mod tests {
     #[test]
     fn a_clock_set_says_how_far_it_reached() {
         mock::reset();
+        let clock = control(mock::clock_node());
         let ns = 1_900_000_000_000_000_000;
-        assert_eq!(set_clock(ns).map_err(|e| e.code()), Ok(ClockSet::Kept));
+        assert_eq!(set_clock(&clock, ns).map_err(|e| e.code()), Ok(ClockSet::Kept));
         assert!(crate::time::wall().unwrap() >= ns, "the wall clock reads it");
         mock::answer_next_clock_set(CLOCK_SET_THIS_BOOT as i64);
-        assert_eq!(set_clock(ns).map_err(|e| e.code()), Ok(ClockSet::ThisBoot));
-        mock::answer_next_clock_set(KError::NoAccess as i64);
-        assert_eq!(set_clock(ns).map_err(|e| e.code()), Err(KError::NoAccess), "without the grant");
-        assert_eq!(set_clock(0).map_err(|e| e.code()), Err(KError::InvalidArgument), "before 2000");
+        assert_eq!(set_clock(&clock, ns).map_err(|e| e.code()), Ok(ClockSet::ThisBoot));
+        assert_eq!(set_clock(&clock, 0).map_err(|e| e.code()), Err(KError::InvalidArgument), "before 2000");
+        let unwritable = control(mock::with_rights(mock::clock_node(), Rights::INSPECT));
+        assert_eq!(set_clock(&unwritable, ns).map_err(|e| e.code()), Err(KError::NoAccess), "without WRITE");
     }
 
     fn power(raw: u64) -> Power<WriteOnly> {

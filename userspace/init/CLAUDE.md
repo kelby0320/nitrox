@@ -11,8 +11,8 @@ PID 1. The first userspace process. Spawned directly by the kernel with the full
 3. Process critical-path mounts in dependency order, spawning fs-servers and binding their endpoints
 4. Read `/system/current-generation` and spawn the system profile server
 5. Spawn the service manager, handing it a root handle with init's own rights and the root
-   filesystem's and profile server's endpoints, and keep the channel they went down as the
-   **terminal channel**
+   filesystem's and profile server's endpoints and then the clock node (the fourth handoff), and
+   keep the channel they went down as the **terminal channel**
 6. Enter main loop: reap orphaned processes, and answer the terminal channel — including a
    shutdown's `Finish`, which unmounts init's own filesystems and stops the machine
 
@@ -66,9 +66,11 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `BIND_NAMESPACE` — to register fs-server endpoints in the system namespace
 - `LOAD_MODULE` — to load Tier 2 LKMs (delegated to device manager later)
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
-- `SYSTEM_CLOCK` — given to `service-mgr` at spawn, to pass to the view broker, whose `clock`
-  grant is that capability in a program's spawn (administration Part E.5). Init never sets the
-  clock itself.
+- **The clock node** (administration Part E.10) — a char `DeviceNode` handle in `rcx`, not a
+  syscap (`SYSTEM_CLOCK` is gone): `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE`. Init **moves**
+  it to `service-mgr` as the fourth handoff on the terminal channel and holds it no longer, so
+  it never sets the clock itself. `service-mgr` moves it on to the one service declared
+  `clock = true`, the view broker, whose `clock` grant binds it at `/dev/clock`.
 - **The power node** (administration Part E.3) — a char `DeviceNode` handle in `rdx`, not a
   syscap: the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE`
   nor `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a

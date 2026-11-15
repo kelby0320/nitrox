@@ -114,7 +114,7 @@ pub fn set_realtime(ns: u64) {
     with(|m| m.realtime = Some(ns));
 }
 
-/// Answer the next clock set in range with `r`, a refusal or `CLOCK_SET_THIS_BOOT`.
+/// Answer the next clock set in range with `r`, `CLOCK_SET_THIS_BOOT` or `CLOCK_SET_KEPT`.
 pub fn answer_next_clock_set(r: i64) {
     with(|m| m.clock_answer = Some(r));
 }
@@ -122,6 +122,12 @@ pub fn answer_next_clock_set(r: i64) {
 /// A handle to a device that `io_submit` takes, with `READ | WRITE`.
 pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
+}
+
+/// The clock node, with the rights the kernel hands it to `init` with: `WRITE`, `INSPECT`, and the
+/// two that move it on and bind it.
+pub fn clock_node() -> u64 {
+    with(|m| m.mint(Object::Clock, Rights::WRITE | Rights::INSPECT | Rights::DUPLICATE | Rights::TRANSFER) as u64)
 }
 
 /// The power node, with `WRITE | INSPECT` and neither `DUPLICATE` nor `TRANSFER`, as the kernel

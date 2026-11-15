@@ -3,10 +3,10 @@
 # by hand, in a reviewed commit of its own that says why.
 [files]
 "kernel/src/arch/x86_64/acpi.rs" = 1035
-"kernel/src/main.rs" = 1044
+"kernel/src/main.rs" = 1040
 "kernel/src/object/file_object.rs" = 1093
 "kernel/src/pci/mod.rs" = 1032
-"kernel/src/syscall/table.rs" = 1579
+"kernel/src/syscall/table.rs" = 1544
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 1926
@@ -31,9 +31,9 @@
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
 "userspace/nxterm/src/lib.rs" = 2339
-"userspace/service-mgr/src/main.rs" = 1875
+"userspace/service-mgr/src/main.rs" = 1862
 "userspace/storage-service/src/main.rs" = 1161
 "userspace/test-harness/src/harness.rs" = 3058
 "userspace/test-harness/src/uiclient.rs" = 1245
-"userspace/view-broker/src/lib.rs" = 1646
+"userspace/view-broker/src/lib.rs" = 1645
 "userspace/view-broker/src/main.rs" = 1262

@@ -56,6 +56,8 @@ enum Object {
     Entropy,
     /// The power node, whose one-byte write stops the machine within the submit.
     Power,
+    /// The clock node, whose eight-byte write sets the wall clock.
+    Clock,
     Timer(u64),
 }
 
@@ -73,7 +75,7 @@ impl Object {
             Object::Process => KObjectType::Process,
             Object::Thread(_) => KObjectType::Thread,
             Object::Timer(_) => KObjectType::Timer,
-            Object::Power => KObjectType::DeviceNode,
+            Object::Power | Object::Clock => KObjectType::DeviceNode,
         }
     }
 }
@@ -344,6 +346,9 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
         }
         if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Entropy)) {
             return file_io::entropy_read(m, resource, op);
+        }
+        if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Clock)) {
+            return file_io::clock_write(m, resource, op);
         }
         if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Power))
             && op.opcode == libkern::IO_OPCODE_WRITE

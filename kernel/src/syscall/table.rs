@@ -167,8 +167,6 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit (§11h) via a `TerminateRequested` notice.
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
-/// `sys_clock_set(clock, ns)` — set the wall clock, and the RTC under it. Needs `SYSTEM_CLOCK`.
-pub const SYS_CLOCK_SET: u64 = 41;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -209,7 +207,6 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
         SYS_NS_CREATE => encode(sys_ns_create(a0)),
-        SYS_CLOCK_SET => encode(sys_clock_set(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, a4)),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
@@ -528,8 +525,8 @@ fn image_fits(len: usize) -> Result<(), KError> {
 /// `u64` at `out`. Returns 0.
 ///
 /// `Realtime` is serviced once anchored from the RTC at boot ([`crate::clock`]) or set, else
-/// `Unsupported`. Reading time-of-day is deliberately **ambient**; *setting* it needs
-/// `SYSTEM_CLOCK`.
+/// `Unsupported`. Reading time-of-day is deliberately **ambient**; *setting* it is a write to the
+/// clock node.
 ///
 /// TODO(sched-acct): `ProcessCpu`/`ThreadCpu` need per-thread CPU accounting from the
 /// scheduler tick (none yet). See docs/planning/implementation-plan.md.
@@ -546,38 +543,6 @@ pub fn sys_clock_read(clock: u64, out: u64) -> SysResult {
     };
     copy_to_user(uptr, &ns).map_err(from_user_access)?;
     Ok(0)
-}
-
-/// `sys_clock_set(clock, ns)` — **set the wall clock** to `ns` nanoseconds since the Unix epoch,
-/// and write the machine's RTC so the next boot anchors to it.
-///
-/// - `clock` must be [`ClockId::Realtime`], and `ns` in 2000–2099 ([`crate::clock::settable`]),
-///   else `InvalidArgument`.
-/// - The caller must hold `SYSTEM_CLOCK`, or `NoAccess`; checked after the arguments, so a
-///   refusal of either is reachable without the authority.
-///
-/// Returns `CLOCK_SET_KEPT` when the RTC read back what was written, or `CLOCK_SET_THIS_BOOT`
-/// when it did not (the clock is set either way). **It steps the clock**, backwards as readily
-/// as forwards. Every set is logged.
-pub fn sys_clock_set(clock: u64, ns: u64) -> SysResult {
-    let id = u32::try_from(clock).ok().and_then(ClockId::from_u32);
-    if id != Some(ClockId::Realtime) {
-        return Err(KError::InvalidArgument);
-    }
-    let secs = crate::clock::settable(ns).ok_or(KError::InvalidArgument)?;
-    require_syscap(crate::libkern::SysCaps::SYSTEM_CLOCK)?;
-    let kept = crate::clock::set(ns);
-    if kept {
-        crate::kprintln!("wall clock: set to {} (Unix epoch seconds, UTC); the RTC holds it", secs);
-        Ok(crate::libkern::clock::CLOCK_SET_KEPT as isize)
-    } else {
-        crate::kprintln!(
-            "wall clock: set to {} (Unix epoch seconds, UTC); the RTC did not take it, so it lasts \
-             until the next boot",
-            secs
-        );
-        Ok(crate::libkern::clock::CLOCK_SET_THIS_BOOT as isize)
-    }
 }
 
 fn timer_rights() -> Rights {

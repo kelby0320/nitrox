@@ -81,9 +81,8 @@ fn start(
     let Some(image) = image else { return Err(Some(theirs)) };
     let mut spawn = Spawn::new(image);
     // Whatever this shell holds, passed on; the kernel intersects it with its own (child = parent &
-    // asked): nothing in a session, `SYSTEM_CLOCK` in a view with the `clock` grant, so `with admin
-    // nxsh` has a working `date --set`. No namespace is named: the child inherits a LOOKUP-only view
-    // of ours.
+    // asked). No namespace is named: the child inherits a LOOKUP-only view of ours, so in a view
+    // with the `clock` grant its `/dev/clock` too, and `with admin nxsh` has a working `date --set`.
     spawn.arg0(bootstrap_arg0(true)).syscaps(SysCaps::all());
     if let Err(back) = spawn.grant(theirs, Rights::from_bits(u64::MAX)) {
         return Err(Some(back));

@@ -79,12 +79,6 @@ pub const SYS_PROCESS_TERMINATE: u64 = 36;
 pub const POWER_HALT: u64 = 0;
 /// The power node's reboot: the FADT's reset register, then the 8042, then a triple fault.
 pub const POWER_REBOOT: u64 = 1;
-/// `sys_clock_set(clock, ns)` — set the wall clock to `ns` since the epoch, and the machine's RTC
-/// under it. `clock` must be [`CLOCK_REALTIME`](crate::abi::CLOCK_REALTIME) and `ns` in
-/// 2000–2099, or `InvalidArgument`; then the caller needs `SYSTEM_CLOCK`, or `NoAccess`. Returns
-/// [`CLOCK_SET_KEPT`](crate::abi::CLOCK_SET_KEPT) or
-/// [`CLOCK_SET_THIS_BOOT`](crate::abi::CLOCK_SET_THIS_BOOT).
-pub const SYS_CLOCK_SET: u64 = 41;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: report a harness verdict (the argument's low byte) to
