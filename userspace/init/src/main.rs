@@ -1,5 +1,5 @@
 //! `init` — PID 1. The kernel hands it a notification channel (`rdi`), a full-rights root
-//! namespace (`rsi`) with the boot kernel-server bindings, and the system-control object (`rdx`).
+//! namespace (`rsi`) with the boot kernel-server bindings, and the power node (`rdx`).
 //! It processes `/initramfs/etc/init.toml`'s mounts in dependency order, binds the profile server
 //! at `/bin`, spawns `service-mgr` (which starts every other server), then reaps orphans and
 //! answers the terminal channel. It never `panic!`s in normal operation (see its `CLAUDE.md`).
@@ -14,12 +14,12 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use init::manifest::{self, BindSpec, Manifest, Mode, MountSpec};
 use libkern::{
-    KError, KIND_CHILD_EXITED, KOBJ_SYSTEM_CONTROL, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH,
+    KError, KIND_CHILD_EXITED, KOBJ_DEVICE_NODE, Rights, SysCaps, TERMINAL_OP_EMERGENCY, TERMINAL_OP_FINISH,
 };
 use libos::FLUSH_TIMEOUT_NS;
 use libos::boot::Start;
 use libos::log::{self, Line};
-use libos::system::{self, Stop};
+use libos::system::{self, Power, Stop};
 use libos::{
     Carried, Channel, Deadline, File, Handle, MapRead, Msg, Namespace, Notify, NsMutable, Only, Process, ReadOnly,
     Resource, Spawn, WaitSet, WriteOnly, block_on,
@@ -38,10 +38,10 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 type Root = Handle<Namespace, NsMutable>;
 type Endpoint = Handle<Channel, Only>;
 
-/// What a shutdown's [`finish`] needs: init's mounts, as made, and the system-control object.
+/// What a shutdown's [`finish`] needs: init's mounts, as made, and the power node.
 struct Finish {
     mounts: Vec<Kept>,
-    system_control: Option<Handle<Resource, WriteOnly>>,
+    power: Option<Power<WriteOnly>>,
 }
 
 /// How long a filesystem server may take to answer `Meta::Unmount`: its write-back came first, so
@@ -564,16 +564,16 @@ fn finish(root: &Root, reboot: bool, held: &mut Finish) {
     for m in core::mem::take(&mut held.mounts).into_iter().rev() {
         unmount_one(root, m);
     }
-    let Some(system_control) = &held.system_control else {
+    let Some(power) = &held.power else {
         Line::new()
-            .s(b"init: no system-control object, so the machine cannot stop itself; ")
+            .s(b"init: no power node, so the machine cannot stop itself; ")
             .s(b"its filesystems are unmounted, and it is safe to turn off")
             .end();
         return;
     };
-    let refused = system::stop(system_control, if reboot { Stop::Reboot } else { Stop::Halt });
+    let refused = power.stop(if reboot { Stop::Reboot } else { Stop::Halt });
     Line::new()
-        .s(b"init: sys_power refused (")
+        .s(b"init: the power node refused (")
         .i(refused.code() as i64)
         .s(b"), so the machine cannot stop itself; ")
         .s(b"its filesystems are unmounted, and it is safe to turn off")
@@ -618,33 +618,33 @@ fn unmount_one(root: &Root, m: Kept) {
     line.end();
 }
 
-/// **Keep the system-control object**, the capability to stop the machine, if `rdx` holds it: a
-/// `SystemControl` handle with `WRITE`. A boot without it goes on, and says so: only a shutdown's
-/// last step needs it. A handle in `rdx` that is not it closes here.
-fn keep_system_control(h: Option<Handle<Resource, WriteOnly>>) -> Option<Handle<Resource, WriteOnly>> {
+/// **Keep the power node**, the capability to stop the machine, if `rdx` holds it: a device node
+/// with `WRITE`, and the page a stop writes from, made now. A boot without it goes on, and says
+/// so: only a shutdown's last step needs it. A handle in `rdx` that is not it closes here.
+fn keep_power(h: Option<Handle<Resource, WriteOnly>>) -> Option<Power<WriteOnly>> {
     let is_it = |h: &Handle<Resource, WriteOnly>| {
-        h.stat().is_ok_and(|info| info.object_type == KOBJ_SYSTEM_CONTROL && info.rights & Rights::WRITE.bits() != 0)
+        h.stat().is_ok_and(|info| info.object_type == KOBJ_DEVICE_NODE && info.rights & Rights::WRITE.bits() != 0)
     };
-    match h {
-        Some(h) if is_it(&h) => {
-            log::write(b"init: holds the system-control object\n");
-            Some(h)
+    match h.filter(is_it).map(Power::new) {
+        Some(Ok(power)) => {
+            log::write(b"init: holds the power node\n");
+            Some(power)
         }
         _ => {
-            log::write(b"init: no system-control object -- a shutdown cannot stop the machine\n");
+            log::write(b"init: no power node -- a shutdown cannot stop the machine\n");
             None
         }
     }
 }
 
-/// Registers: `rdi` = notification channel, `rsi` = root namespace, `rdx` = system-control object.
+/// Registers: `rdi` = notification channel, `rsi` = root namespace, `rdx` = the power node.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, power: u64, arg0: u64) -> ! {
     log::write(b"init: up (pid 1)\n");
     // SAFETY: the kernel's bootstrap registers, read once, here.
-    let mut start = unsafe { Start::from_registers(notif, root_ns, system_control, arg0) };
-    let kept_control = keep_system_control(start.take_handle0());
-    let count = (notif != 0) as u64 + (root_ns != 0) as u64 + (system_control != 0) as u64;
+    let mut start = unsafe { Start::from_registers(notif, root_ns, power, arg0) };
+    let kept_power = keep_power(start.take_handle0());
+    let count = (notif != 0) as u64 + (root_ns != 0) as u64 + (power != 0) as u64;
     Line::new()
         .s(b"init: received ")
         .u(count)
@@ -652,8 +652,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, arg0: u6
         .u(notif)
         .s(b", ns=")
         .u(root_ns)
-        .s(b", system-control=")
-        .u(system_control)
+        .s(b", power=")
+        .u(power)
         .s(b")")
         .end();
     let notify = start.notify.take();
@@ -676,7 +676,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, system_control: u64, arg0: u6
             (false, None)
         }
     };
-    let held = Finish { mounts, system_control: kept_control };
+    let held = Finish { mounts, power: kept_power };
     if !booted {
         drop(fs_endpoint);
         emergency(notify, root, held);

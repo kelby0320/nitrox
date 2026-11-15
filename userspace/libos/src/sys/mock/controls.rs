@@ -124,10 +124,10 @@ pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
 }
 
-/// The system-control object, with `WRITE | INSPECT` and neither `DUPLICATE` nor `TRANSFER`, as
-/// the kernel hands it to `init`.
-pub fn system_control() -> u64 {
-    with(|m| m.mint(Object::SystemControl, Rights::WRITE | Rights::INSPECT) as u64)
+/// The power node, with `WRITE | INSPECT` and neither `DUPLICATE` nor `TRANSFER`, as the kernel
+/// hands it to `init`.
+pub fn power_node() -> u64 {
+    with(|m| m.mint(Object::Power, Rights::WRITE | Rights::INSPECT) as u64)
 }
 
 /// Each test verdict reported, in order.

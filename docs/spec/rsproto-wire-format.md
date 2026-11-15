@@ -213,7 +213,7 @@ last mounted first, and sends it `Meta::Unmount`, **without** the held check, an
 answered. **A flush that fails or runs out of time is followed by no `Meta::Unmount`**: the
 server would record the filesystem clean over what was not written. It
 builds the request and reads the answer by hand (`userspace/init/src/unmount.rs`), as it reads
-`Ready`, since `librsproto` is kept out of `init`'s build. The drive's flush is `sys_power`'s.
+`Ready`, since `librsproto` is kept out of `init`'s build. The drive's flush is the power write's.
 
 ### A filesystem server's setup message
 

@@ -121,7 +121,7 @@ The most user-visible Phase 1 limitation is shutdown. The kernel can boot, run, 
 
 Both paths are wrapped behind `ArchPower::shutdown()` and `ArchPower::reboot()`, so Phase 2 can swap in ACPICA-backed implementations without touching callers.
 
-> **As built (administration Part E.3, 2026-09-28), the seam is named differently and there is no shutdown.** A reset is `ArchPlatform::prepare_reset` and `reset` — the FADT's reset register, then the 8042, then a triple fault — and a halt is `sys_power`'s own, which stops every processor and says it is safe to turn the machine off. The QEMU-only port `0x604` write is not used, so the emulator does not power off either. See [`power.md`](../architecture/power.md).
+> **As built (administration Part E.3, 2026-09-28), the seam is named differently and there is no shutdown.** A reset is `ArchPlatform::prepare_reset` and `reset` — the FADT's reset register, then the 8042, then a triple fault — and a halt is the stop's own (`sys_power`'s then, the power node's write since 2026-11-15), which stops every processor and says it is safe to turn the machine off. The QEMU-only port `0x604` write is not used, so the emulator does not power off either. See [`power.md`](../architecture/power.md).
 
 ## Where to read more
 

@@ -3,15 +3,15 @@
 use super::*;
 use libos::{MapReadWrite, Memory, NsMutable, ReadWrite, Resource};
 
-/// **`sys_power` from anything but `init` is refused**, and the machine goes on: with no handle,
-/// with a namespace this process may only look up in, and with a disk it may write — a `WRITE`
-/// handle, so it is the object's type that refuses it, not a missing right.
+/// **A stop from anything but `init` is refused**, and the machine goes on: the halt byte written
+/// to no handle, to a namespace this process may only look up in, and to a disk it may write — a
+/// `WRITE` handle, so it is the node that refuses it, its write a whole number of blocks, before
+/// any I/O, not a missing right.
 ///
 /// The halt it would otherwise be is what makes a wrong answer loud: the boot stops before the
 /// verdict, and `test-qemu` times out.
 pub(super) fn power_refused_test(root: Root<'_>) -> bool {
     use libkern::KError;
-    use libos::system::{Stop, stop};
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: power FAIL: ").s(why).end();
         false
@@ -34,12 +34,12 @@ pub(super) fn power_refused_test(root: Root<'_>) -> bool {
     let Ok(dev) = lookup::<Resource, ReadWrite, _>(root, &path, Rights::READ | Rights::WRITE) else {
         return fail(b"the root partition does not open read-write");
     };
-    let refused = stop(&dev, Stop::Halt);
+    let refused = refused::authority::power(dev.raw().0);
     drop(dev);
-    if refused.code() != KError::InvalidArgument {
+    if refused != KError::InvalidArgument.as_i32() as i64 {
         return fail(b"a writable disk was not refused InvalidArgument");
     }
-    log::write(b"boot-probe: sys_power refused no handle, a namespace and a writable disk ok\n");
+    log::write(b"boot-probe: a stop refused with no handle, a namespace and a writable disk ok\n");
     true
 }
 

@@ -223,12 +223,6 @@ pub fn test_exit(code: u64) -> i64 {
     unsafe { syscall1(libkern::SYS_TEST_EXIT, code) }
 }
 
-/// `sys_power(control, op)`: returns only to refuse.
-pub fn power(control: u64, op: u64) -> i64 {
-    // SAFETY: a register-only call.
-    unsafe { syscall2(libkern::SYS_POWER, control, op) }
-}
-
 /// `sys_debug_kprint` of `bytes`.
 pub fn kprint(bytes: &[u8]) {
     // SAFETY: `bytes` is a live buffer of its length, which the kernel copies.

@@ -167,8 +167,6 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit (§11h) via a `TerminateRequested` notice.
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
-/// `sys_power(system_control, op)` — flush every disk, stop every processor, halt or reset.
-pub const SYS_POWER: u64 = 40;
 /// `sys_clock_set(clock, ns)` — set the wall clock, and the RTC under it. Needs `SYSTEM_CLOCK`.
 pub const SYS_CLOCK_SET: u64 = 41;
 
@@ -211,7 +209,6 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
         SYS_NS_CREATE => encode(sys_ns_create(a0)),
-        SYS_POWER => encode(sys_power(a0, a1)),
         SYS_CLOCK_SET => encode(sys_clock_set(a0, a1)),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, a4)),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
@@ -1280,23 +1277,6 @@ fn complete_resolve_reply(
     }
     drop(pl);
     Ok(0)
-}
-
-/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt or reset
-/// the machine ([`crate::power`]). Needs `WRITE` on a
-/// [`SystemControl`](crate::object::SystemControl), which only `init` holds; `op` is
-/// `POWER_HALT` or `POWER_REBOOT`, else `InvalidArgument`.
-///
-/// **It returns only to refuse.** The handle is checked before the op, so a process without the
-/// object learns nothing from either. The flush waits in the kernel, bounded.
-fn sys_power(sc_h: u64, op: u64) -> SysResult {
-    let pid = crate::sched::current_owner_pid();
-    let _system_control = lookup_as::<crate::object::SystemControl>(sc_h, pid, Rights::WRITE)?;
-    use crate::libkern::power::PowerOp;
-    let op = PowerOp::from_u64(op).ok_or(KError::InvalidArgument)?;
-    let what = if op == PowerOp::Halt { "halt" } else { "reboot" };
-    crate::kprintln!("power: pid {pid} asks to {what}");
-    crate::power::power(op)
 }
 
 /// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply; returns what the lookup's

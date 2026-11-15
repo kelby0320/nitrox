@@ -92,7 +92,7 @@ newest line is on the screen before the write that produced it returns either wa
 | `fbcon::end_report` | the kernel | updates the grid and paints what changed; the end repaints the grid over the last page |
 | the first `/dev/framebuffer` handout (`framebuffer_server`, `kernel/src/object/kernel_server.rs`) | userspace | updates the grid; paints nothing |
 | `stop_the_machine`, for a panic and a fatal fault alike | the kernel, for good | nothing more is written; the reclaim repaints the grid once |
-| `sys_power`'s halt or reboot, once the other CPUs are stopped (`reclaim_for_stop_with`, administration Part E.3) | the kernel, for good | as a panic's, with one line written first on a row of its own: *"It is now safe to turn off your computer."* or *"Restarting."* ([`power.md`](power.md)) |
+| the power node's halt or reboot write, once the other CPUs are stopped (`reclaim_for_stop_with`, administration Part E.3) | the kernel, for good | as a panic's, with one line written first on a row of its own: *"It is now safe to turn off your computer."* or *"Restarting."* ([`power.md`](power.md)) |
 
 **The handout, not the first frame, is the hand-over.** The phase plan said "until userspace first
 commits a frame", and the kernel cannot see that: a client writes straight into an aperture

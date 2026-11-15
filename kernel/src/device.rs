@@ -477,7 +477,7 @@ pub fn init() {
     drop(table);
     ENUMERATED.store(count, Ordering::Release);
     crate::kprintln!("device: {} node(s) registered", count);
-    let backend = CharBackend { submit_read: changes_read, submit_write: None, ctx: core::ptr::null_mut() };
+    let backend = CharBackend { submit_read: changes_read, submit_write: None, ctx: core::ptr::null_mut(), act: None };
     match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
         Ok(node) => *CHANGES.lock() = Some(Ref::new(node)),
         Err(_) => crate::kprintln!("device: no memory for /dev/registry/changes; nothing will learn of a change"),

@@ -238,7 +238,7 @@ chain with no `auth-service` behind it. Every skipped declaration is logged by n
 handle with `init`'s rights, and the root filesystem's and the profile server's endpoints — and
 then `TERMINAL_OP_EMERGENCY` back up it. Its closing is how `init` learns `service-mgr` has died.
 **`TERMINAL_OP_FINISH`** (Part E.4a), with a byte saying whether to reboot, is a shutdown's last
-word to `init`, which unmounts its own filesystems and calls `sys_power`, sent as a shutdown's
+word to `init`, which unmounts its own filesystems and writes the power node, sent as a shutdown's
 last step (§ *Shutdown*, Part E.4b).
 
 ### `/svc/services`: the list, and starting and stopping
@@ -302,7 +302,7 @@ the one loop:
    the start order lets each server outlive what was started after it, and may use it. One not
    honoured is logged "still running", and the shutdown goes on — a stop is a request, and there is
    no forcible kill. The storage service unmounts everything it mounted on the way out.
-4. **`init` is told to finish** on the terminal channel: its own filesystems, then `sys_power`.
+4. **`init` is told to finish** on the terminal channel: its own filesystems, then the power node's write.
 
 What honours a stop is § *Servers, and the registry* above: every server a release image runs. In a
 test image `nxterm`, `ui-testclient`, `input-testclient` and `restart-probe` do not, and each is

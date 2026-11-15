@@ -100,3 +100,23 @@ pub(super) fn entropy_read(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     }
     m.po(Po { ready: true, never: false, status: 0, result: n as u64, lookup: None })
 }
+
+/// A write to the power node, as the kernel takes it, within the submit: one byte naming a stop
+/// panics `power(<op>)`, the test's way to see the machine stop; any other length or byte is
+/// refused `InvalidArgument`, with no operation made.
+pub(super) fn power_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
+    if let Err(r) = m.typed(h, Rights::WRITE, KObjectType::DeviceNode) {
+        return r;
+    }
+    let b = match m.get(op.buffer, Rights::MAP_READ) {
+        Ok((b, _)) if matches!(m.objects[b], Object::Memory(_)) => b,
+        Ok(_) => return e(KError::InvalidArgument),
+        Err(r) => return r,
+    };
+    let at = op.buf_offset as usize;
+    let byte = pages(&m.objects[b]).0.get(at / PAGE).map(|page| page.0[at % PAGE]);
+    match byte.map(u64::from).filter(|_| op.length == 1) {
+        Some(stop) if stop == libkern::POWER_HALT || stop == libkern::POWER_REBOOT => panic!("power({stop})"),
+        _ => e(KError::InvalidArgument),
+    }
+}

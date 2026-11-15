@@ -62,7 +62,8 @@ KObjectType::Namespace            = 0x03
 ... etc
 ```
 
-Discriminant `11` is vacant: `EntropyObject` was removed on 2026-11-13.
+Discriminant `11` is vacant: `EntropyObject` was removed on 2026-11-13. Discriminant `15` is
+vacant: `SystemControl` was removed on 2026-11-15.
 
 Adding a new variant changes the hash. Removing or renumbering a variant changes the hash.
 

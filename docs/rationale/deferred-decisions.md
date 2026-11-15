@@ -2308,7 +2308,7 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 registration going reaches it, which takes `service-mgr` with it.
 
 **libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
-`system::stop` takes the system-control object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
+`system::stop` took the system-control object as a char node, which it was not yet; since 2026-11-15 it is, the power node. `system::set_clock` is the exception, taking no handle:
 its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
 `date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
 keep, and the call under it changes as its sub-part of

@@ -100,15 +100,15 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `28` | `sys_io_submit` |
 | `30` | `sys_ns_enumerate` |
 | `36` | `sys_process_terminate` |
-| `40` | `sys_power` |
 | `41` | `sys_clock_set` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. **Twelve are
+Numbers are assigned in landing order, not in the order syscalls appear below. **Thirteen are
 vacant**, and answer `Unsupported`, as any number nothing holds does, until they are assigned
 again: `31` to `35`, `38` and `39` went when a resolve came to carry its operation and a file's
 flush became an `io_submit` (pre-Phase-7 E.7); `18` (`thread_set_affinity`) and `29`
 (`io_cancel`) went for want of a caller, `26` and `27` (`entropy_create`, `entropy_read`) when
-entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9).
+entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9); `40` (`power`) when the power node
+came to take a one-byte write (2026-11-15).
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -185,7 +185,8 @@ semantics in [`io-operation.md`](io-operation.md). Syscall numbers:
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
 ```
 Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
-`PendingOperation` handle (positive value); it **never blocks**. `resource` is a
+`PendingOperation` handle (positive value); it **never blocks**, but for one write: the power node's
+(§ Power). `resource` is a
 [`DeviceNode`](device-node.md), or a `FileObject`, which takes `Read` and `Write` a page at a time
 through its page cache, and a copy from another file
 ([`io-operation.md`](io-operation.md) § *A file as the resource*). A block device's opcodes are
@@ -340,8 +341,8 @@ own mount's operations, and no other, but for a copy, which waits on its source'
 runs in its destination's mount (`TODO(copy-two-budgets)`). **A process may have four of a mount's
 file operations running or waiting** (`FILE_OPS_PER_PROCESS`): one past them is refused
 `WouldBlock` synchronously, the operation not kept, which libos sleeps on and asks again, so no
-process takes a mount's budget from the others. One call still waits inside itself: `sys_power`,
-on its flush. `sys_process_spawn` takes a memory object alone, which libos reads a file into
+process takes a mount's budget from the others. One write still waits inside its call: the power
+node's, on its flush. `sys_process_spawn` takes a memory object alone, which libos reads a file into
 first ([`process-spawn-args.md`](process-spawn-args.md)).
 
 **A held counts the files the server has handed out that something still holds**: a handle, a
@@ -383,7 +384,7 @@ fn sys_ns_bind(
 ```
 Binds `resource` (a direct kernel-object handle in slice 1; an IPC resource-server endpoint in slice 3) at `path` in `ns`. Requires the `BIND` right on `ns` (the enforced gate) **and** the `BIND_NAMESPACE` system capability (an additional gate; see [syscaps](../architecture/syscaps.md)). Returns `0` on success.
 
-**A direct handle needs `TRANSFER` and `DUPLICATE`** (`NoAccess` without either). Every resolve of the binding mints a handle to the object for whoever asked, so a bind gives the object away as an IPC send and a spawn grant do, and like them it needs the right that says a handle may leave its process; and the binder keeps its own, so a bind is a copy, which needs `DUPLICATE` as a copied grant does (since 2026-11-13). A binding carries the handle's rights, so it then carries `DUPLICATE`, which grants a resolver nothing a second resolve would not. Until the PR #342 review it needed none, so a handle issued not to leave — `init`'s system-control object — could have been published. An IPC endpoint bound as a userspace server needs no right: the kernel keeps it, and no resolve hands it out.
+**A direct handle needs `TRANSFER` and `DUPLICATE`** (`NoAccess` without either). Every resolve of the binding mints a handle to the object for whoever asked, so a bind gives the object away as an IPC send and a spawn grant do, and like them it needs the right that says a handle may leave its process; and the binder keeps its own, so a bind is a copy, which needs `DUPLICATE` as a copied grant does (since 2026-11-13). A binding carries the handle's rights, so it then carries `DUPLICATE`, which grants a resolver nothing a second resolve would not. Until the PR #342 review it needed none, so a handle issued not to leave — `init`'s power node — could have been published. An IPC endpoint bound as a userspace server needs no right: the kernel keeps it, and no resolve hands it out.
 
 **Subtree scoping** (`base_len > 0`): for an IPC resource-server (userspace-server) bind, `base` is an absolute namespace path the kernel prepends to every forwarded lookup's suffix, so the binding exposes only that sub-tree of the server — e.g. `sys_ns_bind(ns, "/home", …, fs_endpoint, "/home/alice", 11)` makes a lookup of `/home/notes` reach the server as `home/alice/notes`, and nothing above `/home/alice` nameable. `base` is validated like any binding path (no `.`/`..`, so it cannot escape the subtree; root `/` and paths over 128 bytes are rejected → `InvalidArgument`). `base_len == 0` = an unscoped whole-tree mount (the original behaviour; existing callers via `syscall4` pass 0 automatically). A non-zero `base` on a **direct-handle** bind is rejected (`InvalidArgument`) — scoping applies only to servers. See [session-and-auth](../architecture/session-and-auth.md) § Session construction.
 
@@ -626,30 +627,18 @@ Unbinds `/initramfs` from the root namespace and frees the initramfs physical pa
 
 ### Power
 
-```rust
-fn sys_power(system_control: RawHandle, op: u64) -> isize
-```
-**Flush every disk, stop every processor, then halt or reset the machine** (administration Part
-E.3; [`power.md`](../architecture/power.md)). `op` is `POWER_HALT` (`0`) or `POWER_REBOOT` (`1`).
+There is no power syscall (`sys_power`, number `40`, was removed on 2026-11-15; it answers
+`Unsupported`). **The machine is stopped by a write to the power node**
+([`power.md`](../architecture/power.md)): one char `DeviceNode`, made by the kernel at boot and
+handed to `init` in `rdx`, bound in no namespace, with `WRITE` and `INSPECT` and neither
+`DUPLICATE` nor `TRANSFER`. `init` submits a one-byte `Write` of `POWER_HALT` (`0`) or
+`POWER_REBOOT` (`1`) with `sys_io_submit` ([`io-operation.md`](io-operation.md) § *Device classes*).
 
-- **The flush**: `IoOpcode::Flush` to every block device but a partition, whose flush is its
-  disk's, waited for in the kernel for at most 10 seconds for all of them together. A disk that
-  fails or does not finish is named on the log, and the stop goes on.
-- **The stop**: every other processor, by the path a panic takes.
-- **A halt** writes *"It is now safe to turn off your computer."* on COM1 and as the screen's last
-  line, taking the screen back from whoever held it, and halts. There is no power-off: S5 needs
-  AML.
-- **A reboot** writes *"Restarting."* the same way, then tries the FADT's reset register when the
-  FADT advertises one, the 8042's reset line, and a triple fault, giving each half a second.
-
-Requires `WRITE` on a `SystemControl`. There is one, made at boot and handed to `init` in `rdx`
-without `DUPLICATE` or `TRANSFER`, so no other process can hold it. The handle is checked before
-`op`: `InvalidHandle`, `NoAccess` or `InvalidArgument` for a handle that is not the object, then
-`InvalidArgument` for an `op` that names nothing.
-
-**It returns only to refuse.** It is outside the async-first rule for that reason: a blocking
-operation hands back a `PendingOperation`, and this has nothing to hand one to. (Syscall number
-`40`.)
+**That write is the one `sys_io_submit` that may wait inside the call, and it returns only to
+refuse.** It acts before any `PendingOperation` is made: it flushes every disk, stops every
+processor and halts or resets the machine. A machine that is stopping has nothing to hand a
+`PendingOperation` to, and one that cannot stop for want of memory is the worse outcome. Any other
+length or byte is refused `InvalidArgument`, synchronously, with no `PendingOperation` made.
 
 ### High-Throughput Ring (additive optimization)
 

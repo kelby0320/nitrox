@@ -3,16 +3,21 @@
 //! the monotonic clock.
 
 use libkern::{
-    CLOCK_MONOTONIC, POWER_HALT, Rights, SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_CLOCK_SET, SYS_HANDLE_CLOSE,
-    SYS_HANDLE_DUPLICATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_POWER, SYS_WAIT, syscall1, syscall2,
-    syscall4, syscall5,
+    CLOCK_MONOTONIC, IO_OPCODE_WRITE, IoOp, Rights, SENDMODE_NOBLOCK, SYS_CHANNEL_SEND, SYS_CLOCK_SET,
+    SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE, SYS_IO_SUBMIT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT,
+    syscall1, syscall2, syscall4, syscall5,
 };
-use libos::{Channel, Handle, Namespace, NsReadOnly, Only, Ref};
+use libos::{Channel, Handle, MapReadWrite, Memory, Namespace, NsReadOnly, Only, Ref};
 
-/// What `sys_power` answers for the raw handle `h`, which the machine halts on if it is taken.
+/// What a write of the halt byte to the raw handle `h` answers, which halts the machine if `h` is
+/// the power node: its submit's refusal, or an operation made for a write some node took.
 pub(crate) fn power(h: u64) -> i64 {
-    // SAFETY: register-only syscall; refused before anything happens, which is the point.
-    unsafe { syscall2(SYS_POWER, h, POWER_HALT) }
+    // A fresh page reads zero, `POWER_HALT`.
+    let Ok(page) = Handle::<Memory, MapReadWrite>::create(1) else { return i64::MIN };
+    let op = IoOp { opcode: IO_OPCODE_WRITE, flags: 0, buffer: page.raw().0, buf_offset: 0, offset: 0, length: 1 };
+    // SAFETY: `op` is a live `IoOp` the kernel copies in; refused before anything happens, which
+    // is the point.
+    unsafe { syscall2(SYS_IO_SUBMIT, h, &op as *const IoOp as u64) }
 }
 
 /// What `sys_clock_set` answers for `ns` on the monotonic clock, which libos's `set_clock` never

@@ -35,7 +35,7 @@ fn block(desc: ResourceDescriptor, kind: BlockKind, name: &[u8], blocks: u64) ->
 }
 
 fn char_node() -> Ref<DeviceNode> {
-    let backend = CharBackend { submit_read: no_read, submit_write: None, ctx: core::ptr::null_mut() };
+    let backend = CharBackend { submit_read: no_read, submit_write: None, ctx: core::ptr::null_mut(), act: None };
     Ref::new(DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).unwrap())
 }
 

@@ -105,7 +105,7 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
 - Holding a spinlock across a function call that might allocate or block.
 - Waiting on a device inside a syscall. What blocks runs on a kernel thread of its own, a
   `sched::Job` that owns what it holds and lets go of it before it completes its operation, as a
-  flush does (`kernel/src/syscall/table/flush.rs`); `sys_power`'s flush is the one that still
+  flush does (`kernel/src/syscall/table/flush.rs`); the power node's write is the one that still
   waits, and `sys_process_spawn` takes its image in memory, read from its file by libos first.
 - Manual `Box::leak` patterns. State that lives as long as the kernel is held by an owner that
   never frees it: a Tier 1 controller's by a `libkern::Published`, which takes its box once, and

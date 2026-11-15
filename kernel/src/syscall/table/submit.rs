@@ -38,6 +38,9 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     if buf_end > buffer_size {
         return Err(KError::InvalidArgument);
     }
+    if let Some(refused) = acted(&device, &buffer, &op, opcode) {
+        return Err(refused);
+    }
 
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
     let po_ref = Ref::new(po_box);
@@ -71,6 +74,16 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     dispatched?;
     installed.commit();
     Ok(po_h.bits() as isize)
+}
+
+/// **A write to a node whose write acts at once** ([`CharBackend::act`]), made before an operation
+/// is, and its refusal, the one way it returns; `None` for any other request, and a zero-length
+/// write, which completes as every one does.
+///
+/// [`CharBackend::act`]: crate::object::device_node::CharBackend::act
+pub(super) fn acted(device: &DeviceNode, buffer: &MemoryObject, op: &IoOp, opcode: IoOpcode) -> Option<KError> {
+    let act = device.char_backend().and_then(|b| b.act).filter(|_| opcode == IoOpcode::Write && op.length != 0)?;
+    Some(act(buffer, op.buf_offset, op.length))
 }
 
 /// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`

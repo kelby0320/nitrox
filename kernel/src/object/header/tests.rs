@@ -34,7 +34,6 @@ fn one_of_each() -> std::vec::Vec<ObjectRef> {
         ObjectRef::new(PendingOperation::try_new().unwrap()),
         ObjectRef::new(Namespace::try_new().unwrap()),
         ObjectRef::new(InterruptObject::try_new().unwrap()),
-        ObjectRef::new(SystemControl::try_new().unwrap()),
     ]
 }
 
@@ -62,8 +61,7 @@ fn each_object_is_its_own_kind_and_no_other() {
             DeviceNode,
             InterruptObject,
             UserspaceServerReg,
-            FileObject,
-            SystemControl
+            FileObject
         );
         assert_eq!(tags, [obj.object_type()], "the kinds a {:?} downcasts to", obj.object_type());
     }

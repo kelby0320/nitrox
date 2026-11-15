@@ -703,9 +703,10 @@ fn run_first_userspace() {
     use mm::elf::load_elf;
     use nitrox_kernel::handle::{Installed, global};
     use nitrox_kernel::libkern::handle::Rights;
+    use nitrox_kernel::object::device_node::ResourceDescriptor;
     use nitrox_kernel::object::header::Ref;
     use nitrox_kernel::object::kernel_server::KernelServerId;
-    use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
+    use nitrox_kernel::object::{DeviceNode, Namespace, NotificationChannel, ObjectRef, Process};
 
     let mut aspace = match AddressSpace::new() {
         Ok(a) => a,
@@ -883,19 +884,18 @@ fn run_first_userspace() {
         return;
     };
 
-    // The system-control object, the capability to stop the machine, handed to init in `rdx`. Its
-    // handle has `WRITE` and `INSPECT` but not `DUPLICATE` or `TRANSFER`, so init cannot give it
-    // away.
-    let system_control_h = match nitrox_kernel::object::SystemControl::try_new() {
-        Ok(sc) => match installed.install(ObjectRef::new(sc), nitrox_kernel::object::system_control::INIT_RIGHTS) {
+    // The power node, to stop the machine, in `rdx`: init holds no right to give it away.
+    let power = DeviceNode::try_new_char(ResourceDescriptor::ZERO, nitrox_kernel::power::BACKEND);
+    let power_h = match power {
+        Ok(node) => match installed.install(ObjectRef::new(node), nitrox_kernel::power::INIT_RIGHTS) {
             Ok(h) => h.bits(),
             Err(_) => {
-                kprintln!("init: system-control handle alloc failed");
+                kprintln!("init: power node handle alloc failed");
                 0
             }
         },
         Err(_) => {
-            kprintln!("init: system-control object alloc failed");
+            kprintln!("init: power node alloc failed");
             0
         }
     };
@@ -906,7 +906,7 @@ fn run_first_userspace() {
         proc_ref,
         info.entry_point.as_u64(),
         info.stack_top.as_u64(),
-        [notif_h.bits(), ns_h.bits(), system_control_h, 0],
+        [notif_h.bits(), ns_h.bits(), power_h, 0],
     )
     .is_err()
     {
