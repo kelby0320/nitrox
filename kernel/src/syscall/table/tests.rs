@@ -81,11 +81,46 @@ fn unknown_number_is_unsupported() {
 }
 
 #[test]
-fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
-    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41] {
-        let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
-        assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
+fn a_number_past_the_last_is_unsupported_before_it_reads_an_argument() {
+    for vacant in (SYSCALLS..=64).chain([SYS_DEBUG_KPRINT - 1, SYS_DEBUG_KPRINT + 1, SYS_DEBUG_KPRINT + 3]) {
+        let refused = dispatch(vacant, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
+        assert_eq!(refused, KError::Unsupported.as_isize(), "number {vacant}");
     }
+}
+
+#[test]
+fn the_numbers_are_dense_and_in_family_order() {
+    let family_order = [
+        SYS_HANDLE_CLOSE,
+        SYS_HANDLE_DUPLICATE,
+        SYS_HANDLE_RESTRICT,
+        SYS_HANDLE_STAT,
+        SYS_MEMORY_CREATE,
+        SYS_MEMORY_MAP,
+        SYS_MEMORY_UNMAP,
+        SYS_CLOCK_READ,
+        SYS_TIMER_CREATE,
+        SYS_TIMER_SET,
+        SYS_WAIT,
+        SYS_NOTIF_RECV,
+        SYS_CHANNEL_CREATE,
+        SYS_CHANNEL_SEND,
+        SYS_CHANNEL_RECV,
+        SYS_PROCESS_SPAWN,
+        SYS_PROCESS_EXIT,
+        SYS_PROCESS_TERMINATE,
+        SYS_THREAD_EXIT,
+        SYS_THREAD_CREATE,
+        SYS_THREAD_GET_REGISTERS,
+        SYS_EXCEPTION_RESUME,
+        SYS_NS_CREATE,
+        SYS_NS_LOOKUP,
+        SYS_NS_BIND,
+        SYS_NS_UNBIND,
+        SYS_NS_ENUMERATE,
+        SYS_IO_SUBMIT,
+    ];
+    assert!(family_order.iter().copied().eq(0..SYSCALLS));
 }
 
 #[test]

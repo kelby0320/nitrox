@@ -47,8 +47,11 @@ pub const SYS_CHANNEL_RECV: u64 = 14;
 pub const SYS_PROCESS_SPAWN: u64 = 15;
 /// `sys_process_exit` — terminate the calling process with a status.
 pub const SYS_PROCESS_EXIT: u64 = 16;
+/// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
+/// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
+pub const SYS_PROCESS_TERMINATE: u64 = 17;
 /// `sys_thread_exit` — terminate the calling thread with a status.
-pub const SYS_THREAD_EXIT: u64 = 17;
+pub const SYS_THREAD_EXIT: u64 = 18;
 /// `sys_thread_create` — start another thread in the calling process.
 pub const SYS_THREAD_CREATE: u64 = 19;
 /// `sys_thread_get_registers` — read a suspended (faulted) thread's registers.
@@ -65,14 +68,13 @@ pub const SYS_NS_LOOKUP: u64 = 23;
 pub const SYS_NS_BIND: u64 = 24;
 /// `sys_ns_unbind` — remove the binding at a path in a namespace.
 pub const SYS_NS_UNBIND: u64 = 25;
-/// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
-pub const SYS_IO_SUBMIT: u64 = 28;
 /// `sys_ns_enumerate(ns, index, out, count)` — up to `count` of a namespace's bindings from
 /// `index`, at most [`NS_ENUMERATE_MAX`](crate::NS_ENUMERATE_MAX): how many it wrote.
-pub const SYS_NS_ENUMERATE: u64 = 30;
-/// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
-/// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
-pub const SYS_PROCESS_TERMINATE: u64 = 36;
+pub const SYS_NS_ENUMERATE: u64 = 26;
+/// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
+pub const SYS_IO_SUBMIT: u64 = 27;
+/// How many syscalls are numbered: each of `0` to `SYSCALLS - 1` names one, and no other does.
+pub const SYSCALLS: u64 = 28;
 /// The power node's halt, the byte a `Write` to it carries: every disk flushed, every processor
 /// stopped, and the machine stays on, saying it is safe to turn it off. Only `init` holds the node,
 /// and its write **returns only to refuse**.

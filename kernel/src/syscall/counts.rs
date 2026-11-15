@@ -19,11 +19,11 @@ use core::fmt::Write;
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering::Relaxed};
 
 use crate::mm::user_access::{UserPtr, copy_slice_from_user};
-use crate::syscall::table::{SYS_DEBUG_KPRINT, SYS_PROCESS_EXIT, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE};
+use crate::syscall::table::{SYS_DEBUG_KPRINT, SYS_PROCESS_EXIT, SYS_PROCESS_SPAWN, SYSCALLS};
 
 const PIDS: usize = 512;
 /// The numbered syscalls, then `debug_kprint`, then any other, by name.
-const SLOTS: usize = SYS_PROCESS_TERMINATE as usize + 3;
+const SLOTS: usize = SYSCALLS as usize + 2;
 const NAME_WORDS: usize = 3;
 
 static COUNTS: [[AtomicU32; SLOTS]; PIDS] = [const { [const { AtomicU32::new(0) }; SLOTS] }; PIDS];
@@ -34,7 +34,7 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 /// The slot syscall `nr` counts in.
 fn slot(nr: u64) -> usize {
     match nr {
-        n if n <= SYS_PROCESS_TERMINATE => n as usize,
+        n if n < SYSCALLS => n as usize,
         SYS_DEBUG_KPRINT => SLOTS - 2,
         _ => SLOTS - 1,
     }
@@ -141,9 +141,9 @@ mod tests {
 
     #[test]
     fn each_number_has_its_slot_and_the_debug_and_other_calls_theirs() {
-        assert_eq!((slot(0), slot(SYS_PROCESS_TERMINATE)), (0, SYS_PROCESS_TERMINATE as usize));
+        assert_eq!((slot(0), slot(SYSCALLS - 1)), (0, SYSCALLS as usize - 1));
         assert_eq!(slot(SYS_DEBUG_KPRINT), SLOTS - 2);
-        assert_eq!((slot(SYS_PROCESS_TERMINATE + 1), slot(0xFFFF_0002)), (SLOTS - 1, SLOTS - 1));
+        assert_eq!((slot(SYSCALLS), slot(0xFFFF_0002)), (SLOTS - 1, SLOTS - 1));
     }
 
     #[test]

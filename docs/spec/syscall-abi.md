@@ -66,9 +66,14 @@ A page of the user buffer not yet faulted in is served where nothing has to wait
 
 ## Syscall numbering
 
-Syscall numbers are not yet stabilized. The current convention is sequential allocation in `kernel/src/syscall/table.rs`, with stable assignments to be made before the v1.0 ABI freeze. Userspace code should reference syscalls by name through `libkern`, not by number.
+Syscall numbers are not yet stabilized; stable assignments are made before the v1.0 ABI freeze.
+Userspace code references syscalls by name through `libkern`, not by number, and both copies are
+held equal by `cargo xtask abi-sync-check`.
 
-The first stable numbers, allocated sequentially from `0`, are the handle operations:
+**The numbers are `0` to `27`, dense and in family order**: the handles, memory, the clock and
+timers, waits and notifications, the channels, processes and threads, namespaces, and I/O.
+`SYSCALLS` (`28`) is how many there are, and **every other number answers `Unsupported`**, as
+one past the last does:
 
 | Number | Syscall |
 |---|---|
@@ -89,7 +94,8 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `14` | `sys_channel_recv` |
 | `15` | `sys_process_spawn` |
 | `16` | `sys_process_exit` |
-| `17` | `sys_thread_exit` |
+| `17` | `sys_process_terminate` |
+| `18` | `sys_thread_exit` |
 | `19` | `sys_thread_create` |
 | `20` | `sys_thread_get_registers` |
 | `21` | `sys_exception_resume` |
@@ -97,18 +103,10 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `23` | `sys_ns_lookup` |
 | `24` | `sys_ns_bind` |
 | `25` | `sys_ns_unbind` |
-| `28` | `sys_io_submit` |
-| `30` | `sys_ns_enumerate` |
-| `36` | `sys_process_terminate` |
+| `26` | `sys_ns_enumerate` |
+| `27` | `sys_io_submit` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. **Fourteen are
-vacant**, and answer `Unsupported`, as any number nothing holds does, until they are assigned
-again: `31` to `35`, `38` and `39` went when a resolve came to carry its operation and a file's
-flush became an `io_submit` (pre-Phase-7 E.7); `18` (`thread_set_affinity`) and `29`
-(`io_cancel`) went for want of a caller, `26` and `27` (`entropy_create`, `entropy_read`) when
-entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9); `40` (`power`) when the power node
-came to take a one-byte write, and `41` (`clock_set`) when the clock became a node (both
-2026-11-15).
+A new syscall takes the next number, `SYSCALLS`, and `SYSCALLS` moves past it.
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -121,7 +119,7 @@ A small set of **debug-only** syscalls exists to bootstrap and exercise the kern
 
   **It does not diverge, and a caller must not assume it does.** Only `cargo xtask test-qemu` attaches the device; `check-input`, `check-display`, `check-terminal` and `test-interactive` boot the same `test-harness` image without it, because they need the guest alive afterwards. With no device the port write is ignored and the syscall **returns `Unsupported`** — the same answer a production kernel gives, which is the point: one code, one meaning. So `Unsupported` means "no verdict was delivered", never "your kernel is the wrong build". Writing a `-> !` helper around this and falling off its end is undefined behaviour on four of the five gates; the earlier `-> !` in this entry was wrong (corrected 2026-08-13, see the decision log).
 
-(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (17); its number is left vacant — `sys_test_exit` deliberately takes the next one to avoid conflation.)
+(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (18); its number is left vacant — `sys_test_exit` deliberately takes the next one to avoid conflation.)
 
 ## The complete syscall set
 
@@ -203,7 +201,7 @@ request returns a **pre-signalled** PO, so callers have one code path.
 `resource`, malformed/misaligned `IoOp`, an unusable `buffer`, PO/handle
 exhaustion) return a negative `KError` **synchronously**, with no PO created;
 *device/medium* failures are delivered **through the PO** — the same split as the
-namespace lookup. (Syscall number `28`.)
+namespace lookup. (Syscall number `27`.)
 
 **Nothing cancels an operation once it is submitted** (`TODO(io-cancel)`): a waiter may give up
 its wait, and the operation runs to its end. `sys_io_cancel` (`29`), which only ever answered
@@ -224,7 +222,7 @@ listing may shift what follows, and each is written whole, its path's unused byt
 binding path's true length), `kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max
 rights), and the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
 bindings** — mount points + kernel resources — not the files inside a mounted filesystem (that is an
-fs-server `readdir`, deferred). Synchronous (the kernel holds the bindings). (Syscall number `30`.)
+fs-server `readdir`, deferred). Synchronous (the kernel holds the bindings). (Syscall number `26`.)
 
 ```rust
 fn sys_wait(
@@ -446,7 +444,7 @@ Creates a new thread in the **calling process** and returns a `Thread` handle (`
 ```rust
 fn sys_thread_exit(status: i32) -> !
 ```
-Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive); after a `sys_process_exit` by another of its threads, its `status` is that call's, not this one's. Does not return. (Syscall number `17`.)
+Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive); after a `sys_process_exit` by another of its threads, its `status` is that call's, not this one's. Does not return. (Syscall number `18`.)
 
 ```rust
 fn sys_process_exit(status: i32) -> !
@@ -481,7 +479,7 @@ fn sys_process_terminate(process: RawHandle) -> isize
 body) on the target's own `NotificationChannel` and wakes anything blocked on it. Requires
 `SIGNAL` right and a `Process` handle. Returns `0`, or `Unsupported` if the target has no
 notification channel attached — it cannot be asked, and saying so beats succeeding at a
-message nobody will read. (Syscall number `36`.)
+message nobody will read. (Syscall number `17`.)
 
 **It is a request, and the kernel does nothing else.** No thread is stopped, no stack is
 unwound, and the target's execution is not touched — so there is no "safe point" question
