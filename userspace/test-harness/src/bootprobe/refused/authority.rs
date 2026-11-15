@@ -7,8 +7,8 @@ use libkern::{
 };
 use libos::{Channel, Handle, MapReadWrite, Memory, Namespace, NsReadOnly, Only, Ref};
 
-/// What a write of the halt byte to the raw handle `h` answers, which halts the machine if `h` is
-/// the power node: its submit's refusal, or an operation made for a write some node took.
+/// What a write of the halt byte to the raw handle `h` answers: it halts the machine if `h` is the
+/// power node.
 pub(crate) fn power(h: u64) -> i64 {
     // A fresh page reads zero, `POWER_HALT`.
     let Ok(page) = Handle::<Memory, MapReadWrite>::create(1) else { return i64::MIN };

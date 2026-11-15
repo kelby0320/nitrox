@@ -15,9 +15,8 @@
 //! **There is no power-off.** Entering S5 needs AML, which waits for ACPICA
 //! (`docs/rationale/why-phased-acpi.md`).
 //!
-//! **Outside the async-first rule, deliberately.** A write to the power node acts within
-//! `sys_io_submit`, before an operation is made for it ([`CharBackend::act`]), and never returns,
-//! so there would be nothing to hand a `PendingOperation` to; the flush waits here, bounded.
+//! **Outside the async-first rule, deliberately.** A write here acts within `sys_io_submit`
+//! ([`CharBackend::act`]) and never returns, so no operation is made; the flush waits, bounded.
 //!
 //! What stops the machine is `init`'s alone: the one power node is made at boot and handed to it
 //! with [`INIT_RIGHTS`], which it can neither duplicate nor transfer, and bound in no namespace.
@@ -48,8 +47,7 @@ pub const SAFE_TO_TURN_OFF: &str = "It is now safe to turn off your computer.";
 /// The line a reboot shows while the platform resets.
 const RESTARTING: &str = "Restarting.";
 
-/// The rights `init`'s handle to the power node carries: `WRITE`, to stop the machine, and
-/// `INSPECT`; neither `DUPLICATE` nor `TRANSFER`, so it can give the handle to no one.
+/// `init`'s rights to the power node: neither `DUPLICATE` nor `TRANSFER`, so it gives it to no one.
 pub const INIT_RIGHTS: Rights = Rights::WRITE.union(Rights::INSPECT);
 
 /// The power node's backend: no read, and a write that acts at once.
@@ -60,9 +58,7 @@ fn no_read(_: &Ref<MemoryObject>, _: &Ref<PendingOperation>, _: u64, _: u64, _: 
     Err(KError::Unsupported)
 }
 
-/// **A write to the power node**: one byte, `POWER_HALT` or `POWER_REBOOT`, flushes, stops and
-/// halts or resets the machine. Any other length or byte is refused `InvalidArgument`, the only
-/// way this returns.
+/// One byte, `POWER_HALT` or `POWER_REBOOT`, stops the machine; any other is `InvalidArgument`.
 fn write(buffer: &MemoryObject, buf_offset: u64, len: u64) -> KError {
     let Some(op) = op_in(buffer, buf_offset, len) else { return KError::InvalidArgument };
     let (pid, what) = (crate::sched::current_owner_pid(), if op == PowerOp::Halt { "halt" } else { "reboot" });
@@ -70,7 +66,6 @@ fn write(buffer: &MemoryObject, buf_offset: u64, len: u64) -> KError {
     power(op)
 }
 
-/// The stop a write of `len` bytes from `buffer` at `buf_offset` names: one byte naming one.
 fn op_in(buffer: &MemoryObject, buf_offset: u64, len: u64) -> Option<PowerOp> {
     let mut byte = [0u8; 1];
     (len == 1 && buffer.copy_out(buf_offset as usize, &mut byte) == 1).then_some(())?;

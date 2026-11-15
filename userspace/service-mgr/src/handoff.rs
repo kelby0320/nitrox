@@ -1,13 +1,18 @@
 //! Handles moved over a channel one to a message, read positionally.
 
-use super::{Endpoint, READY_TIMEOUT_NS, now_ns, send_msg};
-use libos::{Carried, Deadline, Handle, Msg, WaitSet, log};
+use libos::{Carried, Channel, Deadline, Handle, Msg, Only, Resource, WaitSet, WriteOnly, log};
 
-/// Receive one handle from init's handoff channel; `None` if the message was empty or the receive
-/// failed. **Bounded**: an unbounded wait would hang the supervisor on a message never coming.
-pub(super) fn recv_handoff<T, M>(ctrl: &Endpoint) -> Option<Handle<T, M>> {
+/// A channel end.
+pub type Endpoint = Handle<Channel, Only>;
+/// The clock node.
+pub type Clock = Handle<Resource, WriteOnly>;
+
+/// Receive one handle from `ctrl` within `wait_ns`, or `None`: an unbounded wait would hang the
+/// supervisor on a message never coming.
+pub fn recv_handoff<T, M>(ctrl: &Endpoint, wait_ns: u64) -> Option<Handle<T, M>> {
     let mut set = WaitSet::<1>::new();
-    let deadline = Deadline::at(now_ns().saturating_add(READY_TIMEOUT_NS));
+    // A clock that cannot be read counts from boot, so the wait still ends.
+    let deadline = Deadline::at(libos::time::now().unwrap_or(0).saturating_add(wait_ns));
     if !set.add(ctrl).and_then(|_| set.wait(deadline)).is_ok_and(|s| !s.is_empty()) {
         log::write(b"service-mgr: handoff timeout\n");
         return None;
@@ -18,14 +23,38 @@ pub(super) fn recv_handoff<T, M>(ctrl: &Endpoint) -> Option<Handle<T, M>> {
 
 /// Move `handle` to a child over its control channel; one refused is closed, and as `None`
 /// sends **an empty message**: the receiver reads the handoffs positionally.
-pub(super) fn send_handle<T, M>(ctrl: &Endpoint, handle: Option<Handle<T, M>>) {
+pub fn send_handle<T, M>(ctrl: &Endpoint, handle: Option<Handle<T, M>>) {
     let mut carried = Carried::new();
     if let Some(handle) = handle
         && carried.push(handle).is_ok()
-        && send_msg(ctrl, &[], &mut carried)
+        && send(ctrl, &mut carried)
     {
         return;
     }
     drop(carried);
-    send_msg(ctrl, &[], &mut Carried::new());
+    send(ctrl, &mut Carried::new());
 }
+
+/// **What a service is handed after its spawn, in order**: its log endpoint, if it is not a
+/// server; then the clock node if it declares `clock`, moved, so a later declarer gets none.
+pub fn hand_on(
+    ours: &Endpoint,
+    server: bool,
+    log_ep: Option<Endpoint>,
+    declares_clock: bool,
+    clock: &mut Option<Clock>,
+) {
+    if !server {
+        send_handle(ours, log_ep);
+    }
+    if declares_clock {
+        send_handle(ours, clock.take());
+    }
+}
+
+fn send(ch: &Endpoint, carried: &mut Carried) -> bool {
+    ch.send(&Msg::new(), carried).is_ok()
+}
+
+#[cfg(test)]
+mod tests;

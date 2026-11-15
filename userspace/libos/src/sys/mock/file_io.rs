@@ -101,9 +101,7 @@ pub(super) fn entropy_read(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     m.po(Po { ready: true, never: false, status: 0, result: n as u64, lookup: None })
 }
 
-/// A write to the power node, as the kernel takes it, within the submit: one byte naming a stop
-/// panics `power(<op>)`, the test's way to see the machine stop; any other length or byte is
-/// refused `InvalidArgument`, with no operation made.
+/// A write to the power node: a stop panics `power(<op>)`, the test's way to see the machine stop.
 pub(super) fn power_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     if let Err(r) = m.typed(h, Rights::WRITE, KObjectType::DeviceNode) {
         return r;
@@ -121,23 +119,29 @@ pub(super) fn power_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     }
 }
 
-/// A write to the clock node, as the kernel takes it: eight bytes of a time in 2000 to 2099, else
-/// `InvalidArgument`; its operation answers `CLOCK_SET_KEPT`, or what `answer_next_clock_set`
-/// armed, and a set the wall clock reads.
+/// A request to the clock node, as the kernel takes it; a set answers what `answer_next_clock_set`
+/// armed, else `CLOCK_SET_KEPT`.
 pub(super) fn clock_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     const Y2000: u64 = 946_684_800_000_000_000;
     const Y2100: u64 = 4_102_444_800_000_000_000;
-    if op.opcode != libkern::IO_OPCODE_WRITE {
-        return e(KError::Unsupported);
-    }
-    if let Err(r) = m.typed(h, Rights::WRITE, KObjectType::DeviceNode) {
+    let read = op.opcode == libkern::IO_OPCODE_READ;
+    if let Err(r) = m.typed(h, if read { Rights::READ } else { Rights::WRITE }, KObjectType::DeviceNode) {
         return r;
     }
+    if read {
+        return e(KError::Unsupported);
+    }
     let b = match m.get(op.buffer, Rights::MAP_READ) {
-        Ok((b, _)) if matches!(m.objects[b], Object::Memory(_)) && op.length == 8 => b,
+        Ok((b, _)) if matches!(m.objects[b], Object::Memory(_)) => b,
         Ok(_) => return e(KError::InvalidArgument),
         Err(r) => return r,
     };
+    if op.length == 0 {
+        return m.po(Po { ready: true, never: false, status: 0, result: 0, lookup: None });
+    }
+    if op.length != 8 {
+        return e(KError::InvalidArgument);
+    }
     let at = op.buf_offset as usize;
     let pages = pages(&m.objects[b]);
     let bytes: Vec<u8> = (at..at + 8).filter_map(|i| pages.0.get(i / PAGE).map(|page| page.0[i % PAGE])).collect();

@@ -4,9 +4,8 @@ use super::*;
 use libos::{MapReadWrite, Memory, NsMutable, ReadWrite, Resource, WriteOnly};
 
 /// **A stop from anything but `init` is refused**, and the machine goes on: the halt byte written
-/// to no handle, to a namespace this process may only look up in, and to a disk it may write — a
-/// `WRITE` handle, so it is the node that refuses it, its write a whole number of blocks, before
-/// any I/O, not a missing right.
+/// to no handle, to a lookup-only namespace, and to a disk it may write, which refuses a write
+/// that is not a whole number of blocks.
 ///
 /// The halt it would otherwise be is what makes a wrong answer loud: the boot stops before the
 /// verdict, and `test-qemu` times out.
@@ -220,8 +219,8 @@ pub(super) fn lookup_po_stays_test(root: Root<'_>) -> bool {
 }
 
 /// **A direct-handle bind needs `TRANSFER`**, since every resolve of the binding mints a handle
-/// to the object for whoever asked: without it, `init` could publish its system-control object,
-/// whose handle carries no `TRANSFER` so that it cannot leave `init`.
+/// to the object for whoever asked: without it, `init` could publish its power node, whose handle
+/// carries no `TRANSFER` so that it cannot leave `init`.
 ///
 /// A memory object's handle, duplicated without `TRANSFER` or without `DUPLICATE`, is refused
 /// `NoAccess`, as a bind gives it away and is a copy, and the original, with both, is taken — in

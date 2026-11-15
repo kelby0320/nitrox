@@ -26,17 +26,16 @@ use libos::boot::Start;
 use libos::log::{self, Line};
 use libos::{
     CanLookup, Carried, Channel, Deadline, File, Handle, MapRead, Msg, Namespace, Notify, NsMutable, NsReadOnly, Only,
-    Process, Ref, Resource, Signalled, Spawn, WaitSet, WriteOnly, block_on, time,
+    Process, Ref, Signalled, Spawn, WaitSet, block_on, time,
 };
 use librsproto::server;
 use service_mgr::bringup::{self, Entry, Failed, Step};
+use service_mgr::handoff::{Clock, hand_on, recv_handoff, send_handle};
 use service_mgr::registry;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
 use service_mgr::{services, wake};
 
-mod handoff;
 mod reaping;
-use handoff::{recv_handoff, send_handle};
 use reaping::{Ready, Reaping, channel_peer_closed, drain_codes, take_ready};
 
 #[global_allocator]
@@ -58,7 +57,6 @@ const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 const UNSLOTTED_POLL_NS: u64 = 10_000_000;
 
 type Endpoint = Handle<Channel, Only>;
-type Clock = Handle<Resource, WriteOnly>;
 /// A namespace this manager binds in: the root with `init`'s rights, or its registry.
 type BindNs = Handle<Namespace, NsMutable>;
 
@@ -268,16 +266,8 @@ fn spawn_service(
     };
     // The spawn ABI delivers one handle to a register, so the log endpoint follows on the
     // control channel, as a non-server's first message: empty without one, as heartbeat takes it.
-    if decl.endpoint.is_none()
-        && let Some(ours) = &smgr_end
-    {
-        send_handle(ours, log_ep);
-    }
-    // And the clock node, after it, moved to the service that declares it, which takes it once.
-    if decl.clock
-        && let Some(ours) = &smgr_end
-    {
-        send_handle(ours, clock.take());
+    if let Some(ours) = &smgr_end {
+        hand_on(ours, decl.endpoint.is_some(), log_ep, decl.clock, clock);
     }
     (Some(process), smgr_end)
 }
@@ -411,7 +401,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, arg0: u64) -> 
     let terminal: Option<Endpoint> = start.take_handle0();
     let (root_bind, fs_endpoint, profile_endpoint, clock) = match &terminal {
         None => (None, None, None, None),
-        Some(t) => (recv_handoff(t), recv_handoff(t), recv_handoff(t), recv_handoff(t)),
+        Some(t) => {
+            let w = READY_TIMEOUT_NS;
+            (recv_handoff(t, w), recv_handoff(t, w), recv_handoff(t, w), recv_handoff(t, w))
+        }
     };
     if root_bind.is_none() {
         log::write(b"service-mgr: no root handle from init -- no server can be bound\n");

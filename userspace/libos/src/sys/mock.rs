@@ -882,7 +882,6 @@ pub fn test_exit(code: u64) -> i64 {
     e(KError::Unsupported)
 }
 
-/// As the kernel answers: a refusal, or for a stop it accepts, a panic, as it does not return.
 mod controls;
 mod file_io;
 mod resolve;

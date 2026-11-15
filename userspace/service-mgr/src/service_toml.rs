@@ -105,8 +105,7 @@ pub struct ServiceDecl {
     /// **A service `service --stop` and `--restart` refuse**: one whose absence would
     /// lock the administrator out, or lose state nothing rebuilds.
     pub essential: bool,
-    /// **Handed the clock node** on its control channel at its start, the one handle a service
-    /// may be given beyond its own channel: `service-mgr` moves it, so it reaches one service once.
+    /// **Handed the clock node** at its start, moved, so it reaches one service once.
     pub clock: bool,
     /// **How long it may take to exit once asked to stop**, in nanoseconds — at a shutdown, or
     /// on `service --stop` — or `None` for `service-mgr`'s own bound. For a service whose stop

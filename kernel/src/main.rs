@@ -697,7 +697,7 @@ unsafe fn unmap_plain(base: nitrox_kernel::mm::VirtAddr, pages: u64) {
 
 /// Load and launch **init** from the initramfs (`/sbin/init`) as
 /// pid 1, with `rdi` = its notification-channel handle, `rsi` = a full-rights root-namespace handle
-/// carrying the boot kernel-server bindings, `rdx` = the system-control handle.
+/// carrying the boot kernel-server bindings, `rdx` = the power node, `rcx` = the clock node.
 fn run_first_userspace() {
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;

@@ -79,7 +79,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │                      libdraw/libui/libsurface, libfs, …         │
 │   Raw syscall layer:  libkern                                   │
 └────────────────────────────────────┬────────────────────────────┘
-                                     │ syscall boundary (39 syscalls)
+                                     │ syscall boundary (28 syscalls, and 2 debug calls)
 ┌────────────────────────────────────┴────────────────────────────┐
 │ Kernel                                                          │
 │                                                                 │

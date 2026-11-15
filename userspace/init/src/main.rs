@@ -555,7 +555,7 @@ fn reap_loop(notify: Option<Handle<Notify, Only>>, root: Root, mut terminal: Opt
 
 /// **Finish a shutdown.** `service-mgr` has asked every session and service to stop. What is left
 /// is `init`'s own: its mounts, last first — each flushed, then told `Meta::Unmount`, on which its
-/// server records the filesystem clean and exits — and then the machine, through `sys_power`.
+/// server records the filesystem clean and exits — and then the machine, by the power node.
 /// Whatever one mount answers, the next is still unmounted, since one stopped half way leaves every
 /// later filesystem not clean; whatever still runs writes after the flush at its own risk, as at a
 /// power cut. **Each wait is bounded**: a flush by `FLUSH_TIMEOUT_NS`, an unmount's answer by
@@ -632,8 +632,12 @@ fn keep_power(h: Option<Handle<Resource, WriteOnly>>) -> Option<Power<WriteOnly>
         h.stat().is_ok_and(|info| info.object_type == KOBJ_DEVICE_NODE && info.rights & Rights::WRITE.bits() != 0)
     };
     match h.filter(is_it).map(Power::new) {
-        Some(Ok(power)) => {
-            log::write(b"init: holds the power node\n");
+        Some(power) => {
+            log::write(if power.ready() {
+                b"init: holds the power node\n"
+            } else {
+                b"init: holds the power node -- its page is made at the stop, for want of memory now\n"
+            });
             Some(power)
         }
         _ => {

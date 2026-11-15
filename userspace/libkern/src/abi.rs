@@ -201,7 +201,7 @@ pub const CTRL_OP_SHUTDOWN: u8 = 1;
 pub const TERMINAL_OP_EMERGENCY: u8 = 1;
 
 /// `service-mgr` → `init`, on the terminal channel: every session and service has been asked to
-/// stop, so finish the shutdown — `init`'s own mounts, last first, then `sys_power`. Two bytes
+/// stop, so finish the shutdown — `init`'s own mounts, last first, then the power node. Two bytes
 /// of payload: this op, then `1` to reboot or `0` to halt.
 pub const TERMINAL_OP_FINISH: u8 = 2;
 
@@ -283,11 +283,11 @@ pub const CLOCK_MONOTONIC: u64 = 0;
 pub const CLOCK_REALTIME: u64 = 1;
 
 /// A write to the clock node set the clock, and the machine's hardware clock holds it: the next
-/// boot anchors to it. The write's `result`.
-pub const CLOCK_SET_KEPT: u64 = 0;
+/// boot anchors to it. The write's `result`, never `0`, a zero-length write's.
+pub const CLOCK_SET_KEPT: u64 = 1;
 /// A write to the clock node set the clock, but the hardware clock did not take the time — there
 /// is none, or it did not read back — so it lasts until the next boot.
-pub const CLOCK_SET_THIS_BOOT: u64 = 1;
+pub const CLOCK_SET_THIS_BOOT: u64 = 2;
 
 /// One completion record `sys_wait` writes per signaled handle; 24 bytes.
 #[repr(C)]

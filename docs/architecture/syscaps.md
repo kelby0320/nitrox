@@ -59,7 +59,8 @@ the enforcement is only as broad as the operations that exist.
 A hand-rolled `SysCaps(u64)`, mirroring `Rights`'s style (the kernel forbids the
 `bitflags` crate). It is an ABI type — `SpawnArgs` carries it across the syscall
 boundary — so it lives in `kernel/src/libkern/syscaps.rs` and is mirrored in
-`userspace/libkern/src/syscaps.rs`, exactly like `Rights`:
+`userspace/libkern/src/syscaps.rs`, exactly like `Rights`, and `cargo xtask abi-sync-check` holds
+each bit the same in both:
 
 ```rust
 #[repr(transparent)]

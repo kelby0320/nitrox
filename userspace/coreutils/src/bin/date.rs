@@ -117,8 +117,7 @@ fn set(stage: &Stage, time: &str) {
     // `parse_utc` reads four digits of year, so a time before 1970 is the only negative, and the
     // kernel refuses it with everything else outside 2000-2099.
     let ns = u64::try_from(secs).unwrap_or(0).saturating_mul(1_000_000_000);
-    // The clock node is the authority, bound only where the `clock` grant put it; the kernel
-    // checks the time.
+    // Bound only where the `clock` grant put it.
     let clock = block_on(stage.namespace.lookup::<Resource, WriteOnly>(CLOCK_PATH, Rights::WRITE));
     match clock.and_then(|clock| set_clock(&clock, ns)) {
         Err(e) if e.code() == KError::NotFound || e.code() == KError::NoAccess => stage.die(

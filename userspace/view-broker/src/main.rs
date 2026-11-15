@@ -27,7 +27,6 @@
 extern crate alloc;
 
 mod admin;
-mod clock;
 mod wire;
 
 use alloc::string::String;
@@ -46,6 +45,7 @@ use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, OP_TTY_REDEEM, RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_TOKEN_LEN, server};
 use libstream::setup::{StageStreams, bootstrap_arg0, send_stage_setup};
 use libstream::wire::{ByteSource, Record, TypeTag, Value, read_value};
+use view_broker::clock;
 use view_broker::exits::Exits;
 use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
@@ -850,7 +850,7 @@ impl Broker {
         let Some(Ok(view_ns)) = p.handles.ns.take().map(|ns| ns.copy()) else {
             return Err("could not copy the caller's namespace");
         };
-        let mut kernel_log_ours = false;
+        let (mut kernel_log_ours, mut clock_ours) = (false, false);
         for g in &p.grants {
             match g {
                 // Every disk not in use: a mounted filesystem's device, `init`'s root included,
@@ -906,7 +906,7 @@ impl Broker {
                         return Err("the kernel's log is not there to grant");
                     }
                 }
-                Grant::Clock => clock::bind(self.clock.as_ref(), &view_ns)?,
+                Grant::Clock => clock_ours = clock::bind(self.clock.as_ref(), &view_ns)?,
                 // The broker's own endpoint with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
                 Grant::Views => {
@@ -931,7 +931,7 @@ impl Broker {
             Grant::Views => Some(POLICY_GRANT),
             Grant::Accounts => Some(ACCOUNTS_GRANT),
             Grant::KernelLog => kernel_log_ours.then_some(KERNEL_LOG),
-            Grant::Clock => Some(libos::system::CLOCK_PATH),
+            Grant::Clock => clock_ours.then_some(libos::system::CLOCK_PATH),
             Grant::Disks => None,
         });
         let granted = Granted { paths: paths.collect(), disks: p.grants.contains(&Grant::Disks) };

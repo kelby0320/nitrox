@@ -124,14 +124,12 @@ pub fn device() -> u64 {
     with(|m| m.mint(Object::Device, Rights::READ | Rights::WRITE) as u64)
 }
 
-/// The clock node, with the rights the kernel hands it to `init` with: `WRITE`, `INSPECT`, and the
-/// two that move it on and bind it.
+/// The clock node, with the rights the kernel hands it to `init` with.
 pub fn clock_node() -> u64 {
     with(|m| m.mint(Object::Clock, Rights::WRITE | Rights::INSPECT | Rights::DUPLICATE | Rights::TRANSFER) as u64)
 }
 
-/// The power node, with `WRITE | INSPECT` and neither `DUPLICATE` nor `TRANSFER`, as the kernel
-/// hands it to `init`.
+/// The power node, with the rights the kernel hands it to `init` with.
 pub fn power_node() -> u64 {
     with(|m| m.mint(Object::Power, Rights::WRITE | Rights::INSPECT) as u64)
 }

@@ -8,11 +8,11 @@
 //! scheduler accounts CPU time (the `sys_clock_read` handler's TODO).
 
 /// A write to the clock node set the clock, and the machine's hardware clock holds the time, so
-/// the next boot anchors to it: the operation's `result`.
-pub const CLOCK_SET_KEPT: u64 = 0;
+/// the next boot anchors to it: the operation's `result`. Not `0`, a zero-length write's.
+pub const CLOCK_SET_KEPT: u64 = 1;
 /// A write to the clock node set the clock, but the hardware clock did not take the time — there
 /// is none, or it did not read back — so it lasts until the next boot.
-pub const CLOCK_SET_THIS_BOOT: u64 = 1;
+pub const CLOCK_SET_THIS_BOOT: u64 = 2;
 
 /// The clock selected by `sys_clock_read`. `#[repr(u32)]`; the discriminants are the ABI.
 #[repr(u32)]

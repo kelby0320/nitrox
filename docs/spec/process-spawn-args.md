@@ -90,15 +90,16 @@ closes).
 
 Phase 1/2 has no argc/argv/auxv. The kernel seeds **four** argument registers at
 the child's first ring-3 entry, read directly as the `extern "C"` parameters of
-the child's `_start`. This is the uniform bootstrap convention across pid 1,
-`sys_process_spawn`, and `sys_thread_create`:
+the child's `_start`. This is the bootstrap convention across `sys_process_spawn` and
+`sys_thread_create`, and **pid 1's, but for `rdx` and `rcx`**, which the kernel fills with the
+two nodes only `init` is given:
 
 | Register | Value |
 |---|---|
 | `rdi` | the child's notification-channel handle |
 | `rsi` | the child's **root-namespace** handle (`LOOKUP`-only), or `0` if none |
-| `rdx` | the child's first installed handle (`handles[0]`), or `0` if none — for pid 1, the power node (administration Part E.3) |
-| `rcx` | `args.arg0` — an opaque word, or a **bootstrap descriptor** (below) |
+| `rdx` | the child's first installed handle (`handles[0]`), or `0` if none — for pid 1, the power node (2026-11-15) |
+| `rcx` | `args.arg0` — an opaque word, or a **bootstrap descriptor** (below) — for pid 1, the clock node, a handle, which `init` moves to `service-mgr` (2026-11-15) |
 
 This register bootstrap is the universal, zero-syscall floor and it **stays** — the
 earlier plan to replace it with a kernel stack-resident bootstrap block was considered
@@ -111,7 +112,8 @@ bootstrap endpoint (`rdx`), not from the kernel. See
 ### `arg0` is the bootstrap descriptor
 
 `arg0` (`rcx`) is opaque *to the kernel*, but userspace has exactly **one**
-convention for it, system-wide: it is the **bootstrap descriptor**. No program
+convention for it, in every process a spawn makes: it is the **bootstrap descriptor**. Pid 1,
+which no spawn makes, has the clock node there instead, as the table says. No program
 repurposes it for private payload — a program that needs parameters receives them as
 `argv` in the setup message (Tier 1), not in `arg0`. `arg0 == 0` ⇒ Tier 0,
 register-only; a non-zero descriptor (`[7:0]` version `1`, `[8]` `SETUP_PENDING`)

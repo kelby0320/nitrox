@@ -20,7 +20,6 @@ pub fn clock_read(clock: u64, out: &mut u64) -> i64 {
     })
 }
 
-/// `InvalidArgument` outside 2000 to 2099, as the kernel answers, then what a test armed.
 pub fn timer_create() -> i64 {
     with(|m| m.mint(Object::Timer(0), Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER))
 }

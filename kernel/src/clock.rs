@@ -11,10 +11,8 @@
 //!   `arch/x86_64/rtc.rs`), so it is paid once at boot rather than per timestamp: the filesystem
 //!   server stamps an inode on every create, mkdir and rename.
 //! - **Setting the clock is a single atomic store** to the offset ([`set`]), then a write of the
-//!   RTC so the next boot anchors to what was set. Adjusting time-of-day is real authority (it
-//!   moves every future timestamp), so it is a `Write` of eight bytes to the **clock node**
-//!   ([`BACKEND`]), a handle the kernel gives `init` alone and every holder passes on by moving
-//!   it; reading is ambient, as `CLOCK_MONOTONIC` already is. See the decision log, 2026-07-24.
+//!   RTC so the next boot anchors to what was set. Adjusting time-of-day is real authority, so it
+//!   is a write to the **clock node** ([`BACKEND`]); reading is ambient, as `CLOCK_MONOTONIC` is.
 //!
 //! If the RTC cannot be read (no such device, or an implausible date), the clock stays **unset**
 //! until something sets it, and `CLOCK_REALTIME` keeps returning `Unsupported` rather than
@@ -90,8 +88,7 @@ pub fn set(ns: u64) -> bool {
     rtc.set_wall_clock_seconds((ns / NS_PER_SEC as u64) as i64)
 }
 
-/// The rights `init`'s handle to the clock node carries: `WRITE`, to set the clock, `INSPECT`, and
-/// the two that let it move on and be bound in a view, `TRANSFER` and `DUPLICATE`.
+/// `init`'s rights to the clock node: `WRITE` and `INSPECT`, and the two a move and a bind need.
 pub const INIT_RIGHTS: Rights = Rights::WRITE.union(Rights::INSPECT).union(Rights::TRANSFER).union(Rights::DUPLICATE);
 
 /// The clock node's backend: no read, and a write that sets the clock.
@@ -102,10 +99,8 @@ fn no_read(_: &Ref<MemoryObject>, _: &Ref<PendingOperation>, _: u64, _: u64, _: 
     Err(KError::Unsupported)
 }
 
-/// **A write to the clock node sets the wall clock**: eight bytes, little-endian nanoseconds since
-/// the epoch, in 2000 to 2099 ([`settable`]), else `InvalidArgument`. Its operation completes with
-/// `CLOCK_SET_KEPT` when the RTC read back what was written and `CLOCK_SET_THIS_BOOT` when it did
-/// not, the clock set either way. Every set is logged.
+/// **A write sets the wall clock**: eight bytes, little-endian nanoseconds in 2000 to 2099
+/// ([`settable`]), else `InvalidArgument`; its `result` says whether the RTC kept it.
 fn write(
     buffer: &Ref<MemoryObject>,
     po: &Ref<PendingOperation>,
@@ -124,12 +119,15 @@ fn write(
             secs
         );
     }
-    crate::sched::complete_pending_op(po, 0, if kept { CLOCK_SET_KEPT } else { CLOCK_SET_THIS_BOOT });
+    crate::sched::complete_pending_op(po, 0, answer(kept));
     Ok(())
 }
 
-/// The time a write of `len` bytes from `buffer` at `buf_offset` asks for, and its seconds: eight
-/// bytes, a time [`settable`] allows.
+/// Never `0`, which a zero-length write completes with, having set nothing.
+const fn answer(kept: bool) -> u64 {
+    if kept { CLOCK_SET_KEPT } else { CLOCK_SET_THIS_BOOT }
+}
+
 fn asked(buffer: &MemoryObject, buf_offset: u64, len: u64) -> Option<(u64, i64)> {
     let mut bytes = [0u8; 8];
     (len == 8 && buffer.copy_out(buf_offset as usize, &mut bytes) == 8).then_some(())?;
@@ -172,6 +170,12 @@ mod tests {
         assert_eq!(asked(&page, 16, 8).map(|(_, s)| s), Some(946_684_800), "and 2000 itself");
         assert_eq!(asked(&page, 0, 7), None, "seven bytes");
         assert_eq!(asked(&page, 0, 16), None, "sixteen");
+    }
+
+    #[test]
+    fn a_set_answers_whether_the_rtc_kept_it_and_never_zero() {
+        assert_eq!((answer(true), answer(false)), (CLOCK_SET_KEPT, CLOCK_SET_THIS_BOOT));
+        assert!(answer(true) != 0 && answer(false) != 0 && answer(true) != answer(false));
     }
 
     /// The offset arithmetic, independent of the hardware.

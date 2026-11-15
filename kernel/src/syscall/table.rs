@@ -634,7 +634,7 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
 /// Whether a handle carrying `rights` may be bound as a **direct handle**: `NoAccess` without
 /// `TRANSFER` and `DUPLICATE`. A direct bind gives the object away (every resolve mints a handle to
 /// it), as an IPC send and a spawn grant do, and the binder keeps its own, which makes it a copy;
-/// `init`'s system-control object carries neither, so it cannot leave `init`. A
+/// `init`'s power node carries neither, so it cannot leave `init`. A
 /// **userspace-server** bind needs no right: the kernel keeps the endpoint.
 fn direct_bindable(rights: Rights) -> Result<(), KError> {
     if rights.contains(Rights::TRANSFER | Rights::DUPLICATE) { Ok(()) } else { Err(KError::NoAccess) }

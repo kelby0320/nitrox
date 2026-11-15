@@ -252,11 +252,14 @@ in no namespace at boot. It moves on, a hop at a time, to `service-mgr` and then
 whose `clock` grant binds it at `/dev/clock` in a program's view. A `Write` of **exactly eight
 bytes**, little-endian nanoseconds since the Unix epoch, **in 2000-01-01 to 2099-12-31**, steps
 `Realtime` and writes the RTC under it. Any other length, or a time outside the range, is refused
-`InvalidArgument`. A read is `Unsupported`.
+`InvalidArgument`. **A read is refused `NoAccess`**: the node's handle never carries `READ`, and
+`sys_io_submit` checks it before the node is asked. **A zero-length write sets nothing**, and
+completes at once with `result` `0`, as every zero-length request does: no answer of the clock's
+is `0`.
 
 **It is an ordinary write**: a PO is made, and completes at once. Its **`result` is the clock's
-answer, not a byte count**: `CLOCK_SET_KEPT` (`0`) when the RTC read back what was written, or
-`CLOCK_SET_THIS_BOOT` (`1`) when it did not, and the clock then lasts until the next boot. The
+answer, not a byte count**: `CLOCK_SET_KEPT` (`1`) when the RTC read back what was written, or
+`CLOCK_SET_THIS_BOOT` (`2`) when it did not, and the clock then lasts until the next boot. The
 kernel logs each set (`wall clock: set to <secs> (Unix epoch seconds, UTC); …`). A write needs
 `WRITE` on the node and `MAP_READ` on the buffer, as any write does.
 
