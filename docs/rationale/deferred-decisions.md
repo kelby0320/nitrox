@@ -2307,24 +2307,15 @@ server's stay signalled and `sys_wait` fires again at once, a spin for the rest 
 `auth-service`'s leaves the wait set and `storage-service`'s and `device-mgr`'s exit. Only the
 registration going reaches it, which takes `service-mgr` with it.
 
-**libos is written to the surface Part E ends with, over today's calls — `TODO(surface-shape)`.**
-`system::stop` takes the system-control object as a char node, which it is not yet. `system::set_clock` is the exception, taking no handle:
-its authority is the `SYSTEM_CLOCK` grant until there is a clock node to hold, so its one caller,
-`date`, passes one when E.10 makes it. Every other caller is written once, against the shape it will
-keep, and the call under it changes as its sub-part of
-[`syscall-surface.md`](../planning/syscall-surface.md) lands: E.7 made both flushes, once answered
-within the call, a resolve and an `io_submit`; E.8 made `Spawn` read a file image into memory
-first; E.9 made entropy a node, read through the `/dev/entropy` a caller's namespace binds, so
-`entropy::fill` came to take that namespace: libos holds none of its own, and has nothing to start
-up. E.10 makes a stop and a clock set `Write`s to their nodes. Trigger: E.10.
-
 **Any process can end a test run — `TODO(test-verdict-authority)`.** `sys_test_exit` checks no
 handle and no syscap: a kernel built with the test harness writes the verdict to `isa-debug-exit`
 for whichever process asks, and every other kernel refuses it `Unsupported`. So on a test image any
 program ends the run with the verdict it likes, a stop of the machine with no authority behind it,
 and `libos::system::test_verdict` makes that a safe call for every crate on libos. Only `init` and
-`boot-probe` should hold it: a handle, as pre-Phase-7 Part E.10 makes each privileged operation a
-`Write` to a node. Trigger: E.10.
+`boot-probe` should hold it: a handle, as pre-Phase-7 Part E.10 made the stop and the clock set
+`Write`s to nodes (2026-11-15). E.10 left this one, a test build's debug call outside the
+numbered surface it changed. Trigger: a verdict node for the test harness, or a test run ended by
+a process that should not hold the verdict.
 
 **A resource-server reply's field offsets are literals on both sides — `TODO(rsproto-offsets)`.**
 `abi-sync-check` holds the kernel's rsproto constants to `librsproto`'s (the safety survey's
@@ -2553,6 +2544,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| libos written to the surface Part E ends with, over the calls before it (`surface-shape`) | 2026-11-15 | **Pre-Phase-7 E.7 to E.10**: the flushes became a resolve and an `io_submit` (E.7), `Spawn` read a file image into memory first (E.8), entropy became a node read through the caller's namespace, so `entropy::fill` takes it, libos holding none (E.9), and a stop and a clock set became writes to the power and clock nodes (E.10): every caller kept its shape but `entropy::fill`'s. |
 | A direct bind, a copy that needed no `DUPLICATE` (`direct-bind-copy`) | 2026-11-13 | **Pre-Phase-7 E.9**: `sys_ns_bind` asks `TRANSFER` and `DUPLICATE` of a direct handle, once every in-tree direct bind was checked: five now ask their source for `DUPLICATE` too, `libsession`'s console, generator, `/session/user` and a disk's info leaf, and the view broker's kernel log. A binding so carries `DUPLICATE`, which grants a resolver nothing a second resolve would not. |
 | A copy of a file over 8 MiB (`copy-limit`) | 2026-11-13 | **Pre-Phase-7 E.8**: a copy is `sys_io_submit(destination, Write, buffer = source file)`, a window of 16 MiB at a time with `IO_NOCACHE`, which lets each window's pages go once it is on the device, so `libfs` copies a file of any size the wire carries, 4 GiB less a byte, holding two windows at most. `check-copy` copies 512 MiB in a machine of 256 MiB. Widening the 32-bit size is a change of its own: a 5 GiB file answers `TooLarge` at the destination's create. |
 | A thread's stack with no guard below it (`thread-stack-guard`) | 2026-11-13 | **Pre-Phase-7 E.6**: a mapping placed without a hint keeps an unmapped page below itself, and below the mapping above it, so a `libos::thread::Stack` that overruns faults rather than write the mapping beneath. A hinted mapping is not held off that page. |
@@ -2601,7 +2593,7 @@ decision log entry for the date shown.
 | File truncate | 2026-07-24 | `RESOLVE_OP_TRUNCATE` → `RESOLVE_TRUNCATE` → `ext4::truncate_file`, kernel-forwarded so the page cache stays coherent. |
 | Reclaiming a process's handles at exit | 2026-07-24 | Marked thread + a batched sweep in `reap_pending`; `next_owned` stays unbuilt (the sweep scans). |
 | Wall-clock time | 2026-07-24 | `CLOCK_REALTIME` anchored from the CMOS RTC at boot; the fs-server stamps inodes. Setting the clock stayed unbuilt; this row pointed at an open entry for it that did not exist, until the row below (2026-09-29). |
-| Setting the clock | 2026-09-29 | Administration Part E.5: `sys_clock_set` needs `SYSTEM_CLOCK`, steps the offset, and writes the RTC in the chip's own encoding, read back; the `clock` grant and `date --set`. `check-shutdown` proves the time survives a reboot. No time-sync service: nothing sets the clock but a person. |
+| Setting the clock | 2026-09-29 | Administration Part E.5: `sys_clock_set` needed `SYSTEM_CLOCK` (a write to the clock node since 2026-11-15), steps the offset, and writes the RTC in the chip's own encoding, read back; the `clock` grant and `date --set`. `check-shutdown` proves the time survives a reboot. No time-sync service: nothing sets the clock but a person. |
 | Numeric `/proc/self/{pid,tid}` | Phase 3 | The capture → format → synthesize primitive landed with `/proc/sched/stats`; `/proc/self/status` was its second consumer. |
 | General deferred object reclamation from `SCHED`/IRQ context | 2026-07-21 | `SchedState::deferred_drops`, drained by `reap_pending` in thread context (review fix F2). |
 | `kmalloc` alignment > `SLAB_SIZE` | 2026-06-12 | Resolved by taking the other path: `mm::dma::DmaBuffer` allocates from the buddy. No remaining client wants it from `kmalloc`. |

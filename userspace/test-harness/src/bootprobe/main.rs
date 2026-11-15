@@ -140,7 +140,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         & dot_entries_test(root)
         & removed_dir_session_test(root)
         & power_refused_test(root)
-        & clock_set_refused_test()
+        & clock_set_refused_test(root)
         & bind_needs_transfer_and_duplicate_test()
         & transfer_list_test()
         & payload_sealed_test()

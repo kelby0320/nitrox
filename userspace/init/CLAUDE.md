@@ -11,8 +11,8 @@ PID 1. The first userspace process. Spawned directly by the kernel with the full
 3. Process critical-path mounts in dependency order, spawning fs-servers and binding their endpoints
 4. Read `/system/current-generation` and spawn the system profile server
 5. Spawn the service manager, handing it a root handle with init's own rights and the root
-   filesystem's and profile server's endpoints, and keep the channel they went down as the
-   **terminal channel**
+   filesystem's and profile server's endpoints and then the clock node (the fourth handoff), and
+   keep the channel they went down as the **terminal channel**
 6. Enter main loop: reap orphaned processes, and answer the terminal channel — including a
    shutdown's `Finish`, which unmounts init's own filesystems and stops the machine
 
@@ -66,14 +66,17 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `BIND_NAMESPACE` — to register fs-server endpoints in the system namespace
 - `LOAD_MODULE` — to load Tier 2 LKMs (delegated to device manager later)
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
-- `SYSTEM_CLOCK` — given to `service-mgr` at spawn, to pass to the view broker, whose `clock`
-  grant is that capability in a program's spawn (administration Part E.5). Init never sets the
-  clock itself.
-- **The system-control object** (administration Part E.3) — a handle in `rdx`, not a syscap:
-  the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE` nor
-  `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a
-  namespace bind, which all need `TRANSFER`. Init keeps it for the last step of a
-  shutdown (E.4), after every service and mount has stopped. See
+- **The clock node** (administration Part E.10) — a char `DeviceNode` handle in `rcx`, not a
+  syscap (`SYSTEM_CLOCK` is gone): `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE`. Init **moves**
+  it to `service-mgr` as the fourth handoff on the terminal channel and holds it no longer, so
+  it never sets the clock itself. `service-mgr` moves it on to the one service declared
+  `clock = true`, the view broker, whose `clock` grant binds it at `/dev/clock`.
+- **The power node** (administration Part E.3) — a char `DeviceNode` handle in `rdx`, not a
+  syscap: the capability to stop the machine, with `WRITE` and `INSPECT` and neither `DUPLICATE`
+  nor `TRANSFER`, so init cannot delegate it even by mistake — not by a send, a spawn grant or a
+  namespace bind, which all need `TRANSFER`. Init keeps it for the last step of a shutdown (E.4),
+  after every service and mount has stopped, and makes at boot, with it, a page holding the two
+  bytes (`libos::system::Power::new`), so a stop needs no memory later. See
   `docs/architecture/power.md`.
 
 **`service-mgr` sits in init's trust tier** (administration Part E, the maintainer's call,
@@ -131,8 +134,8 @@ beside its notification channel:
 - **`TERMINAL_OP_FINISH`** (administration Part E.4): a shutdown has asked every session and
   service to stop. Init unmounts its own mounts, last first — the mount's flush, then
   `Meta::Unmount` on the control channel it **keeps** for each since then, with no held check —
-  and calls `sys_power` with the system-control object, to halt or to reboot as the second byte
-  says. Every mount is tried whatever the one before answered, and if `sys_power` refuses, init
+  and writes the power node one byte (`Power::stop`), to halt or to reboot as the second byte
+  says. Every mount is tried whatever the one before answered, and if the write is refused, init
   says so and goes on reaping. **Every wait here is bounded**: the flush at 60 s
   (`FLUSH_TIMEOUT_NS`), as it runs on a kernel thread of its own, and the answer to
   `Meta::Unmount` at 10 s. **A flush that fails or runs out of time sends no `Meta::Unmount`**:

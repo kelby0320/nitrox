@@ -425,8 +425,7 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     steps += 1;
 
     // 20g. **`date --set`, and the clock it leaves.**
-    //      (a) **Refused without the grant**, by the kernel: a session's programs are spawned
-    //          without `SYSTEM_CLOCK`.
+    //      (a) **Refused without the grant**: a session binds no `/dev/clock`, the clock node.
     s.send("date --set 2031-01-02T00:00:00Z")?;
     s.expect("needs the clock grant")?;
     s.expect("/home>")?;
@@ -441,7 +440,8 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     s.send("date --unix")?;
     s.expect("1925078")?;
     s.expect("/home>")?;
-    //      (d) **A shell in the view passes it on**: `nxsh` spawns its stages with what it holds.
+    //      (d) **A shell in the view passes it on**: `nxsh`'s stages inherit its namespace, and
+    //          its `/dev/clock` with it.
     //          A day later, so the kernel's line is this set's and not (b)'s.
     with_admin_asked(s, "nxsh")?;
     s.expect("/home>")?;

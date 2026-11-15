@@ -92,7 +92,7 @@ gives one out once.
 | `entropy` | `Source::open(ns)` resolves `/dev/entropy` (`entropy::PATH`) in the namespace the caller passes, `Source::from_handle(node)` takes a node already held; `Source::fill` waits for the seeding and reads again as needed, `Source::try_fill` is refused `WouldBlock` before the seeding, for a caller that cannot wait; `entropy::fill(ns, buf)` and `entropy::try_fill(ns, buf)` open a source for the call. libos holds no namespace of its own |
 | `boot` | `Start`: `_start`'s four registers, owned and typed |
 | `control` | a service's control channel, read: an op, nothing, or closed and taken |
-| `system` | `stop`, the machine halted or reset with the system-control object; `set_clock`, with the clock grant; and `test_verdict` |
+| `system` | `Power::new` makes, at boot, the page holding the two bytes, and `Power::stop` halts or resets the machine with the power node, a one-byte write; `set_clock(clock, ns)`, a write to the clock node a program resolves at `CLOCK_PATH` (`/dev/clock`, bound by the `clock` grant); and `test_verdict` |
 | `io` | a `Resource`'s `read` and `write`, a `File`'s `read`, `write` and `copy_from`, a window of a copy whose pages go once it completes (`IO_NOCACHE`), and a notification queue's `recv` |
 
 **A flush refused `WouldBlock`**, its process already running or waiting with its share of the

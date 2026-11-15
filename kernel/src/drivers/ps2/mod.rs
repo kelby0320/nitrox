@@ -495,7 +495,7 @@ pub fn init() {
         if !present {
             continue;
         }
-        let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: index as *mut () };
+        let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: index as *mut (), act: None };
         match DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend) {
             Ok(node) => {
                 // **Owned by the device table**, which `/dev/input/raw/<n>` resolves through.

@@ -1,45 +1,51 @@
 # Power
 
 **Status: the kernel half built with administration Part E.3, and `shutdown` above it with Part
-E.4; last checked 2026-09-29, when `check-shutdown` came to gate a halt and a reboot.** The
-system-control object, `sys_power`'s halt and reboot, and the FADT facts a reset and the clock
+E.4; the stop became a write to the power node on 2026-11-15, replacing the `SystemControl` object
+and `sys_power`.** The power node, its halt and reboot, and the FADT facts a reset and the clock
 use. A person asks with `with power shutdown [--reboot]`; `service-mgr` stops the sessions and the
-services, and `init` unmounts its filesystems and calls `sys_power`
+services, and `init` unmounts its filesystems and writes the power node
 ([`service-manager.md`](service-manager.md) § *Shutdown*). Not built at all: power-off, which needs
 AML.
 
-## The system-control object
+## The power node
 
-**One exists.** `run_first_userspace` makes it and hands it to `init` in `rdx`, beside the
-notification channel and the root namespace ([`boot-flow.md`](boot-flow.md) §4). Its handle
-carries `WRITE`, which `sys_power` requires, and `INSPECT`, and neither `DUPLICATE` nor
-`TRANSFER`:
+**One exists.** `run_first_userspace` makes it, a char `DeviceNode` whose backend is
+`kernel/src/power.rs`'s `BACKEND`, and hands it to `init` in `rdx`, beside the notification
+channel and the root namespace ([`boot-flow.md`](boot-flow.md) §4). Its handle carries `WRITE`,
+which a write needs, and `INSPECT`, and neither `DUPLICATE` nor `TRANSFER` (`INIT_RIGHTS`):
 
 - `init` cannot give it away, even by mistake: a duplicate needs `DUPLICATE`, and an IPC send, a
   spawn grant and a direct-handle bind each need `TRANSFER`;
 - so it is bound in no namespace, and no lookup yields it.
 
 The bind was the gap the PR #342 review found: `sys_ns_bind` asked for no right on a direct handle,
-so `init` could have published the object at a path anyone resolving it would get a `WRITE` handle
-from. A direct-handle bind needs `TRANSFER` since then, and `DUPLICATE` since 2026-11-13, for every
-object — a bind gives the object away as a send does, and is a copy
-([`syscall-abi.md`](../spec/syscall-abi.md) § Namespace).
+so `init` could have published the object it then held (a `SystemControl` object, until 2026-11-15)
+at a path anyone resolving it would get a `WRITE` handle from. A direct-handle bind needs
+`TRANSFER` since then, and `DUPLICATE` since 2026-11-13, for every object — a bind gives the
+object away as a send does, and is a copy ([`syscall-abi.md`](../spec/syscall-abi.md) §
+Namespace). The power node, which has neither right, still cannot be bound.
 
 So the process that stops the machine is the one the kernel started first. That is deliberate:
 `init` mounted the root, and a shutdown's last steps are its own — its mounts written back and
-marked clean, then the power operation.
+marked clean, then the power write.
 
 It is a **handle, not a syscap**. A syscap is ambient: every process `init` spawns with it could
-stop the machine. The object is held, so exactly one process can.
+stop the machine. The node is held, so exactly one process can.
 
-`init` checks what `rdx` holds with `sys_handle_stat` and says `init: holds the system-control
-object`, or that it has none, in which case the boot goes on and a shutdown could reach every step
-but the last. The object is `kernel/src/object/system_control.rs`, type `15`.
+`init` keeps `rdx` if it holds a `DeviceNode` with `WRITE` (checked with `sys_handle_stat`) and
+says `init: holds the power node`; otherwise the boot goes on and a shutdown could reach every step
+but the last. At boot, with the node, it makes a page holding the two bytes
+(`libos::system::Power::new`), so a stop needs no memory later. `Power::stop(Stop::Halt |
+Stop::Reboot)` is a one-byte `sys_io_submit` write from offset 0 or 1 of that page.
 
-## `sys_power`
+## The power write
 
-`sys_power(system_control, op)` ([`syscall-abi.md`](../spec/syscall-abi.md) § Power) is
-`kernel/src/power.rs`, in three steps.
+A write of one byte, `POWER_HALT` (`0`) or `POWER_REBOOT` (`1`)
+([`io-operation.md`](../spec/io-operation.md) § *The power node*), is taken by the node's
+`CharBackend::act` (`kernel/src/object/device_node.rs`) in place of `submit_write`, in three
+steps. `sys_io_submit` runs it after its handle, right and buffer-range checks and before any
+`PendingOperation` is allocated.
 
 1. **Every disk is flushed.** `IoOpcode::Flush` — AHCI's `FLUSH CACHE EXT` — goes to every block
    device except a partition, whose flush is its disk's, all at once. The kernel waits for them for
@@ -56,10 +62,13 @@ but the last. The object is `kernel/src/object/system_control.rs`, type `15`.
    processor halts too. The machine stays on, showing the message, until its button is held.
    **A reboot** writes *"Restarting."* the same way and resets.
 
-**It is outside the async-first rule.** A blocking operation hands back a `PendingOperation`,
-and `sys_power` never returns, so there is nothing to hand one to. Its flush waits in the kernel,
-bounded. It returns only to refuse: a handle that is not the object (`InvalidHandle`, `NoAccess`
-or `InvalidArgument`), then an `op` that names nothing (`InvalidArgument`).
+**It is the one write that acts before an operation is made, and the one that may wait inside
+`sys_io_submit`.** A blocking operation hands back a `PendingOperation`, and this write never
+returns, so there is nothing to hand one to; and a machine that cannot stop for want of memory to
+make one is the worse outcome. Its flush waits in the kernel, bounded. It returns only to refuse:
+a handle without `WRITE` or a buffer without `MAP_READ`, as any write is, then any other length or
+byte (`InvalidArgument`), with no PO made. A zero-length write completes at once, as every one
+does.
 
 **There is no power-off.** Entering S5 means evaluating the `\_S5` object, which is AML, and AML
 waits for ACPICA ([`why-phased-acpi.md`](../rationale/why-phased-acpi.md)).
@@ -99,7 +108,7 @@ it. A revision-1 FADT ends at byte 116, before the reset register:
 The hardware report prints them as four `fadt:` lines, so the laptop's report says whether it can
 reset by register. The RTC reads the century register when the FADT names one, in the chip's own
 BCD or binary, and believes only 19–21; otherwise the year is 2000–2099, as before. **A set writes
-it** (`sys_clock_set`, Part E.5), in the same encoding — which is why a set is refused outside
+it** (the clock node's write; `sys_clock_set` until 2026-11-15), in the same encoding — which is why a set is refused outside
 2000–2099: a machine with no century register would read a later year back as another century.
 
 ## What gates it
@@ -110,14 +119,14 @@ it** (`sys_clock_set`, Part E.5), in the same encoding — which is why a set is
   - the PCI configuration address;
   - the RTC's century;
   - the last line's row;
-  - the object's rights: a duplicate and a direct-handle bind are refused;
-  - the op's decoding, and which block devices are flushed.
+  - the node's rights: a duplicate and a direct-handle bind are refused;
+  - the byte's decoding, and which block devices are flushed.
 - **`cargo xtask test-qemu`:**
   - q35's four `fadt:` lines;
-  - `init: holds the system-control object`;
-  - `boot-probe` calling `sys_power` with no handle, a lookup-only namespace and a writable disk,
-    each refused. A kernel that checked the right and not the type halts the machine there, and
-    the run times out;
+  - `init: holds the power node`;
+  - `boot-probe` writing the power byte with no handle, a lookup-only namespace and a writable
+    disk, each refused. A kernel that checked the right and not the type halts the machine there,
+    and the run times out;
   - `boot-probe` binding a handle without `TRANSFER`, refused `NoAccess`, and one with it, taken.
 - **`cargo xtask check-report`**: the same `fadt:` lines, read off the live image's report.
 - **`cargo xtask check-shutdown`** (administration Part E.4d), in CI: `with power shutdown` from a

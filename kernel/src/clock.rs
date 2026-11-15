@@ -10,10 +10,9 @@
 //! - **The RTC is slow and racy to read** (port I/O plus an update-in-progress window; see
 //!   `arch/x86_64/rtc.rs`), so it is paid once at boot rather than per timestamp: the filesystem
 //!   server stamps an inode on every create, mkdir and rename.
-//! - **Setting the clock is a single atomic store** to the offset ([`set`], `sys_clock_set`), then
-//!   a write of the RTC so the next boot anchors to what was set. Adjusting time-of-day is real
-//!   authority (it moves every future timestamp), so it needs `SYSTEM_CLOCK`; reading is ambient,
-//!   as `CLOCK_MONOTONIC` already is. See the decision log, 2026-07-24.
+//! - **Setting the clock is a single atomic store** to the offset ([`set`]), then a write of the
+//!   RTC so the next boot anchors to what was set. Adjusting time-of-day is real authority, so it
+//!   is a write to the **clock node** ([`BACKEND`]); reading is ambient, as `CLOCK_MONOTONIC` is.
 //!
 //! If the RTC cannot be read (no such device, or an implausible date), the clock stays **unset**
 //! until something sets it, and `CLOCK_REALTIME` keeps returning `Unsupported` rather than
@@ -24,7 +23,13 @@ use core::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use crate::arch::timer::ArchTimer;
 use crate::arch::{Rtc, Timer};
 use crate::libkern::SpinLock;
+use crate::libkern::clock::{CLOCK_SET_KEPT, CLOCK_SET_THIS_BOOT};
+use crate::libkern::handle::Rights;
 use crate::libkern::lockrank::LockRank;
+use crate::object::device_node::CharBackend;
+use crate::object::header::Ref;
+use crate::object::{MemoryObject, PendingOperation};
+use crate::syscall::error::KError;
 
 /// `realtime_ns = monotonic_ns + OFFSET_NS`. Meaningful only while [`IS_SET`].
 static OFFSET_NS: AtomicI64 = AtomicI64::new(0);
@@ -61,7 +66,7 @@ pub fn init() -> Option<i64> {
 }
 
 /// **Whether `ns` is a time the clock may be set to**, as whole seconds since the epoch: 2000-01-01
-/// to the end of 2099, which is what the RTC holds on every machine. Pure, so `sys_clock_set`'s
+/// to the end of 2099, which is what the RTC holds on every machine. Pure, so the clock node's
 /// refusal is host-tested.
 pub fn settable(ns: u64) -> Option<i64> {
     let secs = i64::try_from(ns / NS_PER_SEC as u64).ok()?;
@@ -70,7 +75,7 @@ pub fn settable(ns: u64) -> Option<i64> {
 
 /// **Set the wall clock** to `ns` since the epoch, and write it to the RTC. Returns whether the RTC
 /// holds it: `false` means the clock is set until the next boot, which anchors to whatever the chip
-/// still says. The caller has checked [`settable`] and `SYSTEM_CLOCK`.
+/// still says. The caller has checked [`settable`], and holds the clock node.
 ///
 /// **It steps the clock**, backwards as readily as forwards, and anchors a clock the boot could not
 /// read.
@@ -81,6 +86,53 @@ pub fn set(ns: u64) -> bool {
     OFFSET_NS.store(ns as i64 - Timer::read_ns() as i64, Ordering::Relaxed);
     IS_SET.store(true, Ordering::Release);
     rtc.set_wall_clock_seconds((ns / NS_PER_SEC as u64) as i64)
+}
+
+/// `init`'s rights to the clock node: `WRITE` and `INSPECT`, and the two a move and a bind need.
+pub const INIT_RIGHTS: Rights = Rights::WRITE.union(Rights::INSPECT).union(Rights::TRANSFER).union(Rights::DUPLICATE);
+
+/// The clock node's backend: no read, and a write that sets the clock.
+pub const BACKEND: CharBackend =
+    CharBackend { submit_read: no_read, submit_write: Some(write), ctx: core::ptr::null_mut(), act: None };
+
+fn no_read(_: &Ref<MemoryObject>, _: &Ref<PendingOperation>, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
+    Err(KError::Unsupported)
+}
+
+/// **A write sets the wall clock**: eight bytes, little-endian nanoseconds in 2000 to 2099
+/// ([`settable`]), else `InvalidArgument`; its `result` says whether the RTC kept it.
+fn write(
+    buffer: &Ref<MemoryObject>,
+    po: &Ref<PendingOperation>,
+    buf_offset: u64,
+    len: u64,
+    _: *mut (),
+) -> Result<(), KError> {
+    let (ns, secs) = asked(buffer, buf_offset, len).ok_or(KError::InvalidArgument)?;
+    let kept = set(ns);
+    if kept {
+        crate::kprintln!("wall clock: set to {} (Unix epoch seconds, UTC); the RTC holds it", secs);
+    } else {
+        crate::kprintln!(
+            "wall clock: set to {} (Unix epoch seconds, UTC); the RTC did not take it, so it lasts \
+             until the next boot",
+            secs
+        );
+    }
+    crate::sched::complete_pending_op(po, 0, answer(kept));
+    Ok(())
+}
+
+/// Never `0`, which a zero-length write completes with, having set nothing.
+const fn answer(kept: bool) -> u64 {
+    if kept { CLOCK_SET_KEPT } else { CLOCK_SET_THIS_BOOT }
+}
+
+fn asked(buffer: &MemoryObject, buf_offset: u64, len: u64) -> Option<(u64, i64)> {
+    let mut bytes = [0u8; 8];
+    (len == 8 && buffer.copy_out(buf_offset as usize, &mut bytes) == 8).then_some(())?;
+    let ns = u64::from_le_bytes(bytes);
+    Some((ns, settable(ns)?))
 }
 
 /// Current wall-clock time in nanoseconds since the Unix epoch, or `None` if never anchored.
@@ -104,6 +156,27 @@ pub fn is_set() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_write_asks_for_a_time_only_by_eight_bytes_of_one_settable() {
+        crate::mm::test_support::init_global_heap();
+        let page = MemoryObject::try_new(4096).unwrap();
+        let in_2031: u64 = 1_925_078_400 * 1_000_000_000;
+        page.copy_in(0, &in_2031.to_le_bytes());
+        page.copy_in(8, &(946_684_799u64 * 1_000_000_000).to_le_bytes());
+        page.copy_in(16, &(946_684_800u64 * 1_000_000_000).to_le_bytes());
+        assert_eq!(asked(&page, 0, 8), Some((in_2031, 1_925_078_400)));
+        assert_eq!(asked(&page, 8, 8), None, "the second before 2000");
+        assert_eq!(asked(&page, 16, 8).map(|(_, s)| s), Some(946_684_800), "and 2000 itself");
+        assert_eq!(asked(&page, 0, 7), None, "seven bytes");
+        assert_eq!(asked(&page, 0, 16), None, "sixteen");
+    }
+
+    #[test]
+    fn a_set_answers_whether_the_rtc_kept_it_and_never_zero() {
+        assert_eq!((answer(true), answer(false)), (CLOCK_SET_KEPT, CLOCK_SET_THIS_BOOT));
+        assert!(answer(true) != 0 && answer(false) != 0 && answer(true) != answer(false));
+    }
 
     /// The offset arithmetic, independent of the hardware.
     fn offset_for(epoch_secs: i64, mono_ns: i64) -> i64 {

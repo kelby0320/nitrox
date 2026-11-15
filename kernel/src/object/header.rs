@@ -33,7 +33,7 @@ use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
     DeviceNode, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace, NotificationChannel,
-    PendingOperation, Process, SystemControl, Thread, Timer, UserspaceServerReg,
+    PendingOperation, Process, Thread, Timer, UserspaceServerReg,
 };
 
 /// Upper bound on the refcount; exceeding it means ~2^62 leaked references, so abort rather
@@ -447,8 +447,7 @@ unsafe fn dispatch_destroy(header: NonNull<KObjectHeader>) {
             DeviceNode,
             InterruptObject,
             UserspaceServerReg,
-            FileObject,
-            SystemControl
+            FileObject
         )
     }
 }
@@ -475,7 +474,7 @@ pub(crate) mod test_probe {
     use core::cell::Cell;
 
     /// One more than the largest tag.
-    const TAGS: usize = KObjectType::SystemControl as usize + 1;
+    const TAGS: usize = KObjectType::FileObject as usize + 1;
 
     std::thread_local! {
         static DESTROYS: [Cell<usize>; TAGS] = const { [const { Cell::new(0) }; TAGS] };
@@ -520,10 +519,6 @@ pub(crate) mod test_probe {
 
     pub(crate) fn namespace_destroys() -> usize {
         destroys(KObjectType::Namespace)
-    }
-
-    pub(crate) fn system_control_destroys() -> usize {
-        destroys(KObjectType::SystemControl)
     }
 
     pub(crate) fn device_node_destroys() -> usize {

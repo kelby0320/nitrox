@@ -6,6 +6,7 @@ use crate::libkern::resolve_op::*;
 use crate::mm::test_support::init_global_heap;
 use crate::object::Process;
 
+mod acting;
 mod installs;
 mod object_casts;
 
@@ -81,7 +82,7 @@ fn unknown_number_is_unsupported() {
 
 #[test]
 fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
-    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39] {
+    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41] {
         let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
         assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
     }
@@ -117,19 +118,6 @@ fn clock_read_unsupported_clocks_are_unsupported() {
     assert_eq!(sys_clock_read(1, valid_out), Err(KError::Unsupported)); // Realtime
     assert_eq!(sys_clock_read(2, valid_out), Err(KError::Unsupported)); // ProcessCpu
     assert_eq!(sys_clock_read(3, valid_out), Err(KError::Unsupported)); // ThreadCpu
-}
-
-/// **`sys_clock_set`'s arguments are refused before its authority is asked**: each refusal
-/// proves it, as `require_syscap` panics on the host.
-#[test]
-fn clock_set_refuses_its_arguments_before_asking_for_system_clock() {
-    let ok_ns = 1_790_605_800u64 * 1_000_000_000; // 2026-09-28T14:30:00Z
-    for clock in [0, 2, 3, 4, u64::MAX] {
-        assert_eq!(sys_clock_set(clock, ok_ns), Err(KError::InvalidArgument), "clock {clock}");
-    }
-    assert_eq!(sys_clock_set(1, 946_684_799 * 1_000_000_000), Err(KError::InvalidArgument));
-    assert_eq!(sys_clock_set(1, 4_102_444_800 * 1_000_000_000), Err(KError::InvalidArgument));
-    assert_eq!(dispatch(SYS_CLOCK_SET, 0, ok_ns, 0, 0, 0, 0), KError::InvalidArgument.as_isize(),);
 }
 
 #[test]
@@ -184,25 +172,6 @@ fn namespace_rights_are_allocatable_on_a_namespace() {
     let ns = Namespace::try_new().unwrap();
     let h =
         t.install(1, ObjectRef::new(ns), namespace_rights()).expect("namespace_rights must be valid for a Namespace");
-    drop(t.close(h, 1).unwrap());
-}
-
-#[test]
-fn the_system_control_handle_cannot_be_given_away() {
-    use crate::object::SystemControl;
-    use crate::object::system_control::INIT_RIGHTS;
-    init_global_heap();
-    let t = HandleTable::try_new(0x1357_9BDF_2468_ACE0).unwrap();
-    let h = t
-        .install(1, ObjectRef::new(SystemControl::try_new().unwrap()), INIT_RIGHTS)
-        .expect("INIT_RIGHTS must be valid for a SystemControl");
-    assert!(t.lookup(h, 1, Rights::WRITE).is_ok());
-    assert!(t.duplicate(h, 1, Rights::WRITE).is_err(), "a duplicate is refused");
-    let held = t.lookup(h, 1, Rights::empty()).unwrap().rights;
-    assert_eq!(direct_bindable(held), Err(KError::NoAccess), "and so is a bind");
-    assert_eq!(direct_bindable(held | Rights::TRANSFER), Err(KError::NoAccess), "a copy wants DUPLICATE");
-    assert_eq!(direct_bindable(held | Rights::DUPLICATE), Err(KError::NoAccess), "and to leave, TRANSFER");
-    assert_eq!(direct_bindable(held | Rights::TRANSFER | Rights::DUPLICATE), Ok(()), "which both allow");
     drop(t.close(h, 1).unwrap());
 }
 

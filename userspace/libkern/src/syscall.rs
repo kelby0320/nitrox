@@ -73,20 +73,12 @@ pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
 /// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
-/// `sys_power(system_control, op)` — flush every disk, stop every processor, then halt
-/// ([`POWER_HALT`]) or reset ([`POWER_REBOOT`]). Needs `WRITE` on the system-control object,
-/// which only `init` holds, and **returns only to refuse**.
-pub const SYS_POWER: u64 = 40;
-/// `sys_power`'s halt: the machine stays on, saying it is safe to turn it off.
+/// The power node's halt, the byte a `Write` to it carries: every disk flushed, every processor
+/// stopped, and the machine stays on, saying it is safe to turn it off. Only `init` holds the node,
+/// and its write **returns only to refuse**.
 pub const POWER_HALT: u64 = 0;
-/// `sys_power`'s reboot: the FADT's reset register, then the 8042, then a triple fault.
+/// The power node's reboot: the FADT's reset register, then the 8042, then a triple fault.
 pub const POWER_REBOOT: u64 = 1;
-/// `sys_clock_set(clock, ns)` — set the wall clock to `ns` since the epoch, and the machine's RTC
-/// under it. `clock` must be [`CLOCK_REALTIME`](crate::abi::CLOCK_REALTIME) and `ns` in
-/// 2000–2099, or `InvalidArgument`; then the caller needs `SYSTEM_CLOCK`, or `NoAccess`. Returns
-/// [`CLOCK_SET_KEPT`](crate::abi::CLOCK_SET_KEPT) or
-/// [`CLOCK_SET_THIS_BOOT`](crate::abi::CLOCK_SET_THIS_BOOT).
-pub const SYS_CLOCK_SET: u64 = 41;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: report a harness verdict (the argument's low byte) to

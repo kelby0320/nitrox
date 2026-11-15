@@ -117,9 +117,9 @@ executable = \"/bin/view-broker\"\n\
 description = \"Views, and the policy and accounts it fronts\"\n\
 endpoint = \"/svc/views\"\n\
 essential = true\n\
-# `SYSTEM_CLOCK` only to give it: the `clock` grant is that capability at a program's spawn, and\n\
-# a parent passes on only what it holds (administration Part E.5).\n\
-syscaps = [\"BIND_NAMESPACE\", \"SYSTEM_CLOCK\"]\n\
+syscaps = [\"BIND_NAMESPACE\"]\n\
+# The clock node, moved here once: the `clock` grant binds it into a view at `/dev/clock`.\n\
+clock = true\n\
 \n\
 [service.view-broker.restart]\n\
 policy = \"never\"\n\

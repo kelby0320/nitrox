@@ -1,17 +1,16 @@
 //! Binds, derived namespaces, and the calls a missing syscap refuses.
 
 use super::*;
-use libos::{MapReadWrite, Memory, NsMutable, ReadWrite, Resource};
+use libos::{MapReadWrite, Memory, NsMutable, ReadWrite, Resource, WriteOnly};
 
-/// **`sys_power` from anything but `init` is refused**, and the machine goes on: with no handle,
-/// with a namespace this process may only look up in, and with a disk it may write — a `WRITE`
-/// handle, so it is the object's type that refuses it, not a missing right.
+/// **A stop from anything but `init` is refused**, and the machine goes on: the halt byte written
+/// to no handle, to a lookup-only namespace, and to a disk it may write, which refuses a write
+/// that is not a whole number of blocks.
 ///
 /// The halt it would otherwise be is what makes a wrong answer loud: the boot stops before the
 /// verdict, and `test-qemu` times out.
 pub(super) fn power_refused_test(root: Root<'_>) -> bool {
     use libkern::KError;
-    use libos::system::{Stop, stop};
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: power FAIL: ").s(why).end();
         false
@@ -34,37 +33,27 @@ pub(super) fn power_refused_test(root: Root<'_>) -> bool {
     let Ok(dev) = lookup::<Resource, ReadWrite, _>(root, &path, Rights::READ | Rights::WRITE) else {
         return fail(b"the root partition does not open read-write");
     };
-    let refused = stop(&dev, Stop::Halt);
+    let refused = refused::authority::power(dev.raw().0);
     drop(dev);
-    if refused.code() != KError::InvalidArgument {
+    if refused != KError::InvalidArgument.as_i32() as i64 {
         return fail(b"a writable disk was not refused InvalidArgument");
     }
-    log::write(b"boot-probe: sys_power refused no handle, a namespace and a writable disk ok\n");
+    log::write(b"boot-probe: a stop refused with no handle, a namespace and a writable disk ok\n");
     true
 }
 
-/// **`sys_clock_set` is refused without `SYSTEM_CLOCK`**, which this process does not hold, and
-/// the clock does not move: a set to 2031 refused `NoAccess`, and the clock read either side of it
-/// within a minute of itself. Before the authority, the arguments: `Monotonic` never steps, and
-/// 1999 is before what the hardware clock holds — both `InvalidArgument`.
-pub(super) fn clock_set_refused_test() -> bool {
-    use libkern::KError;
-    use libos::system::set_clock;
+/// **The clock is set only where the `clock` grant bound its node**: the root, which this process
+/// was spawned with, binds no `/dev/clock`, as a kernel node there would give it to every process,
+/// and the clock does not move: read either side of the lookup, within a minute of itself.
+pub(super) fn clock_set_refused_test(root: Root<'_>) -> bool {
+    use libos::system::CLOCK_PATH;
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: clock FAIL: ").s(why).end();
         false
     };
-    let set = |secs: u64| set_clock(secs * 1_000_000_000).map_err(|e| e.code());
-    let in_2031 = 1_925_078_400; // 2031-01-02T00:00:00Z
-    if refused::authority::set_monotonic_clock(in_2031 * 1_000_000_000) != KError::InvalidArgument.as_i32() as i64 {
-        return fail(b"setting the monotonic clock was not refused InvalidArgument");
-    }
-    if set(946_684_799) != Err(KError::InvalidArgument) {
-        return fail(b"a time in 1999 was not refused InvalidArgument");
-    }
     let before = time::wall().ok();
-    if set(in_2031) != Err(KError::NoAccess) {
-        return fail(b"a set without SYSTEM_CLOCK was not refused NoAccess");
+    if lookup::<Resource, WriteOnly, _>(root, CLOCK_PATH, Rights::WRITE).is_ok() {
+        return fail(b"the root binds a clock node");
     }
     let (Some(before), Some(after)) = (before, time::wall().ok()) else {
         return fail(b"the wall clock does not read");
@@ -72,7 +61,7 @@ pub(super) fn clock_set_refused_test() -> bool {
     if after < before || after - before > 60_000_000_000 {
         return fail(b"the wall clock moved across a refused set");
     }
-    log::write(b"boot-probe: sys_clock_set refused the monotonic clock, 1999 and no SYSTEM_CLOCK ok\n");
+    log::write(b"boot-probe: the root binds no clock node, and the clock did not move ok\n");
     true
 }
 
@@ -230,8 +219,8 @@ pub(super) fn lookup_po_stays_test(root: Root<'_>) -> bool {
 }
 
 /// **A direct-handle bind needs `TRANSFER`**, since every resolve of the binding mints a handle
-/// to the object for whoever asked: without it, `init` could publish its system-control object,
-/// whose handle carries no `TRANSFER` so that it cannot leave `init`.
+/// to the object for whoever asked: without it, `init` could publish its power node, whose handle
+/// carries no `TRANSFER` so that it cannot leave `init`.
 ///
 /// A memory object's handle, duplicated without `TRANSFER` or without `DUPLICATE`, is refused
 /// `NoAccess`, as a bind gives it away and is a copy, and the original, with both, is taken — in

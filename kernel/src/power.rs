@@ -1,4 +1,4 @@
-//! **Stopping the machine on purpose**: `sys_power`'s halt and reboot.
+//! **Stopping the machine on purpose**: the power node's halt and reboot.
 //!
 //! The machine stops in three steps:
 //!
@@ -15,12 +15,12 @@
 //! **There is no power-off.** Entering S5 needs AML, which waits for ACPICA
 //! (`docs/rationale/why-phased-acpi.md`).
 //!
-//! **Outside the async-first rule, deliberately.** This never returns, so there would be nothing
-//! to hand a `PendingOperation` to; the flush waits here, bounded.
+//! **Outside the async-first rule, deliberately.** A write here acts within `sys_io_submit`
+//! ([`CharBackend::act`]) and never returns, so no operation is made; the flush waits, bounded.
 //!
-//! What stops the machine is `init`'s alone: the one
-//! [`SystemControl`](crate::object::SystemControl) is made at boot and handed to it, and cannot
-//! be duplicated or transferred. See `docs/architecture/power.md`.
+//! What stops the machine is `init`'s alone: the one power node is made at boot and handed to it
+//! with [`INIT_RIGHTS`], which it can neither duplicate nor transfer, and bound in no namespace.
+//! See `docs/architecture/power.md`.
 
 use core::fmt::Write;
 
@@ -28,10 +28,13 @@ use crate::arch::cpu::ArchCpu;
 use crate::arch::platform::ArchPlatform;
 use crate::arch::timer::ArchTimer;
 use crate::libkern::block::BlockKind;
+use crate::libkern::handle::Rights;
 use crate::libkern::power::PowerOp;
 use crate::libkern::{ArrayVec, KVec};
+use crate::object::device_node::CharBackend;
 use crate::object::header::Ref;
-use crate::object::{DeviceNode, MAX_WAIT_HANDLES, ObjectRef, PendingOperation};
+use crate::object::{DeviceNode, MAX_WAIT_HANDLES, MemoryObject, ObjectRef, PendingOperation};
+use crate::syscall::error::KError;
 
 /// How long the flush may take, every disk together. A drive's own limit is longer (30 seconds for
 /// ATA), but that is for a cache full of writes; by the time `init` asks, every filesystem is
@@ -43,6 +46,31 @@ pub const SAFE_TO_TURN_OFF: &str = "It is now safe to turn off your computer.";
 
 /// The line a reboot shows while the platform resets.
 const RESTARTING: &str = "Restarting.";
+
+/// `init`'s rights to the power node: neither `DUPLICATE` nor `TRANSFER`, so it gives it to no one.
+pub const INIT_RIGHTS: Rights = Rights::WRITE.union(Rights::INSPECT);
+
+/// The power node's backend: no read, and a write that acts at once.
+pub const BACKEND: CharBackend =
+    CharBackend { submit_read: no_read, submit_write: None, ctx: core::ptr::null_mut(), act: Some(write) };
+
+fn no_read(_: &Ref<MemoryObject>, _: &Ref<PendingOperation>, _: u64, _: u64, _: u64, _: *mut ()) -> Result<(), KError> {
+    Err(KError::Unsupported)
+}
+
+/// One byte, `POWER_HALT` or `POWER_REBOOT`, stops the machine; any other is `InvalidArgument`.
+fn write(buffer: &MemoryObject, buf_offset: u64, len: u64) -> KError {
+    let Some(op) = op_in(buffer, buf_offset, len) else { return KError::InvalidArgument };
+    let (pid, what) = (crate::sched::current_owner_pid(), if op == PowerOp::Halt { "halt" } else { "reboot" });
+    crate::kprintln!("power: pid {pid} asks to {what}");
+    power(op)
+}
+
+fn op_in(buffer: &MemoryObject, buf_offset: u64, len: u64) -> Option<PowerOp> {
+    let mut byte = [0u8; 1];
+    (len == 1 && buffer.copy_out(buf_offset as usize, &mut byte) == 1).then_some(())?;
+    PowerOp::from_u64(u64::from(byte[0]))
+}
 
 /// Flush every disk, stop every processor, then halt or reset. Never returns.
 pub fn power(op: PowerOp) -> ! {
@@ -156,5 +184,19 @@ mod tests {
         assert!(flushes(BlockKind::RamDisk as u32));
         assert!(flushes(BlockKind::Unknown as u32));
         assert!(!flushes(BlockKind::Partition as u32));
+    }
+
+    #[test]
+    fn a_write_names_a_stop_only_by_one_byte_that_is_one() {
+        crate::mm::test_support::init_global_heap();
+        let page = MemoryObject::try_new(4096).unwrap();
+        page.copy_in(0, &[0, 1, 2, 0xFF]);
+        assert_eq!(op_in(&page, 0, 1), Some(PowerOp::Halt));
+        assert_eq!(op_in(&page, 1, 1), Some(PowerOp::Reboot));
+        assert_eq!(op_in(&page, 2, 1), None, "the byte past the two");
+        assert_eq!(op_in(&page, 3, 1), None);
+        assert_eq!(op_in(&page, 0, 2), None, "two bytes");
+        assert_eq!(write(&page, 2, 1), KError::InvalidArgument, "refused, and the machine goes on");
+        assert_eq!(write(&page, 0, 2), KError::InvalidArgument);
     }
 }

@@ -52,10 +52,6 @@ const IO_RING_PRINCIPALS: Rights = Rights::from_bits_truncate(Rights::READ.bits(
 /// generic right, not on the principal mask.
 const DEVICE_NODE_PRINCIPALS: Rights = Rights::READ.union(Rights::WRITE);
 
-/// Principal rights valid on [`KObjectType::SystemControl`] handles: `WRITE`,
-/// which `sys_power` requires.
-const SYSTEM_CONTROL_PRINCIPALS: Rights = Rights::WRITE;
-
 /// Wait-only types ([`KObjectType::NotificationChannel`], `Timer`,
 /// `InterruptObject`, `PendingOperation`). `WAIT` is a generic right, so the
 /// principal mask is empty.
@@ -78,7 +74,6 @@ pub(crate) fn is_rights_compatible(ty: KObjectType, rights: Rights) -> bool {
         | KObjectType::PendingOperation => WAIT_ONLY_PRINCIPALS,
         KObjectType::IoRing => IO_RING_PRINCIPALS,
         KObjectType::DeviceNode => DEVICE_NODE_PRINCIPALS,
-        KObjectType::SystemControl => SYSTEM_CONTROL_PRINCIPALS,
         KObjectType::Invalid | KObjectType::UserspaceServerReg => return false,
     };
     let requested_principal = rights & PRINCIPAL_MASK;
@@ -100,7 +95,6 @@ mod tests {
             KObjectType::IoRing,
             KObjectType::Timer,
             KObjectType::DeviceNode,
-            KObjectType::SystemControl,
         ] {
             assert!(is_rights_compatible(ty, Rights::empty()), "{:?}", ty);
         }
@@ -140,13 +134,6 @@ mod tests {
         let rw = Rights::READ | Rights::WRITE;
         assert!(is_rights_compatible(KObjectType::IoRing, rw));
         assert!(!is_rights_compatible(KObjectType::IoRing, Rights::EXECUTE));
-    }
-
-    #[test]
-    fn system_control_accepts_write_only() {
-        assert!(is_rights_compatible(KObjectType::SystemControl, Rights::WRITE | Rights::INSPECT));
-        assert!(!is_rights_compatible(KObjectType::SystemControl, Rights::READ));
-        assert!(!is_rights_compatible(KObjectType::SystemControl, Rights::BIND));
     }
 
     #[test]

@@ -492,7 +492,7 @@ fn interface_request(x: &Xhci, slot: u8, mem: &mut DeviceMem, request: [u8; 8]) 
 fn publish(kind: DeviceKind, parent: Option<u32>) -> Option<(usize, u32, u32)> {
     let (index, epoch) = NODES.take(kind == DeviceKind::Keyboard)?;
     LIGHTS_TAKEN.fetch_and(!(1u32 << index), Ordering::Relaxed);
-    let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: context(index, epoch) };
+    let backend = CharBackend { submit_read, submit_write: Some(submit_write), ctx: context(index, epoch), act: None };
     let served = DeviceNode::try_new_char(ResourceDescriptor::ZERO, backend).ok().and_then(|node| {
         let node = Ref::new(node);
         crate::device::register_input(node, kind, parent, "usb-hid")

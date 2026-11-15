@@ -31,6 +31,8 @@ enum AbiShape {
     EnumVariant,
     /// `pub const NAME: Rights = Rights(1 << k);`
     RightsBit,
+    /// `pub const NAME: SysCaps = SysCaps(1 << k);`
+    SysCapsBit,
     /// `pub const NAME: u16 = <int>;` — the input event classes and codes.
     U16Const,
     /// `pub const NAME: u32 = <int>;` — the device registry's constants.
@@ -64,6 +66,13 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         kernel_file: "kernel/src/libkern/handle.rs",
         user_files: &["userspace/libkern/src/handle.rs"],
         shape: AbiShape::RightsBit,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "SysCaps bits",
+        kernel_file: "kernel/src/libkern/syscaps.rs",
+        user_files: &["userspace/libkern/src/syscaps.rs"],
+        shape: AbiShape::SysCapsBit,
         one_sided: &[],
     },
     AbiFamily {
@@ -134,8 +143,8 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U32Const,
         one_sided: &[],
     },
-    // `sys_power`'s operations. The kernel states them in a file of their
-    // own, so the sweep there finds nothing else; `libkern` keeps them beside `SYS_POWER`.
+    // The power node's bytes. The kernel states them in a file of their own, so the sweep there
+    // finds nothing else; `libkern` keeps them in `syscall.rs`.
     AbiFamily {
         what: "power operations",
         kernel_file: "kernel/src/libkern/power.rs",
@@ -143,7 +152,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         shape: AbiShape::U64Const,
         one_sided: &[],
     },
-    // What `sys_clock_set` says: the clock set and kept by the RTC, or
+    // What a write to the clock node says: the clock set and kept by the RTC, or
     // set for this boot only. The kernel's `u64` consts in `clock.rs` are these alone; `libkern`
     // keeps them beside `CLOCK_REALTIME`.
     AbiFamily {
@@ -266,10 +275,11 @@ fn extract_consts(text: &str, shape: AbiShape) -> Consts {
                 }
                 take(name, val);
             }
-            AbiShape::RightsBit => {
+            AbiShape::RightsBit | AbiShape::SysCapsBit => {
                 let Some(rest) = t.strip_prefix("pub const ") else { continue };
                 let Some((name, tail)) = rest.split_once(':') else { continue };
-                if !tail.contains("Rights(") {
+                let wrapper = if matches!(shape, AbiShape::RightsBit) { "Rights(" } else { "SysCaps(" };
+                if !tail.contains(wrapper) {
                     continue;
                 }
                 let Some((_, shifted)) = tail.split_once("1 <<") else { continue };

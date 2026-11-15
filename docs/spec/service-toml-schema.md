@@ -72,7 +72,6 @@ Recognized values:
 | `"BIND_NAMESPACE"` | `SysCaps::BIND_NAMESPACE` |
 | `"PHYSICAL_MEMORY"` | `SysCaps::PHYSICAL_MEMORY` |
 | `"REAL_TIME"` | `SysCaps::REAL_TIME` |
-| `"SYSTEM_CLOCK"` | `SysCaps::SYSTEM_CLOCK` |
 | `"AUDIT_CONTROL"` | `SysCaps::AUDIT_CONTROL` |
 
 Most services should hold zero syscaps. Granting `BIND_NAMESPACE` is reserved for services that themselves act as supervisors (e.g., a sub-service-manager). Granting `LOAD_MODULE` is for the device manager. Granting others requires equally strong justification.
@@ -133,6 +132,14 @@ rebuilds. **A server whose clients do not reconnect is essential too**, however 
 it strands them, and on a machine with no serial port leaves nothing to type at. That is why the
 terminal server, the input server and the compositor are, and the clipboard — whose clients open a
 session for each copy — is not (PR #341 review).
+
+### `clock` (optional, boolean; default `false`)
+
+**Since pre-Phase-7 Part E.10** (2026-11-15). A service that says `clock = true` is **handed the
+clock node**: `service-mgr` holds it from boot, and moves it to that service as a message on its
+control channel right after the spawn — after the log endpoint, for a non-server. **The move is
+once**: the service holds the node and `service-mgr` does not. Only the view broker declares it
+(with `syscaps = ["BIND_NAMESPACE"]`, and a restart policy of `never`, so there is one move).
 
 ### `stop_timeout` (optional, duration string; default: the service manager's)
 

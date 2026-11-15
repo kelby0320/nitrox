@@ -20,22 +20,6 @@ pub fn clock_read(clock: u64, out: &mut u64) -> i64 {
     })
 }
 
-/// `InvalidArgument` outside 2000 to 2099, as the kernel answers, then what a test armed.
-pub fn clock_set(ns: u64) -> i64 {
-    const Y2000: u64 = 946_684_800_000_000_000;
-    const Y2100: u64 = 4_102_444_800_000_000_000;
-    with(|m| {
-        if !(Y2000..Y2100).contains(&ns) {
-            return e(KError::InvalidArgument);
-        }
-        let r = m.clock_answer.take().unwrap_or(libkern::CLOCK_SET_KEPT as i64);
-        if r >= 0 {
-            m.realtime = Some(ns.saturating_sub(m.clock));
-        }
-        r
-    })
-}
-
 pub fn timer_create() -> i64 {
     with(|m| m.mint(Object::Timer(0), Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER))
 }

@@ -20,12 +20,10 @@ impl SysCaps {
     pub const PHYSICAL_MEMORY: SysCaps = SysCaps(1 << 2);
     /// Request the `RealTime` scheduling class.
     pub const REAL_TIME: SysCaps = SysCaps(1 << 3);
-    /// Set the realtime-clock offset.
-    pub const SYSTEM_CLOCK: SysCaps = SysCaps(1 << 4);
     /// Manage the audit subsystem.
     pub const AUDIT_CONTROL: SysCaps = SysCaps(1 << 5);
 
-    const ALL_BITS: u64 = (1 << 6) - 1;
+    const ALL_BITS: u64 = ((1 << 6) - 1) & !(1 << 4);
 
     /// The empty set (no authority).
     pub const fn empty() -> Self {
@@ -62,9 +60,6 @@ impl SysCaps {
 pub const SYSCAP_BIND_NAMESPACE: u64 = SysCaps::BIND_NAMESPACE.bits();
 /// `u64` alias for `REAL_TIME`.
 pub const SYSCAP_REAL_TIME: u64 = SysCaps::REAL_TIME.bits();
-/// `u64` alias for `SYSTEM_CLOCK`: `sys_clock_set`'s authority.
-pub const SYSCAP_SYSTEM_CLOCK: u64 = SysCaps::SYSTEM_CLOCK.bits();
-
 impl BitOr for SysCaps {
     type Output = SysCaps;
     fn bitor(self, rhs: SysCaps) -> SysCaps {
@@ -96,8 +91,7 @@ mod tests {
         assert_eq!(SysCaps::BIND_NAMESPACE.bits(), 1 << 1);
         assert_eq!(SysCaps::PHYSICAL_MEMORY.bits(), 1 << 2);
         assert_eq!(SysCaps::REAL_TIME.bits(), 1 << 3);
-        assert_eq!(SysCaps::SYSTEM_CLOCK.bits(), 1 << 4);
         assert_eq!(SysCaps::AUDIT_CONTROL.bits(), 1 << 5);
-        assert_eq!(SysCaps::all().bits(), 0b11_1111);
+        assert_eq!(SysCaps::all().bits(), 0b10_1111, "bit 4, the clock's until it was a node, vacant");
     }
 }

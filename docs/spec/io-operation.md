@@ -150,15 +150,17 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   through the same `PendingOperation`; no device-specific syscall exists.
 
   **A char device takes a `Write` only where its driver does** — today a keyboard's raw node,
-  for its lights ([Keyboard lights](#keyboard-lights)). Every other char node refuses one,
-  `Unsupported`, synchronously and with no PO: the console's output stays on the kernel log
-  path, and a mouse has nothing to set. **A zero-length `Write` is the exception**, to this and
+  for its lights ([Keyboard lights](#keyboard-lights)), the power node
+  ([below](#the-power-node)) and the clock node ([below](#the-clock-node)). Every other char
+  node refuses one, `Unsupported`, synchronously and with no PO: the console's output stays on
+  the kernel log path, and a mouse has nothing to set. **A zero-length `Write` is the exception**, to this and
   to everything below: like every zero-length request it completes at once, `result` `0`,
   before any device's rule is asked (`length` above).
 
   Today's char nodes are the serial console at `/dev/console`, the raw input devices at
-  `/dev/input/raw/<n>`, the registry's change node at `/dev/registry/changes`, and the kernel
-  generator at `/dev/entropy`.
+  `/dev/input/raw/<n>`, the registry's change node at `/dev/registry/changes`, the kernel
+  generator at `/dev/entropy`, the power node, which is bound nowhere, and the clock node, which
+  is bound nowhere at boot.
 
   **`/dev/entropy` answers at most 256 bytes a read, and may answer none.** A read before the
   generator is seeded, which only a CPU with neither `RDSEED` nor `RDRAND` sees, waits for the
@@ -225,6 +227,41 @@ Char devices come in two flavours, and the difference is visible to a caller:
   already waiting when the device went is answered with the releases, or completed `PeerClosed`
   if there were none. A reader therefore learns of the departure from one answer, and cannot spin
   on reads that each complete with an error.
+
+### The power node
+
+*(2026-11-15.)* **The power node is `init`'s alone**: one char node, made at boot and handed to
+`init` in `rdx` with `WRITE` and `INSPECT` and neither `DUPLICATE` nor `TRANSFER`, and bound in no
+namespace ([`power.md`](../architecture/power.md)). It is written, never read. A `Write` of
+**exactly one byte**, `POWER_HALT` (`0`) or `POWER_REBOOT` (`1`), flushes every disk, stops every
+processor and halts or resets the machine, **within `sys_io_submit`**, and never returns. Any other
+length or byte is refused `InvalidArgument`, synchronously, with no PO made; a zero-length write
+completes at once, as every one does.
+
+**This is the one write that acts before an operation is made.** Every other write makes its PO
+first and completes it later. The machine is stopping, so there is no PO to hand to anyone, and a
+machine that cannot stop for want of memory to make one is the worse outcome. It is also the one
+write that may wait inside the call, on its flush, which is bounded. A write needs `WRITE` on the
+node and `MAP_READ` on the buffer, as any write does.
+
+### The clock node
+
+*(2026-11-15.)* **Setting the wall clock is a `Write` to the clock node.** One char node, made at
+boot and handed to `init` in `rcx` with `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE`, and bound
+in no namespace at boot. It moves on, a hop at a time, to `service-mgr` and then the view broker,
+whose `clock` grant binds it at `/dev/clock` in a program's view. A `Write` of **exactly eight
+bytes**, little-endian nanoseconds since the Unix epoch, **in 2000-01-01 to 2099-12-31**, steps
+`Realtime` and writes the RTC under it. Any other length, or a time outside the range, is refused
+`InvalidArgument`. **A read is refused `NoAccess`**: the node's handle never carries `READ`, and
+`sys_io_submit` checks it before the node is asked. **A zero-length write sets nothing**, and
+completes at once with `result` `0`, as every zero-length request does: no answer of the clock's
+is `0`.
+
+**It is an ordinary write**: a PO is made, and completes at once. Its **`result` is the clock's
+answer, not a byte count**: `CLOCK_SET_KEPT` (`1`) when the RTC read back what was written, or
+`CLOCK_SET_THIS_BOOT` (`2`) when it did not, and the clock then lasts until the next boot. The
+kernel logs each set (`wall clock: set to <secs> (Unix epoch seconds, UTC); …`). A write needs
+`WRITE` on the node and `MAP_READ` on the buffer, as any write does.
 
 ### The registry's change node
 
@@ -301,7 +338,7 @@ IDENTIFY does not list the 48-bit form for. *(Administration Part C.2; it resolv
 **One opcode, two meanings a resource apart.** On a **file**, a `FileObject`, `Flush` puts every
 page of the file on its device: the page cache's write-back, as a writable mapping's writes need.
 It does not empty the device's volatile cache, which stays the device's own `Flush`: the storage
-service sends that at an unmount and `sys_power` at a stop. A file's flush runs on a kernel
+service sends that at an unmount and the power node's write at a stop. A file's flush runs on a kernel
 thread of its own and takes its turn in its mount's budget, as a mount's flush does, forgotten or
 not ([`syscall-abi.md`](syscall-abi.md) § `sys_ns_lookup`); one past its process's share is refused
 `WouldBlock`. A file with no device behind it has nothing to write: its flush completes `IoError`

@@ -17,6 +17,10 @@ libfs = { path = "../libfs" }
 # The TSM1 table `/svc/services/all.tsm` answers with (administration Part E.2).
 libstream = { path = "../libstream" }
 
+[dev-dependencies]
+# The kernel's model, for the handoffs' host tests.
+libos = { path = "../libos", features = ["mock"] }
+
 # A library + binary split (mirroring init): the library holds the host-testable
 # internals (the service-declaration parser), the binary is the bare-target
 # supervisor entry point. `cargo xtask test` runs `cargo test -p service-mgr --lib`

@@ -105,6 +105,8 @@ pub struct ServiceDecl {
     /// **A service `service --stop` and `--restart` refuse**: one whose absence would
     /// lock the administrator out, or lose state nothing rebuilds.
     pub essential: bool,
+    /// **Handed the clock node** at its start, moved, so it reaches one service once.
+    pub clock: bool,
     /// **How long it may take to exit once asked to stop**, in nanoseconds — at a shutdown, or
     /// on `service --stop` — or `None` for `service-mgr`'s own bound. For a service whose stop
     /// is work that grows with what it holds: the storage service writes back and unmounts every
@@ -131,7 +133,6 @@ const SYSCAP_NAMES: &[(&str, u64)] = &[
     ("BIND_NAMESPACE", libkern::syscaps::SysCaps::BIND_NAMESPACE.bits()),
     ("PHYSICAL_MEMORY", libkern::syscaps::SysCaps::PHYSICAL_MEMORY.bits()),
     ("REAL_TIME", libkern::syscaps::SysCaps::REAL_TIME.bits()),
-    ("SYSTEM_CLOCK", libkern::syscaps::SysCaps::SYSTEM_CLOCK.bits()),
     ("AUDIT_CONTROL", libkern::syscaps::SysCaps::AUDIT_CONTROL.bits()),
 ];
 
@@ -163,6 +164,7 @@ struct RestartSeen {
     endpoint: bool,
     critical: bool,
     essential: bool,
+    clock: bool,
     stop_timeout: bool,
     policy: bool,
     max_attempts: bool,
@@ -288,6 +290,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
     let mut endpoint: Option<Option<String>> = None;
     let mut critical = false;
     let mut essential = false;
+    let mut clock = false;
     let mut stop_timeout: Option<u64> = None;
     let mut restart = RestartConfig::default();
     let mut seen = RestartSeen::default();
@@ -319,6 +322,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
                     endpoint: endpoint.clone().flatten(),
                     critical,
                     essential,
+                    clock,
                     stop_timeout,
                 });
             }
@@ -353,6 +357,7 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
                         endpoint = None;
                         critical = false;
                         essential = false;
+                        clock = false;
                         stop_timeout = None;
                         name = Some(String::from(svc));
                     }
@@ -395,6 +400,10 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
             Section::Root if key == "essential" && !seen.essential => {
                 seen.essential = true;
                 essential = value == "true";
+            }
+            Section::Root if key == "clock" && !seen.clock => {
+                seen.clock = true;
+                clock = value == "true";
             }
             // A duration that does not read is `service-mgr`'s own bound, as a backoff's is.
             Section::Root if key == "stop_timeout" && !seen.stop_timeout => {
@@ -723,14 +732,14 @@ backoff_max = \"2s\"\n";
     fn a_server_declares_its_path_and_whether_it_is_critical_or_essential() {
         let v = parse_all(
             "[service.auth-service]\nexecutable=\"/bin/auth-service\"\nendpoint=\"/svc/auth\"\n\
-             critical=true\nessential=true\n\
+             critical=true\nessential=true\nclock=true\n\
              [service.heartbeat]\nexecutable=\"/bin/heartbeat\"\n",
         );
         assert_eq!(v.len(), 2);
         assert_eq!(v[0].endpoint.as_deref(), Some("/svc/auth"));
-        assert!(v[0].critical && v[0].essential);
+        assert!(v[0].critical && v[0].essential && v[0].clock);
         assert_eq!(v[1].endpoint, None, "a server's path does not leak to the next service");
-        assert!(!v[1].critical && !v[1].essential, "nor do its flags");
+        assert!(!v[1].critical && !v[1].essential && !v[1].clock, "nor do its flags");
         let first = parse_all(
             "[service.a]\nexecutable=\"/a\"\nendpoint=\"/x\"\nendpoint=\"/y\"\n\
              critical=true\ncritical=false\n",

@@ -54,7 +54,10 @@ enum Object {
     Thread(Option<RegisterValues>),
     /// `/dev/entropy`'s char node, whose `Read` answers bytes, or waits while unseeded.
     Entropy,
-    SystemControl,
+    /// The power node, whose one-byte write stops the machine within the submit.
+    Power,
+    /// The clock node, whose eight-byte write sets the wall clock.
+    Clock,
     Timer(u64),
 }
 
@@ -72,7 +75,7 @@ impl Object {
             Object::Process => KObjectType::Process,
             Object::Thread(_) => KObjectType::Thread,
             Object::Timer(_) => KObjectType::Timer,
-            Object::SystemControl => KObjectType::SystemControl,
+            Object::Power | Object::Clock => KObjectType::DeviceNode,
         }
     }
 }
@@ -343,6 +346,15 @@ pub fn io_submit(resource: u64, op: &IoOp) -> i64 {
         }
         if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Entropy)) {
             return file_io::entropy_read(m, resource, op);
+        }
+        if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Clock)) {
+            return file_io::clock_write(m, resource, op);
+        }
+        if matches!(m.get(resource, Rights::empty()), Ok((o, _)) if matches!(m.objects[o], Object::Power))
+            && op.opcode == libkern::IO_OPCODE_WRITE
+            && op.length != 0
+        {
+            return file_io::power_write(m, resource, op);
         }
         if let Err(r) = m.get(resource, Rights::empty()) {
             return r;
@@ -868,16 +880,6 @@ pub fn kprint(bytes: &[u8]) {
 pub fn test_exit(code: u64) -> i64 {
     with(|m| m.verdicts.push(code));
     e(KError::Unsupported)
-}
-
-/// As the kernel answers: a refusal, or for a stop it accepts, a panic, as it does not return.
-pub fn power(h: u64, op: u64) -> i64 {
-    let checked = with(|m| m.typed(h, Rights::WRITE, KObjectType::SystemControl).map(|_| ()));
-    match checked {
-        Err(r) => r,
-        Ok(()) if op != libkern::POWER_HALT && op != libkern::POWER_REBOOT => e(KError::InvalidArgument),
-        Ok(()) => panic!("power({op})"),
-    }
 }
 
 mod controls;

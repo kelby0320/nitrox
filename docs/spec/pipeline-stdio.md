@@ -40,8 +40,9 @@ floor; the setup message is opt-in.
 
 ## The `arg0` bootstrap descriptor
 
-`rcx` (`SpawnArgs.arg0`) **is the bootstrap descriptor — system-wide, the one
-meaning it has.** This is the single process-spawn convention: no program repurposes
+`rcx` (`SpawnArgs.arg0`) **is the bootstrap descriptor — in every spawned process, the one
+meaning it has**; pid 1, which no spawn makes, has the clock node there
+([`process-spawn-args.md`](process-spawn-args.md)). This is the single process-spawn convention: no program repurposes
 `arg0` (or `endpoint`, or any register) for private payload. A program that needs
 parameters gets them from `argv` in the setup message (Tier 1), never from `arg0`.
 (This governs `sys_process_spawn`; `sys_thread_create`'s `arg0` is a separate,

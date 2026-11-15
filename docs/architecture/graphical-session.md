@@ -299,8 +299,10 @@ Both supervisors run the same five steps. Only the first and last differ.
 
 **`nxsh`'s `syscaps: 0` is load-bearing for every command in the session**: since administration
 Part E.5, `nxsh` passes each stage it spawns whatever capabilities it holds, so giving it one gives
-that one to everything typed at it. That is how `with admin nxsh` is a shell whose `date --set`
-works; for a leader it would put the capability in every command a person runs.
+that one to everything typed at it. (The clock is not one: `date --set` reaches the `clock` grant's
+`/dev/clock` through the shell's namespace, which its stages inherit, so `with admin nxsh` is a
+shell whose `date --set` works.) For a leader a capability would be in every command a person
+runs.
 
 Steps 2–4 are the same logic against different arguments, which is what
 [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 7 factors into a shared crate.

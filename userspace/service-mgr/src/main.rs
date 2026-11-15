@@ -30,6 +30,7 @@ use libos::{
 };
 use librsproto::server;
 use service_mgr::bringup::{self, Entry, Failed, Step};
+use service_mgr::handoff::{Clock, hand_on, recv_handoff, send_handle};
 use service_mgr::registry;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
 use service_mgr::{services, wake};
@@ -201,6 +202,7 @@ fn spawn_service(
     root: &Handle<Namespace, NsReadOnly>,
     registry: Option<&BindNs>,
     decl: &ServiceDecl,
+    clock: &mut Option<Clock>,
 ) -> (Option<Handle<Process, Only>>, Option<Endpoint>) {
     let Some(image) = lookup::<File, MapRead, _>(root, &decl.executable, Rights::MAP_READ | Rights::INSPECT) else {
         Line::new().s(b"service-mgr: image not found: ").s(decl.executable.as_bytes()).end();
@@ -264,10 +266,8 @@ fn spawn_service(
     };
     // The spawn ABI delivers one handle to a register, so the log endpoint follows on the
     // control channel, as a non-server's first message: empty without one, as heartbeat takes it.
-    if decl.endpoint.is_none()
-        && let Some(ours) = &smgr_end
-    {
-        send_handle(ours, log_ep);
+    if let Some(ours) = &smgr_end {
+        hand_on(ours, decl.endpoint.is_some(), log_ep, decl.clock, clock);
     }
     (Some(process), smgr_end)
 }
@@ -285,33 +285,6 @@ fn spawn_supervisor(root: &Handle<Namespace, NsReadOnly>, path: &str) -> Option<
     let _ = spawn.grant(child_end, SUPERVISOR_CONTROL);
     spawn.syscaps(SysCaps::BIND_NAMESPACE);
     Some((spawn.spawn().ok()?, smgr_end))
-}
-
-/// Receive one handle from init's handoff channel; `None` if the message was empty or the receive
-/// failed. **Bounded**: an unbounded wait would hang the supervisor on a message never coming.
-fn recv_handoff<T, M>(ctrl: &Endpoint) -> Option<Handle<T, M>> {
-    let mut set = WaitSet::<1>::new();
-    let deadline = Deadline::at(now_ns().saturating_add(READY_TIMEOUT_NS));
-    if !set.add(ctrl).and_then(|_| set.wait(deadline)).is_ok_and(|s| !s.is_empty()) {
-        log::write(b"service-mgr: handoff timeout\n");
-        return None;
-    }
-    // The one handle a handoff brings; any more close as `sent` drops.
-    ctrl.recv(&mut Msg::new()).ok()?.take(0)
-}
-
-/// Move `handle` to a child over its control channel; one refused is closed, and as `None`
-/// sends **an empty message**: the receiver reads the handoffs positionally.
-fn send_handle<T, M>(ctrl: &Endpoint, handle: Option<Handle<T, M>>) {
-    let mut carried = Carried::new();
-    if let Some(handle) = handle
-        && carried.push(handle).is_ok()
-        && send_msg(ctrl, &[], &mut carried)
-    {
-        return;
-    }
-    drop(carried);
-    send_msg(ctrl, &[], &mut Carried::new());
 }
 
 /// **What the login supervisors are handed**, in order. `fs` and `profile` are `init`'s servers'
@@ -415,7 +388,8 @@ fn bring_up_desktop_session(root: &Handle<Namespace, NsReadOnly>, set: ChainEndp
 /// **What comes down the terminal channel first:**
 /// 1. a root handle with `init`'s own rights, `BIND` and `UNBIND` among them, since binding the
 ///    servers is this manager's job and it is in `init`'s trust tier;
-/// 2. the root filesystem's endpoint, and 3. the profile server's, both for the login chain.
+/// 2. the root filesystem's endpoint, and 3. the profile server's, both for the login chain;
+/// 4. the clock node, for the one service that declares `clock`, which it moves on.
 ///
 /// The channel then stays open for asking `init` for the emergency shell. An empty first handoff
 /// means `init` made no root handle, and then no server can be bound, which is said.
@@ -425,9 +399,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, arg0: u64) -> 
     let mut start = unsafe { Start::from_registers(notif, root_ns, terminal, arg0) };
     log::write(b"service-mgr: up\n");
     let terminal: Option<Endpoint> = start.take_handle0();
-    let (root_bind, fs_endpoint, profile_endpoint) = match &terminal {
-        None => (None, None, None),
-        Some(t) => (recv_handoff(t), recv_handoff(t), recv_handoff(t)),
+    let (root_bind, fs_endpoint, profile_endpoint, clock) = match &terminal {
+        None => (None, None, None, None),
+        Some(t) => {
+            let w = READY_TIMEOUT_NS;
+            (recv_handoff(t, w), recv_handoff(t, w), recv_handoff(t, w), recv_handoff(t, w))
+        }
     };
     if root_bind.is_none() {
         log::write(b"service-mgr: no root handle from init -- no server can be bound\n");
@@ -477,6 +454,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, arg0: u64) -> 
         terminal,
         fs_endpoint,
         profile_endpoint,
+        clock,
         svcs,
         entries,
         started: 0,
@@ -706,6 +684,8 @@ struct Mgr {
     /// `init`'s endpoints for the login chain, until it takes them.
     fs_endpoint: Option<Endpoint>,
     profile_endpoint: Option<Endpoint>,
+    /// `init`'s clock node, until the service that declares it takes it.
+    clock: Option<Clock>,
     svcs: Vec<Supervised>,
     entries: Vec<Entry>,
     started: usize,
@@ -945,7 +925,7 @@ impl Mgr {
 
     fn start(&mut self, i: usize, bringup: bool) -> bool {
         let server = self.svcs[i].decl.endpoint.is_some();
-        let (h, ctrl) = spawn_service(&self.root, self.registry.as_ref(), &self.svcs[i].decl);
+        let (h, ctrl) = spawn_service(&self.root, self.registry.as_ref(), &self.svcs[i].decl, &mut self.clock);
         let s = &mut self.svcs[i];
         if h.is_some() {
             s.proc_h = h;

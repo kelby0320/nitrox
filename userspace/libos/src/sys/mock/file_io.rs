@@ -100,3 +100,57 @@ pub(super) fn entropy_read(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     }
     m.po(Po { ready: true, never: false, status: 0, result: n as u64, lookup: None })
 }
+
+/// A write to the power node: a stop panics `power(<op>)`, the test's way to see the machine stop.
+pub(super) fn power_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
+    if let Err(r) = m.typed(h, Rights::WRITE, KObjectType::DeviceNode) {
+        return r;
+    }
+    let b = match m.get(op.buffer, Rights::MAP_READ) {
+        Ok((b, _)) if matches!(m.objects[b], Object::Memory(_)) => b,
+        Ok(_) => return e(KError::InvalidArgument),
+        Err(r) => return r,
+    };
+    let at = op.buf_offset as usize;
+    let byte = pages(&m.objects[b]).0.get(at / PAGE).map(|page| page.0[at % PAGE]);
+    match byte.map(u64::from).filter(|_| op.length == 1) {
+        Some(stop) if stop == libkern::POWER_HALT || stop == libkern::POWER_REBOOT => panic!("power({stop})"),
+        _ => e(KError::InvalidArgument),
+    }
+}
+
+/// A request to the clock node, as the kernel takes it; a set answers what `answer_next_clock_set`
+/// armed, else `CLOCK_SET_KEPT`.
+pub(super) fn clock_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
+    const Y2000: u64 = 946_684_800_000_000_000;
+    const Y2100: u64 = 4_102_444_800_000_000_000;
+    let read = op.opcode == libkern::IO_OPCODE_READ;
+    if let Err(r) = m.typed(h, if read { Rights::READ } else { Rights::WRITE }, KObjectType::DeviceNode) {
+        return r;
+    }
+    if read {
+        return e(KError::Unsupported);
+    }
+    let b = match m.get(op.buffer, Rights::MAP_READ) {
+        Ok((b, _)) if matches!(m.objects[b], Object::Memory(_)) => b,
+        Ok(_) => return e(KError::InvalidArgument),
+        Err(r) => return r,
+    };
+    if op.length == 0 {
+        return m.po(Po { ready: true, never: false, status: 0, result: 0, lookup: None });
+    }
+    if op.length != 8 {
+        return e(KError::InvalidArgument);
+    }
+    let at = op.buf_offset as usize;
+    let pages = pages(&m.objects[b]);
+    let bytes: Vec<u8> = (at..at + 8).filter_map(|i| pages.0.get(i / PAGE).map(|page| page.0[i % PAGE])).collect();
+    let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) else { return e(KError::InvalidArgument) };
+    let ns = u64::from_le_bytes(bytes);
+    if !(Y2000..Y2100).contains(&ns) {
+        return e(KError::InvalidArgument);
+    }
+    let answer = m.clock_answer.take().unwrap_or(libkern::CLOCK_SET_KEPT as i64);
+    m.realtime = Some(ns.saturating_sub(m.clock));
+    m.po(Po { ready: true, never: false, status: 0, result: answer as u64, lookup: None })
+}

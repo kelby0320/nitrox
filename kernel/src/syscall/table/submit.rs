@@ -10,9 +10,12 @@ use super::*;
 // TODO(io-cancel): nothing cancels an operation once it is submitted.
 pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-
     let optr = UserPtr::<IoOp>::new(op_ptr).map_err(from_user_access)?;
-    let op = copy_from_user(optr).map_err(from_user_access)?;
+    submit_op(resource_h, &copy_from_user(optr).map_err(from_user_access)?, pid)
+}
+
+pub(super) fn submit_op(resource_h: u64, op: &IoOp, pid: u32) -> SysResult {
+    let op = *op;
     let opcode = IoOpcode::from_u32(op.opcode).ok_or(KError::InvalidArgument)?;
     if matches!(opcode, IoOpcode::Read | IoOpcode::Write)
         && let Ok(found) = global::get().lookup(RawHandle(resource_h), pid, Rights::empty())
@@ -37,6 +40,9 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     let buf_end = op.buf_offset.checked_add(op.length).ok_or(KError::InvalidArgument)?;
     if buf_end > buffer_size {
         return Err(KError::InvalidArgument);
+    }
+    if let Some(refused) = acted(&device, &buffer, &op, opcode) {
+        return Err(refused);
     }
 
     let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
@@ -71,6 +77,13 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
     dispatched?;
     installed.commit();
     Ok(po_h.bits() as isize)
+}
+
+/// The refusal of a write that acts, run before an operation is made; `None` for any other request
+/// and a zero-length write, which completes as every one does.
+pub(super) fn acted(device: &DeviceNode, buffer: &MemoryObject, op: &IoOp, opcode: IoOpcode) -> Option<KError> {
+    let act = device.char_backend().and_then(|b| b.act).filter(|_| opcode == IoOpcode::Write && op.length != 0)?;
+    Some(act(buffer, op.buf_offset, op.length))
 }
 
 /// `sys_io_submit`'s **flush**: make what has been written to the block device `resource_h`

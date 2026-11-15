@@ -258,7 +258,8 @@ pub fn seed_u64() -> u64 {
 }
 
 /// `/dev/entropy`'s backend: a read and no write.
-pub const BACKEND: CharBackend = CharBackend { submit_read: read, submit_write: None, ctx: core::ptr::null_mut() };
+pub const BACKEND: CharBackend =
+    CharBackend { submit_read: read, submit_write: None, ctx: core::ptr::null_mut(), act: None };
 
 /// The node `/dev/entropy` serves, made by [`make_node`].
 static NODE: SpinLock<Option<Ref<DeviceNode>>> = SpinLock::new(LockRank::Leaf, None);

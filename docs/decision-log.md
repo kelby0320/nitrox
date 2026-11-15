@@ -38319,3 +38319,26 @@ E.8 merged, #441. E.9, `syscall-surface.md` § E.9, built on `pre-phase-7/part-e
   is written fresh; **`/dev/entropy`'s waited `0` is in the char contract** as read again; libos
   refuses a second empty answer from what it took for the generator; tty-server reads a token's
   bytes as it mints it.
+
+## 2026-11-15 — Before Phase 7, E.10: one authority model
+
+E.9 merged, #442. E.10, `syscall-surface.md` § E.10, built on `pre-phase-7/part-e10-authority`.
+
+- **A handle for both**, each privileged system operation a `Write` to a kernel char node (the
+  maintainer's call, finding 5). **The power node** replaces `SystemControl` and `sys_power`;
+  `init` holds it alone, and its one-byte write acts within `sys_io_submit` before an operation is
+  made (`CharBackend::act`), as a machine that cannot stop for want of memory is the worse
+  outcome. It is the one write that waits in the call, and returns only to refuse.
+- **The clock node** replaces `sys_clock_set` and `SYSTEM_CLOCK`: handed to `init` in `rcx` and
+  moved at each hop, to `service-mgr` and then the view broker, which declares `clock = true`
+  and binds it at `/dev/clock` for the `clock` grant. A direct bind needs `TRANSFER`, so the
+  clock is sendable from a view, as a disk is. Its write's `result` is the clock's answer.
+- `SystemControl` (15) went, so the ABI hash's inputs changed; numbers 40 and 41 and syscap bit 4
+  are vacant, leaving 28 numbered syscalls and five syscaps. `surface-shape` is resolved;
+  `test-verdict-authority` stays, its trigger a verdict node.
+- The commits: `6dea7a20`, `30b7c70a`.
+- After review (`a960f24a`), **pid 1's `rdx` and `rcx` are the power and clock nodes in the spawn
+  spec**, and **the clock's answers are `1` and `2`**, so a zero-length write's `0` is no answer;
+  the clock's moves, the act's call site and init's kept power node are host-tested, and
+  `abi-sync-check` pairs the syscap bits.
+

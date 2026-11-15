@@ -217,7 +217,7 @@ pub(crate) fn cmd_test_qemu(accel: Accel) -> R<()> {
             check_oversize_refused(&transcript)?;
             check_every_service_started(&transcript)?;
             check_servers_are_service_mgrs(&transcript)?;
-            check_system_control(&transcript)?;
+            check_power_node(&transcript)?;
             check_hardware_facts(&transcript)?;
             check_hot_plug(&transcript, &hot)?;
             check_usb_listed(&transcript)?;
@@ -524,15 +524,15 @@ const SERVICE_MGR_SERVERS: &[(&str, &str)] = &[
     ("compositor", "/dev/draw"),
 ];
 
-/// `init` holds the system-control object; that nothing else can use `sys_power` is `boot-probe`'s.
-fn check_system_control(transcript: &[u8]) -> R<()> {
+/// `init` holds the power node; that nothing else can stop the machine is `boot-probe`'s.
+fn check_power_node(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
-    if !text.contains("init: holds the system-control object") {
-        return Err("`init: holds the system-control object` is not in the transcript: the kernel's \
-                    handoff in `rdx` did not reach init as a SystemControl with WRITE"
+    if !text.contains("init: holds the power node") {
+        return Err("`init: holds the power node` is not in the transcript: the kernel's handoff in \
+                    `rdx` did not reach init as a device node with WRITE"
             .into());
     }
-    println!("xtask: init holds the system-control object ✓");
+    println!("xtask: init holds the power node ✓");
     Ok(())
 }
 

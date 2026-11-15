@@ -2,9 +2,9 @@
 //! when `/system/views.toml` says the caller may.
 //!
 //! **What it holds, and so what a bug here reaches.** It is spawned by `service-mgr` with
-//! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and `SYSTEM_CLOCK`,
-//! which it never uses and passes to a program only for the `clock` grant — a capability can be
-//! given at spawn only by a parent that holds it. It inherits the root namespace, which is where
+//! `BIND_NAMESPACE`, which it needs to bind grants into the views it builds, and is moved the
+//! clock node, which it never writes and binds into a view only for the `clock` grant
+//! ([`clock`]). It inherits the root namespace, which is where
 //! the grants come from: every block device, for `disks`. **And the root filesystem**, through
 //! which it reads and replaces `/system/views.toml` and makes and removes `/home/<name>` for the
 //! accounts it fronts. It never holds a session's ingredients — the caller hands it a copy of its
@@ -45,6 +45,7 @@ use librsproto::views::*;
 use librsproto::{OP_NS_RESOLVE, OP_TTY_REDEEM, RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_TOKEN_LEN, server};
 use libstream::setup::{StageStreams, bootstrap_arg0, send_stage_setup};
 use libstream::wire::{ByteSource, Record, TypeTag, Value, read_value};
+use view_broker::clock;
 use view_broker::exits::Exits;
 use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
@@ -185,11 +186,12 @@ enum Endpoint {
 
 struct Broker {
     storage: Storage,
-    /// Endpoints for the `services`, `power` and `logs` grants, each held for the boot and
-    /// **resolved when first needed**, as the storage service's is; `None` until then.
+    /// Endpoints for the `services`, `power` and `logs` grants, **resolved when first needed** and
+    /// held for the boot; and the clock node for `clock`, which `service-mgr` moves here at start.
     services_admin: Option<Ch>,
     power: Option<Ch>,
     logs: Option<Ch>,
+    clock: Option<clock::Clock>,
     root_ns: Root,
     notif: Handle<Notify, Only>,
     /// The control channel, for a shutdown's `CTRL_OP_SHUTDOWN`. `service --stop` never sends it:
@@ -845,12 +847,10 @@ impl Broker {
     /// closed on a refusal.
     fn launch(&mut self, session: u64, p: &mut Pending) -> Result<Launched, &'static str> {
         // **Copied again, never used as sent** — whoever sent a namespace may still hold it.
-        let copied = p.handles.ns.take().map(|ns| ns.copy());
-        let Some(Ok(view_ns)) = copied else {
+        let Some(Ok(view_ns)) = p.handles.ns.take().map(|ns| ns.copy()) else {
             return Err("could not copy the caller's namespace");
         };
-        let mut syscaps = SysCaps::empty();
-        let mut kernel_log_ours = false;
+        let (mut kernel_log_ours, mut clock_ours) = (false, false);
         for g in &p.grants {
             match g {
                 // Every disk not in use: a mounted filesystem's device, `init`'s root included,
@@ -906,9 +906,7 @@ impl Broker {
                         return Err("the kernel's log is not there to grant");
                     }
                 }
-                // `SYSTEM_CLOCK` in the spawn below, which the kernel intersects with the broker's
-                // own. Binds nothing.
-                Grant::Clock => syscaps |= SysCaps::SYSTEM_CLOCK,
+                Grant::Clock => clock_ours = clock::bind(self.clock.as_ref(), &view_ns)?,
                 // The broker's own endpoint with the base `/policy/<session>`, so a resolve there
                 // reaches the broker as this session's policy channel.
                 Grant::Views => {
@@ -933,10 +931,11 @@ impl Broker {
             Grant::Views => Some(POLICY_GRANT),
             Grant::Accounts => Some(ACCOUNTS_GRANT),
             Grant::KernelLog => kernel_log_ours.then_some(KERNEL_LOG),
-            Grant::Disks | Grant::Clock => None,
+            Grant::Clock => clock_ours.then_some(libos::system::CLOCK_PATH),
+            Grant::Disks => None,
         });
         let granted = Granted { paths: paths.collect(), disks: p.grants.contains(&Grant::Disks) };
-        let started = spawn_program(&self.root_ns, &p.program, &view_ns, bootstrap_arg0(true), syscaps)
+        let started = spawn_program(&self.root_ns, &p.program, &view_ns, bootstrap_arg0(true), SysCaps::empty())
             .map_err(StartError::reason)?;
         let env = view_env(&p.env, &p.view);
         let mut argv: Vec<&str> = Vec::with_capacity(1 + p.args.len());
@@ -1237,6 +1236,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         services_admin: None,
         power: None,
         logs: None,
+        clock: clock::receive(control.as_ref()),
         log: liblog::Logger::open(&root_ns, "/log/system/view-broker"),
         root_ns,
         notif,

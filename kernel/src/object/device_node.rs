@@ -167,6 +167,9 @@ pub struct CharBackend {
     /// **Submit a write to the device**, if it takes one: a keyboard's lights, one byte. `None`
     /// refuses a write as `Unsupported`.
     pub submit_write: Option<CharWrite>,
+    /// **A write that acts before any operation is made, and returns only to refuse**, in place of
+    /// `submit_write`: a machine that cannot stop for want of memory is the worse outcome.
+    pub act: Option<CharAct>,
     /// Device context passed back to `submit_read` and `submit_write` (e.g. the console state).
     pub ctx: *mut (),
 }
@@ -182,6 +185,9 @@ pub type CharRead = fn(
     max_len: u64,
     ctx: *mut (),
 ) -> Result<(), KError>;
+
+/// A char device's write that acts within the call ([`CharBackend::act`]), and its refusal.
+pub type CharAct = fn(buffer: &MemoryObject, buf_offset: u64, len: u64) -> KError;
 
 /// A char device's write: `len` bytes from `buffer` at `buf_offset`, completing `po`.
 pub type CharWrite = fn(

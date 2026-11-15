@@ -787,6 +787,58 @@ defined. **Controls:** `date --set` without the grant, refused; with it, the clo
 power byte refused with no PO made; `check-shutdown` and `check-logout`, unchanged. Author;
 `/pr-review`.
 
+**Built 2026-11-15** (`6dea7a20` the power node; `30b7c70a` the clock node). Thirty numbers to
+twenty-eight, the count the part ends with.
+- **The power node** replaces `SystemControl` and `sys_power`: `init` holds it with `WRITE` alone
+  of the rights a move or a copy needs, and a stop is a one-byte `Write`. **A node's write may act
+  before an operation is made**, a `CharBackend::act` run in `sys_io_submit` after its checks and
+  before the PO; the power node's is the one, and it returns only to refuse.
+- **The clock node** replaces `sys_clock_set` and `SYSTEM_CLOCK`: `init` has it in `rcx`, moves it
+  to `service-mgr` as a fourth handoff, and `service-mgr` to the one service that declares
+  `clock = true`, the view broker, which binds it at `/dev/clock` for the `clock` grant. `date
+  --set` resolves it there. Five syscaps are left.
+- **The controls the plan named**: `date --set` refused without the grant and the clock moved with
+  it (`test-interactive`, a shell in the view too); a bad power byte refused with no PO made (a
+  host test of the act and of the byte); `check-shutdown` and `check-logout` unchanged.
+- **For the maintainer's eye: four departures from the plan.**
+  1. **The clock's write answers the clock's answer**: its `result` is `CLOCK_SET_KEPT` or
+     `CLOCK_SET_THIS_BOOT`, not a byte count, so `date` can still say the RTC did not take it.
+  2. **"From a buffer it makes at boot"** is a page of both stops' bytes, `system::Power`, so a
+     stop writes from offset 0 or 1 and maps nothing then.
+  3. **The broker's declaration says `clock = true`**, a new key: `service-mgr` moves the node to
+     the first service that declares it, and sends an empty message to any later one.
+  4. **A broker with no clock refuses every view with the `clock` grant**, `with admin`'s among
+     them, as it refuses a view whose other grant it cannot make, where a missing `SYSTEM_CLOCK`
+     was attenuated away in silence.
+- `test-verdict-authority`, whose trigger was E.10, stays: the verdict is a test build's debug call
+  outside the surface E.10 changed, and its trigger is now a verdict node.
+
+**The controls**: fourteen mutations each fail their test, two of them a boot: the power byte and
+its length, a zero-length write or a read acting, the stops swapped, the mock taking any byte; the
+clock's length and time, the kernel's and the mock's, its answer ignored, the mock's right
+unchecked, the declaration's key unread; a `sys_io_submit` that does not run the act fails
+`check-shutdown`, and a `service-mgr` that does not move the clock fails `test-interactive`.
+**All 19 CI gates pass under KVM**; `check-fbcon` failed once in four runs, a frame read before
+both lines were on it, and passed alone twice.
+
+**After review** (`a960f24a`):
+- **The spawn spec says what pid 1's `rdx` and `rcx` hold**, the power node and the clock node,
+  which no spawn makes, where it called `rcx` the bootstrap descriptor in every process.
+- **The clock's answers are `1` and `2`, never `0`**, which a zero-length write completes with, as
+  every one does, having set nothing: an empty write read as a set the RTC kept. libos refuses any
+  other answer, and the mock refuses a read `NoAccess` and completes an empty write, as the kernel
+  does.
+- **The act is driven at its call site** by a host test of `sys_io_submit` once its op is read
+  in, and `timer_create`'s refusal of unknown flags, lost with `sys_clock_set`'s tests, is tested
+  again.
+- **The clock's moves are host-tested**: the broker takes only a device node it may write, and
+  keeps a nested view's own `/dev/clock`, where such a view was refused; `service-mgr` sends the
+  log endpoint before the clock, and the clock once. **init keeps the power node** if its page
+  cannot be made, and the stop makes it then.
+- **`abi-sync-check` pairs the syscap bits**, and `overview.md` counts 28 syscalls.
+- Declined: the clock write's `result` as the clock's answer, departure 1, which `io-operation.md`
+  states and `set_clock` alone decodes.
+
 ### E.11 The numbers, and the record
 
 Numbers were assigned in landing order, so the removals leave holes. **One commit renumbers `0`

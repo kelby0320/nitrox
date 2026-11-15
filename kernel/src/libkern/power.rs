@@ -1,13 +1,13 @@
-//! `sys_power`'s operations — the kernel's copy. `userspace/libkern` carries the matching
-//! one, and `cargo xtask abi-sync-check` pairs the two by name. Not a version-hash input: a
-//! syscall argument, like [`ClockId`](super::ClockId).
+//! The power node's operations, the one byte a write to it carries — the kernel's copy.
+//! `userspace/libkern` carries the matching one, and `cargo xtask abi-sync-check` pairs the two
+//! by name. Not a version-hash input: a payload, as [`ClockId`](super::ClockId) is an argument.
 
 /// Flush every disk, stop every processor, and say it is safe to turn the machine off.
 pub const POWER_HALT: u64 = 0;
 /// Flush every disk, stop every processor, and reset the machine.
 pub const POWER_REBOOT: u64 = 1;
 
-/// What `sys_power` was asked to do.
+/// What a write to the power node asks for.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum PowerOp {
     /// [`POWER_HALT`].
@@ -17,7 +17,7 @@ pub enum PowerOp {
 }
 
 impl PowerOp {
-    /// Decode `sys_power`'s argument, or `None` for a value that names no operation.
+    /// Decode a write's byte, or `None` for a value that names no operation.
     pub const fn from_u64(v: u64) -> Option<Self> {
         match v {
             POWER_HALT => Some(Self::Halt),
