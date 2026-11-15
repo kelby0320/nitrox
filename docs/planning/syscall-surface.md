@@ -821,6 +821,24 @@ unchecked, the declaration's key unread; a `sys_io_submit` that does not run the
 **All 19 CI gates pass under KVM**; `check-fbcon` failed once in four runs, a frame read before
 both lines were on it, and passed alone twice.
 
+**After review** (`a960f24a`):
+- **The spawn spec says what pid 1's `rdx` and `rcx` hold**, the power node and the clock node,
+  which no spawn makes, where it called `rcx` the bootstrap descriptor in every process.
+- **The clock's answers are `1` and `2`, never `0`**, which a zero-length write completes with, as
+  every one does, having set nothing: an empty write read as a set the RTC kept. libos refuses any
+  other answer, and the mock refuses a read `NoAccess` and completes an empty write, as the kernel
+  does.
+- **The act is driven at its call site** by a host test of `sys_io_submit` once its op is read
+  in, and `timer_create`'s refusal of unknown flags, lost with `sys_clock_set`'s tests, is tested
+  again.
+- **The clock's moves are host-tested**: the broker takes only a device node it may write, and
+  keeps a nested view's own `/dev/clock`, where such a view was refused; `service-mgr` sends the
+  log endpoint before the clock, and the clock once. **init keeps the power node** if its page
+  cannot be made, and the stop makes it then.
+- **`abi-sync-check` pairs the syscap bits**, and `overview.md` counts 28 syscalls.
+- Declined: the clock write's `result` as the clock's answer, departure 1, which `io-operation.md`
+  states and `set_clock` alone decodes.
+
 ### E.11 The numbers, and the record
 
 Numbers were assigned in landing order, so the removals leave holes. **One commit renumbers `0`

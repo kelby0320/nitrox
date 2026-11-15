@@ -38337,4 +38337,8 @@ E.9 merged, #442. E.10, `syscall-surface.md` § E.10, built on `pre-phase-7/part
   are vacant, leaving 28 numbered syscalls and five syscaps. `surface-shape` is resolved;
   `test-verdict-authority` stays, its trigger a verdict node.
 - The commits: `6dea7a20`, `30b7c70a`.
+- After review (`a960f24a`), **pid 1's `rdx` and `rcx` are the power and clock nodes in the spawn
+  spec**, and **the clock's answers are `1` and `2`**, so a zero-length write's `0` is no answer;
+  the clock's moves, the act's call site and init's kept power node are host-tested, and
+  `abi-sync-check` pairs the syscap bits.
 
