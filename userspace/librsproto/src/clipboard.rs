@@ -341,12 +341,16 @@ pub enum ClipError {
     Transport(i32),
     /// The request did not fit the message buffer, or the payload is over [`MAX_CLIP_BYTES`].
     Protocol,
-    /// The server refused: its `KError` (or `None` if the error reply carried no body) and its
-    /// `server_code`.
+    /// The server refused.
     ///
     /// Two refusals share `InvalidArgument` and mean opposite things: a stale cycle is *retry*,
     /// a malformed body *a bug*.
-    Refused { kerror: Option<i32>, server_code: u32 },
+    Refused {
+        /// Its `KError`, or `None` if the error reply carried no body.
+        kerror: Option<i32>,
+        /// Its own code for the refusal.
+        server_code: u32,
+    },
 }
 
 #[cfg(feature = "io")]

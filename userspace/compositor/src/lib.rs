@@ -25,8 +25,8 @@ use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, STICKY_DESKTOP, SURFACE_FORMAT_ARGB8888,
-    SURFACE_FORMAT_XRGB8888, WINDOW_FLAG_MINIMIZED,
+    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Placement, Role, STICKY_DESKTOP,
+    SURFACE_FORMAT_ARGB8888, SURFACE_FORMAT_XRGB8888, WINDOW_FLAG_MINIMIZED,
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
@@ -138,6 +138,8 @@ pub struct Window {
     /// Stored so the scheme reaches every reader without being threaded through each; written only
     /// by [`create`](WindowStack::create) and [`set_scheme`](WindowStack::set_scheme).
     pub shadow: Option<Shadow>,
+    /// A placed popup's anchor and placement, to place it again when a commit changes its size.
+    pub placed: Option<(Point, Placement)>,
 }
 
 impl Window {
@@ -235,6 +237,8 @@ pub enum StackError {
     StickyIsNotADesktop,
     /// This window already holds [`MAX_ACCEPTORS`](librsproto::surface::MAX_ACCEPTORS) acceptors.
     TooManyAcceptors,
+    /// A popup asked to be placed by a stack given no screen ([`WindowStack::on_screen`]).
+    NoScreen,
     /// That window is being dragged by the user, so a manager may not place it (it would be
     /// undone).
     Dragging,
@@ -312,6 +316,13 @@ impl WindowStack {
         self
     }
 
+    /// The work area, or the screen when panels reserved all of it: that empty area is off the edge.
+    fn placement_area(&self) -> Option<Rect> {
+        let screen = self.screen?;
+        let area = self.work_area(screen);
+        Some(if area.size.w == 0 || area.size.h == 0 { screen } else { area })
+    }
+
     /// Windows, bottom-first.
     pub fn windows(&self) -> &[Window] {
         &self.windows
@@ -340,25 +351,26 @@ impl WindowStack {
         //
         // A dialog names a parent for desktop membership and lifetime, not position; it is placed
         // like a `normal` window.
-        let origin = match req.role {
+        let (origin, placed) = match req.role {
             // Where its creator asks, or kept inside the work area if it asks that. Nothing makes an
             // application ask, so its popup can still cover the bars — `TODO(app-covers-panels)`.
             Role::Popup { parent } => {
                 let base = self.window(parent).expect("checked above").origin;
                 let anchor = Point::new(base.x.saturating_add(req.offset_x), base.y.saturating_add(req.offset_y));
-                match self.screen {
-                    Some(screen) => {
-                        placement::place(anchor, (req.width, req.height), self.work_area(screen), req.place)
-                    }
-                    None => anchor,
+                if req.place == Placement::AsAsked {
+                    (anchor, None)
+                } else {
+                    // Refused: a compositor that forgot its screen would misplace menus silently.
+                    let area = self.placement_area().ok_or(StackError::NoScreen)?;
+                    (placement::place(anchor, (req.width, req.height), area, req.place), Some((anchor, req.place)))
                 }
             }
             // A `normal` or `dialog` window starts where it asked and a manager overrides it: the
             // configure is held until it answers. Without a manager (the login greeter) it appears
             // where it asked.
-            Role::Normal | Role::Dialog { .. } => Point::new(req.offset_x, req.offset_y),
+            Role::Normal | Role::Dialog { .. } => (Point::new(req.offset_x, req.offset_y), None),
             // A panel is docked, not positioned: its `strut` says which edge it reserves.
-            Role::Panel { .. } => Point::new(0, 0),
+            Role::Panel { .. } => (Point::new(0, 0), None),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -379,6 +391,7 @@ impl WindowStack {
             acceptors: Vec::new(),
             state_requested: None,
             shadow: shadow_for(req.role, self.scheme),
+            placed,
         });
         Ok(id)
     }
@@ -586,6 +599,7 @@ impl WindowStack {
     /// Returns the buffer that was on screen before, if any — that is the one to release; releasing
     /// the new one would hand the client memory the compositor is about to read.
     pub fn commit(&mut self, req: &CommitRequest) -> Result<Option<u32>, StackError> {
+        let area = self.placement_area();
         let w = self.windows.iter_mut().find(|w| w.id == req.window).ok_or(StackError::NoSuchWindow)?;
         if !w.buffers.iter().any(|b| b.id == req.buffer) {
             return Err(StackError::NoSuchBuffer);
@@ -593,6 +607,13 @@ impl WindowStack {
         let previous = w.committed;
         let was = w.painted_bounds();
         w.committed = Some(req.buffer);
+        // Placed again at its new size, or a menu that grows passes the edge it was kept inside.
+        if let (Some((anchor, how)), Some(area)) = (w.placed, area)
+            && w.bounds().size != was.size
+        {
+            let size = w.bounds().size;
+            w.origin = placement::place(anchor, (size.w, size.h), area, how);
+        }
         // A commit can resize the window: `bounds()` follows the committed buffer's geometry.
         if w.painted_bounds() != was {
             self.geometry_log.push(req.window);

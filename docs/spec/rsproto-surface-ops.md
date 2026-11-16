@@ -8,7 +8,9 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 2 Part A
 (`docs/planning/display-arm-plan.md`); the namespace surface completed in Part B.
 `AttachBuffer` gained a second accepted pixel format in M13 Part B (2026-09-03) — an
-extension the `format` word was reserved for, so no envelope or offset changed.
+extension the `format` word was reserved for, so no envelope or offset changed. A popup's
+`CreateWindow` aux16 word, reserved the same way, became its **placement** in pre-Phase-7 Part F.2
+(2026-11-16): `0`, what every earlier encoder wrote, still means as asked.
 `CreateWindow`, `AttachBuffer`, `Commit`, `Release`, `DestroyWindow`, `KeyEvent` and
 `PointerEvent` are defined, and
 four paths resolve: `/dev/draw/new` for a session, `/dev/draw/<N>/info` for a window's
@@ -361,10 +363,14 @@ window may have moved since the last `Configure` it read.
 | `2` | **At a point**: on each axis where it would overhang the far edge, flipped to the other side of its anchor (the parent's origin plus the offset), so it opens to the left of or above the point; then moved inward as `1` is. A context menu at the pointer |
 
 - **A popup longer than the work area on an axis takes the area's start** (its left or top), so its
-  first rows are what show, and is clipped. A flip that crosses the other edge is moved inward from
-  that edge, for the same reason.
-- **It is computed once, at creation**, against the work area at that moment, as the offset is
-  resolved once.
+  first rows are what show, and runs past the far edge, over a panel there. A flip that crosses the
+  other edge is moved inward from that edge, for the same reason.
+- **If the panels have reserved the whole screen on an axis**, the work area is empty and lies at
+  the screen's far edge, so the popup is kept inside the screen instead.
+- **It is computed at creation, and again at a commit that changes the popup's size**, from the same
+  anchor, against the work area at that moment: a menu that grows after it opens would otherwise
+  grow past the edge it was kept inside. The client is not told of the move; its first `Configure`
+  gave the origin it was created at.
 - **The client learns where it went from its first `Configure`**, which carries the origin. So the
   disagreement the default avoids is one the client asked for, and is told of.
 - **Any other value is refused** (`InvalidArgument`).
@@ -372,8 +378,10 @@ window may have moved since the last `Configure` it read.
   client's and the compositor's affair, not the manager's.
 
 **This does not keep an application off the bars.** Nothing makes an application ask, so its popup
-can still cover them, `TODO(app-covers-panels)`. The graphical prompt's first step will require `1`
-of every connection but the manager's, through the same placement.
+can still cover them, `TODO(app-covers-panels)`. The graphical prompt's first step will require a
+placement other than `0` of every connection but the manager's, an application's `0` read as `1`
+and its `2` kept, through the same function. A popup longer than the work area would still cover a
+bar, so that step also has to bound one.
 
 An unknown role tag, a panel docked to an edge that does not exist, and a `reserve` above
 the bound are all **rejected** rather than defaulted.

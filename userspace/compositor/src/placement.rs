@@ -25,7 +25,7 @@ fn axis(at: i32, len: u32, start: i32, span: u32, flip: bool) -> i32 {
         from = at - len;
     }
     from = from.min(hi - len).max(lo);
-    i32::try_from(from).unwrap_or(start)
+    i32::try_from(from).expect("between the area's start and the anchor, both `i32`s")
 }
 
 #[cfg(test)]
@@ -99,40 +99,84 @@ mod tests {
 
     #[test]
     fn create_places_a_popup_against_the_stacks_own_work_area() {
-        use crate::WindowStack;
-        use crate::server::{Connection, Outcome, dispatch};
+        use crate::server::{Connection, Outcome, SurfaceError, dispatch};
+        use crate::{StackError, WindowStack};
         use librsproto::surface::{CreateWindowRequest, Edge, OP_CREATE_WINDOW, Role, build_create_window_request};
 
-        fn create(conn: &mut Connection, stack: &mut WindowStack, req: CreateWindowRequest) -> (u32, Point) {
+        fn create(
+            conn: &mut Connection,
+            stack: &mut WindowStack,
+            req: CreateWindowRequest,
+        ) -> Result<(u32, Point), Outcome> {
             let mut body = [0u8; 32];
             let n = build_create_window_request(&mut body, &req).expect("encodes");
             match dispatch(conn, stack, OP_CREATE_WINDOW, &body[..n], &mut [0u8; 32]) {
                 Outcome::Created { configure, .. } => {
                     stack.mark_configured(configure.window);
-                    (configure.window, Point::new(configure.x, configure.y))
+                    Ok((configure.window, Point::new(configure.x, configure.y)))
                 }
-                other => panic!("not created: {other:?}"),
+                other => Err(other),
             }
         }
         let screen = Rect::new(0, 0, 1280, 800);
         for (stack, placed) in [(WindowStack::new().on_screen(screen), true), (WindowStack::new(), false)] {
             let (mut stack, mut conn) = (stack, Connection::new());
             for dock in [Edge::Top, Edge::Bottom] {
-                create(&mut conn, &mut stack, CreateWindowRequest::new(1280, 30, Role::Panel { dock, reserve: 30 }));
+                let bar = CreateWindowRequest::new(1280, 30, Role::Panel { dock, reserve: 30 });
+                create(&mut conn, &mut stack, bar).expect("a bar");
             }
-            let (window, _) = create(&mut conn, &mut stack, CreateWindowRequest::at(600, 700, Role::Normal, 0, 40));
-            let popup = |at: (i32, i32), how| {
-                CreateWindowRequest::at(MENU.0, MENU.1, Role::Popup { parent: window }, at.0, at.1).placed(how)
-            };
-            let landed =
-                |stack: &mut WindowStack, conn: &mut Connection, at, how| create(conn, stack, popup(at, how)).1;
-            let near_corner = (1270, 720);
-            let want = if placed { Point::new(1070, 460) } else { Point::new(1270, 760) };
-            assert_eq!(landed(&mut stack, &mut conn, near_corner, Placement::AtPoint), want, "placed: {placed}");
-            let want = if placed { Point::new(1080, 470) } else { Point::new(1270, 760) };
-            assert_eq!(landed(&mut stack, &mut conn, near_corner, Placement::Inside), want, "placed: {placed}");
-            let asked = landed(&mut stack, &mut conn, near_corner, Placement::AsAsked);
+            let (window, _) = create(&mut conn, &mut stack, CreateWindowRequest::at(600, 700, Role::Normal, 0, 40))
+                .expect("a window");
+            let popup =
+                |how| CreateWindowRequest::at(MENU.0, MENU.1, Role::Popup { parent: window }, 1270, 720).placed(how);
+            for (how, want) in [(Placement::AtPoint, Point::new(1070, 460)), (Placement::Inside, Point::new(1080, 470))]
+            {
+                match create(&mut conn, &mut stack, popup(how)) {
+                    Ok((_, at)) => assert!(placed && at == want, "{how:?} landed at {at:?}, placed: {placed}"),
+                    Err(Outcome::Failed(SurfaceError::Rejected(StackError::NoScreen))) => assert!(!placed),
+                    Err(other) => panic!("{how:?}: {other:?}"),
+                }
+            }
+            let (_, asked) = create(&mut conn, &mut stack, popup(Placement::AsAsked)).expect("as asked");
             assert_eq!(asked, Point::new(1270, 760), "as asked is as asked, with a screen or none");
+        }
+    }
+
+    #[test]
+    fn a_placed_popup_that_grows_is_placed_again_from_its_anchor() {
+        use crate::WindowStack;
+        use librsproto::surface::{
+            AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role, SURFACE_FORMAT_XRGB8888,
+        };
+        for (how, want) in [(Placement::Inside, Point::new(1080, 470)), (Placement::AtPoint, Point::new(1070, 440))] {
+            let mut s = WindowStack::new().on_screen(Rect::new(0, 0, 1280, 800));
+            for dock in [Edge::Top, Edge::Bottom] {
+                s.create(&CreateWindowRequest::new(1280, 30, Role::Panel { dock, reserve: 30 })).expect("a bar");
+            }
+            let parent = s.create(&CreateWindowRequest::at(600, 700, Role::Normal, 0, 40)).expect("a window");
+            let req = CreateWindowRequest::at(10, 10, Role::Popup { parent }, 1270, 700).placed(how);
+            let popup = s.create(&req).expect("a popup");
+            assert_eq!(s.window(popup).map(|w| w.origin), Some(Point::new(1270, 740)), "precondition: it fit");
+            let (width, height, format) = (200, 300, SURFACE_FORMAT_XRGB8888);
+            s.attach(&AttachBufferRequest { window: popup, buffer: 1, width, height, pitch: 800, format })
+                .expect("attaches");
+            let commit = CommitRequest { window: popup, buffer: 1, damage_x: 0, damage_y: 0, damage_w: 0, damage_h: 0 };
+            s.commit(&commit).expect("commits");
+            assert_eq!(s.window(popup).map(|w| w.bounds().origin), Some(want), "{how:?} grew past the edge");
+        }
+    }
+
+    #[test]
+    fn with_no_work_area_left_a_popup_is_kept_on_the_screen() {
+        use crate::WindowStack;
+        use librsproto::surface::{CreateWindowRequest, Edge, Role};
+        let mut s = WindowStack::new().on_screen(Rect::new(0, 0, 1280, 800));
+        s.create(&CreateWindowRequest::new(1280, 30, Role::Panel { dock: Edge::Top, reserve: 65_536 })).expect("bar");
+        let parent = s.create(&CreateWindowRequest::at(600, 600, Role::Normal, 100, 100)).expect("a window");
+        for how in [Placement::Inside, Placement::AtPoint] {
+            let req = CreateWindowRequest::at(MENU.0, MENU.1, Role::Popup { parent }, 10, 10).placed(how);
+            let popup = s.create(&req).expect("a popup");
+            assert_eq!(s.window(popup).map(|w| w.origin), Some(Point::new(110, 110)), "{how:?}");
         }
     }
 }

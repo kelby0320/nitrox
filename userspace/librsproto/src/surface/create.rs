@@ -462,4 +462,25 @@ mod tests {
         b[10..12].copy_from_slice(&3u16.to_le_bytes());
         assert_eq!(parse_create_window_request(&b).map(|r| r.place), Some(Placement::AsAsked));
     }
+
+    /// Against literal bytes: a client that follows the spec rather than this crate sends these.
+    #[test]
+    fn the_placements_wire_values_are_the_specs() {
+        let popup = || CreateWindowRequest::new(80, 60, Role::Popup { parent: 7 });
+        for (word, how) in [(0u16, Placement::AsAsked), (1, Placement::Inside), (2, Placement::AtPoint)] {
+            assert_eq!(encoded(&popup().placed(how))[10..12], word.to_le_bytes(), "{how:?} is written {word}");
+            let mut b = encoded(&popup());
+            b[10..12].copy_from_slice(&word.to_le_bytes());
+            assert_eq!(parse_create_window_request(&b).map(|r| r.place), Some(how), "{word} is read as {how:?}");
+        }
+    }
+
+    #[test]
+    fn a_placed_popups_window_created_carries_no_placement() {
+        let role = Role::Popup { parent: 7 };
+        for how in [Placement::Inside, Placement::AtPoint] {
+            assert_ne!(encoded(&CreateWindowRequest::new(80, 60, role).placed(how))[10..12], [0, 0], "precondition");
+            assert_eq!(super::super::MgrWindowCreated::for_role(3, role, 80, 60).aux16, 0, "{how:?}");
+        }
+    }
 }

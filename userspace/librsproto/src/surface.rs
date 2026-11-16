@@ -21,6 +21,7 @@ pub const OP_RELEASE: u16 = 0x0903;
 /// `DestroyWindow` — drop the window and everything attached to it.
 pub const OP_DESTROY_WINDOW: u16 = 0x0904;
 
+/// Body length of an `AttachBufferRequest`.
 pub const ATTACH_BUFFER_REQUEST_LEN: usize = 24;
 
 /// A parsed `AttachBufferRequest`.
@@ -1570,9 +1571,8 @@ mod tests {
         assert_eq!((back.offset_x, back.offset_y), (77, -88), "a popup's offset survives");
     }
 
-    /// `for_role` puts the role in the same two aux words `CreateWindowRequest` does, for
-    /// **every** role: the two encoders are separate code with the same match arms, and every
-    /// gate creates `Role::Normal`, where all branches agree on `(0, 0)`.
+    /// `for_role` writes the aux words an unplaced `CreateWindowRequest` does, for **every** role; a
+    /// placed popup's aux16 differs by design (`a_placed_popups_window_created_carries_no_placement`).
     #[test]
     fn for_role_encodes_every_role_the_way_a_create_request_does() {
         for role in [

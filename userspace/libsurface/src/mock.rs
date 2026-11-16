@@ -1,4 +1,4 @@
-//! A transport that answers as a compositor with no manager would, for host tests.
+//! A host-test transport: a `Configure` at the size asked and the origin `(0, 0)`, placing nothing.
 
 use alloc::vec::Vec;
 
