@@ -18,6 +18,10 @@ librsproto = { path = "../librsproto" }
 libkern = { path = "../libkern" }
 libos = { path = "../libos" }
 
+# Exports the test transport (`mock`) for other crates' host tests.
+[features]
+mock = []
+
 [lib]
 name = "libsurface"
 path = "src/lib.rs"

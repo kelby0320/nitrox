@@ -9,6 +9,7 @@
 //! `cargo test` the crate compiles as host `std`.
 
 #![cfg_attr(not(test), no_std)]
+#![deny(missing_docs)]
 
 pub mod auth;
 pub mod clipboard;

@@ -200,7 +200,10 @@ In dependency order:
 
 1. **The compositor keeps applications off the panels.**
    - The manager's connection is opened through `manage`.
-   - An application's popup stays inside the work area.
+   - An application's popup stays inside the work area: a placement of `0` read as `1` (inside), and
+     `2` (at a point) kept, so a context menu still flips about the pointer; one longer than the
+     work area bounded to it. The placement itself is built (pre-Phase-7 Part F.2,
+     `compositor::placement::place`), re-placing a popup whose committed size changes.
    - An application's connection may not create a panel.
    - This closes `TODO(app-covers-panels)`, and it can land on its own.
 2. **The compositor's prompt layer.**

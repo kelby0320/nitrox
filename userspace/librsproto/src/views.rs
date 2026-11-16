@@ -80,8 +80,11 @@ pub enum Outcome {
     Started,
     /// The rule wants a password; send one with `OP_VIEWS_PASSWORD`.
     NeedPassword,
-    /// Refused. `retry` is whether another `Password` on the same request will be heard.
-    Denied { retry: bool },
+    /// Refused.
+    Denied {
+        /// Whether another `Password` on the same request will be heard.
+        retry: bool,
+    },
 }
 
 const OUTCOME_STARTED: u8 = 0;

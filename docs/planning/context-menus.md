@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16; F.1 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1 and F.2 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why
@@ -286,6 +286,61 @@ clamped" made "not clamped unless asked"), [`display-substrate.md`](../architect
 §4a, `graphical-prompt.md`, and `deferred-decisions.md`. Every gate, as every window is
 created through `create`. A real menu near the corner is F.4's gate. Author: the wire format.
 
+**Built 2026-11-16** (`e65ee9a0`, after three moves by the implementer):
+- `cbea944f`: the compositor's tests to `tests.rs`, and its cursor, outline and key repeat to
+  `cursor.rs`.
+- `af9a51c0`: the create codec to `surface/create.rs`.
+- `8cb5c54f`: `MockTransport` exported behind libsurface's `mock` feature.
+
+A popup's aux16 is its `Placement`. The compositor's `placement::place` computes in `i64`, and
+`WindowStack::new().on_screen(..)` is set in `main.rs`'s one line, so `dispatch` and `server.rs` are
+untouched.
+
+**Four departures, for the maintainer's eye:**
+- **The compositor's moved tests take a size entry of their own**, at 1,548 lines, as test files
+  already do elsewhere. `lib.rs` drops to 926 lines, and to 941 with the placement, under the limit.
+- **A flip that does not fit is moved inward from the edge it crossed**, so a menu taller than the
+  space above and below the pointer starts at the top bar. That is the plan's "flipped, then moved
+  inward", and it keeps a menu's first rows on screen.
+- **A comment written twice in `WindowStack::new` is written once.**
+- **`input.yml` runs on librsproto's new `surface/` too** (`a79ba503`). The workflow test caught
+  it: a change confined to the create codec would not have run `check-input`.
+
+**Eleven tests:**
+- the neighbours of each edge;
+- flips that fit, and flips that do not;
+- a popup larger than the area, and an empty area;
+- the extremes;
+- placement `0` unchanged;
+- one through `dispatch` with both bars up, with a screen and without, which checks the first
+  `Configure`'s origin;
+- the codec's round trip, its refusal of bytes no encoder writes, and a dialog's aux16 still
+  ignored.
+
+**Five mutations each failed the test meant to catch them:**
+- `create` ignoring the placement;
+- no flip;
+- `i32` arithmetic;
+- a decoder accepting any value;
+- an encoder writing zero.
+
+4,527 host tests pass, and all nineteen gates under KVM: every window is created through `create`.
+
+**After review** (`f523276a`):
+- **A placed popup is placed again when a commit changes its size**, from the anchor it was created
+  at, so a menu that grows after it opens stays inside.
+- **With the work area reserved away, a popup is kept inside the screen** instead of placed below
+  it.
+- **A stack never given its screen refuses a placed popup**, rather than placing it as asked with
+  nothing said.
+- **The wire values are tested against literal bytes**, and so is `WindowCreated`'s zero for a
+  placed popup.
+- **`librsproto` denies `missing_docs`.** Its sweep found three items besides the one the move
+  lost, one of them behind the `io` feature.
+- **The mock's doc says it places nothing.**
+- **The spec and the graphical prompt now read "a placement other than `0`"**, not "`1`", so a
+  context menu keeps its flip; a popup longer than the area still needs bounding there.
+
 ### F.3 A menu's window, once, and a context menu
 
 **`libui::menu::Context` is a context menu's state:**
@@ -339,7 +394,9 @@ sticky and logs as the manager. It is the host's next caller if the host grows t
 **What the tests run on.** `libui` takes `libsurface`, with its `mock` feature (F.2 exports the
 mock), and `libos`, with its `mock` feature, as dev-dependencies: a real `Child` allocates its
 buffers through libos. The failing cases run on `Counting`, the double `window.rs` already has,
-which refuses every request.
+which refuses every request. **The mock places nothing**: its `Configure` carries the origin `(0, 0)`
+whatever was asked, so a test reads a placement from the request the host sent, not from where the
+window says it is.
 
 **Tests:**
 - the host opens a menu when asked, and switches File to Edit by rebuilding the window, since a

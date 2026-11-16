@@ -1876,7 +1876,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     };
     let screen_bounds = screen.geometry().bounds();
     let mut srv = Server {
-        stack: WindowStack::new(),
+        stack: WindowStack::new().on_screen(screen_bounds),
         conns: core::array::from_fn(|_| Connection::new()),
         sessions: [const { None }; MAX_SESSIONS],
         manager: None,
