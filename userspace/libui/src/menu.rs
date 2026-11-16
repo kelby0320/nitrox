@@ -171,12 +171,31 @@ pub struct Menu<Msg> {
 }
 
 /// Which menu is open, where the bar's words are, and which row the keyboard is on.
+///
+/// **A bar menu and a context menu are one state**, so a window shows one at a time: opening
+/// either closes the other.
 #[derive(Clone, Default)]
 pub struct MenuState {
     open: Option<usize>,
     /// Each bar word's rectangle, captured from the layout so a popup knows where to hang.
     anchors: Vec<Option<Rect>>,
     cursor: Option<usize>,
+    /// Where a context menu was asked, window-local.
+    context: Option<(i32, i32)>,
+    /// Bumped by each context menu's opening, so a `Dismissed` closes only the one it names.
+    serial: u32,
+    /// A bar menu a `Dismissed` closed, until every button is up: the press that dismissed it may be
+    /// on its own word, whose release would otherwise open it again.
+    dismissed: Option<usize>,
+}
+
+/// Which menu a window shows: a bar menu by index, or a context menu by its opening's serial.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Shown {
+    /// The bar's menu at this index.
+    Bar(usize),
+    /// A context menu, the serial of its opening.
+    Context(u32),
 }
 
 /// What a keystroke did to an open menu.
@@ -201,7 +220,52 @@ pub enum KeyOutcome {
 impl MenuState {
     /// A closed bar over `count` menus.
     pub fn new(count: usize) -> Self {
-        Self { open: None, anchors: alloc::vec![None; count], cursor: None }
+        Self { anchors: alloc::vec![None; count], ..Self::default() }
+    }
+
+    /// Which menu is shown, if any.
+    pub fn shown(&self) -> Option<Shown> {
+        self.open.map(Shown::Bar).or(self.context.map(|_| Shown::Context(self.serial)))
+    }
+
+    /// The menu shown, and where it hangs: a bar menu under its word, a context menu at its point.
+    pub fn shown_at(&self) -> Option<(Shown, (i32, i32))> {
+        match self.shown()? {
+            Shown::Bar(i) => Some((Shown::Bar(i), self.anchor()?)),
+            shown => Some((shown, self.context?)),
+        }
+    }
+
+    /// Where the context menu shown was asked, window-local.
+    pub fn context(&self) -> Option<(i32, i32)> {
+        self.context
+    }
+
+    /// Open a context menu at `(x, y)`, window-local, closing any bar menu.
+    pub fn open_context(&mut self, x: i32, y: i32) {
+        self.open = None;
+        self.context = Some((x, y));
+        self.serial = self.serial.wrapping_add(1);
+        self.cursor = None;
+        self.dismissed = None;
+    }
+
+    /// A press landed outside the window showing `shown`: close it, if it is still what is shown.
+    ///
+    /// **Either order**: the press that dismissed a context menu may have opened another first.
+    pub fn dismissed(&mut self, shown: Shown) {
+        if self.shown() == Some(shown) {
+            if let Shown::Bar(i) = shown {
+                self.dismissed = Some(i);
+            }
+            self.close();
+        }
+    }
+
+    /// Every pointer button is up, so a gesture that dismissed a menu has ended; the owner calls it
+    /// after routing each of its window's pointer events with no button held.
+    pub fn buttons_up(&mut self) {
+        self.dismissed = None;
     }
 
     /// Which menu is open.
@@ -221,15 +285,21 @@ impl MenuState {
         self.cursor
     }
 
-    /// Toggle menu `i`, which is what a press on the bar means.
+    /// Toggle menu `i`, which is what a press on the bar means; it closes a context menu.
     pub fn toggle(&mut self, i: usize) {
+        // The click that dismissed this menu was on its own word, and this is its release.
+        if self.dismissed.take() == Some(i) {
+            return;
+        }
         self.open = if self.open == Some(i) { None } else { Some(i) };
+        self.context = None;
         self.cursor = None;
     }
 
     /// Close, choosing nothing.
     pub fn close(&mut self) {
         self.open = None;
+        self.context = None;
         self.cursor = None;
     }
 
@@ -290,6 +360,52 @@ impl MenuState {
                 }
             },
             _ => KeyOutcome::Ignored,
+        }
+    }
+}
+
+impl MenuState {
+    /// Drive the menu shown from the keyboard, and return the message a chosen row sends.
+    ///
+    /// `bar` is the bar's table and `context` the context menu's, each as its popup drew them. A
+    /// context menu has no Left or Right: there is only one.
+    pub fn choose<Msg: Clone>(&mut self, ev: &KeyEvent, bar: &[Menu<Msg>], context: Option<&Menu<Msg>>) -> Option<Msg> {
+        use libkern::abi::{KEY_DOWN, KEY_ENTER, KEY_ESC, KEY_UP};
+        let (items, outcome) = match self.shown()? {
+            Shown::Bar(_) => {
+                let outcome = self.key(ev, bar);
+                let menu = match outcome {
+                    KeyOutcome::Chose { menu, .. } => bar.get(menu),
+                    _ => None,
+                };
+                (menu.map_or(&[][..], |m| m.items.as_slice()), outcome)
+            }
+            Shown::Context(_) => {
+                let items = context.map_or(&[][..], |m| m.items.as_slice());
+                let outcome = match (ev.pressed != 0).then_some(ev.keycode) {
+                    Some(KEY_ESC) => KeyOutcome::Dismissed,
+                    Some(KEY_DOWN | KEY_UP) => {
+                        self.cursor = step(items, self.cursor, if ev.keycode == KEY_DOWN { 1 } else { -1 });
+                        KeyOutcome::Changed
+                    }
+                    // Enter with nothing selected closes rather than guessing, as on the bar.
+                    Some(KEY_ENTER) => {
+                        self.cursor.map_or(KeyOutcome::Dismissed, |item| KeyOutcome::Chose { menu: 0, item })
+                    }
+                    _ => KeyOutcome::Ignored,
+                };
+                if matches!(outcome, KeyOutcome::Dismissed | KeyOutcome::Chose { .. }) {
+                    self.close();
+                }
+                (items, outcome)
+            }
+        };
+        match (outcome, items) {
+            (KeyOutcome::Chose { item, .. }, items) => match items.get(item) {
+                Some(Item::Action { msg, enabled: true, .. }) => Some(msg.clone()),
+                _ => None,
+            },
+            _ => None,
         }
     }
 }
@@ -495,6 +611,9 @@ pub const MARK: &str = "\u{2022}";
 
 /// How wide that column is, whether or not a row is marked.
 const MARK_W: u32 = 14;
+
+mod host;
+pub use host::*;
 
 #[cfg(test)]
 mod tests;

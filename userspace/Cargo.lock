@@ -353,6 +353,7 @@ dependencies = [
  "libinput",
  "libkern",
  "libm",
+ "libos",
  "librsproto",
  "libsurface",
 ]

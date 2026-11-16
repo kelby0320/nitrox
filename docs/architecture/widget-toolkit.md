@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`, and 2026-11-16, when pre-Phase-7 Part F.1 made a click the left button's and gave a right press `on_context` and a middle click `on_middle`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`, and 2026-11-16, when pre-Phase-7 Part F.1 made a click the left button's and gave a right press `on_context` and a middle click `on_middle`, and F.3 gave every application one menu window, `menu::Host`, and `MenuState` a context menu), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -566,10 +566,26 @@ the widget set that is a small type system rather than a function:
 | `Accel` | A chord and how it reads — `Ctrl+Shift+T`. **Exact on modifiers**, not a subset test, so `Ctrl+V` and `Ctrl+Shift+V` are different chords |
 | `Item` | An action — label, optional `Accel`, message, `enabled`, and `marked` — or a `Separator`. `marked` draws a bullet in a fixed-width column, so a menu that *sets* something says what it is set to (M14 Part D). Since the desktop refresh's Part C a label may be owned as well as `'static` (a `Cow`), a row may carry a `hint` — dim text in the chord's column that is only read, never matched — and a `swatch`, a small rounded square of colour in the leading column, which widens for the whole menu when any row has one so labels stay in one line. All three are the shell's Places and Applications menus: names from desktop entries, paths beside places |
 | `Menu` | A title and its items |
-| `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key`, and `select_first` — the cursor on the first row Enter can choose, for a menu whose rows change under the keyboard (the Applications menu, narrowing as you type) |
+| `MenuState` | Which menu is open, where each bar word sits, and where the keyboard is inside the open one. `toggle`, `close`, `set_anchors`, `anchor`, `key`, and `select_first` — the cursor on the first row Enter can choose, for a menu whose rows change under the keyboard (the Applications menu, narrowing as you type). **A context menu too** (pre-Phase-7 Part F.3): `open_context` at a window-local point, `context`, and `shown`/`shown_at` naming what is shown as a `Shown`. One state, so a window shows one menu at a time: opening either closes the other. `choose` drives whichever is shown from the keyboard and returns the chosen row's message |
+| `Shown` | `Bar(index)` or `Context(serial)`: each context menu's opening bumps the serial, so `dismissed(shown)` closes only the menu that window was showing |
+| `Host` | **The popup window a menu is shown in**, the one copy every application uses. `sync` opens, switches, redraws or closes it to match `shown_at`, asking the compositor to place a drop-down inside the work area and a context menu at its point (`Child::open_placed`), and reports what it did for the owner's log lines: `Synced`. `event` routes the popup's events: a `Dismissed`, a key, or the messages a pointer chose (`Routed`) |
 | `KeyOutcome::Chose` | **Names the menu as well as the row.** Choosing closes, so a caller that asked `open()` afterwards would get `None` and lose the message |
 | `bar` / `popup` | The two trees: one word per menu, and the open menu's rows. `popup_headed` puts a caller's element above the rows — the Applications menu's filter field — and the caller keys it, since it shares a column with rows that are all keyed |
 | `accel_match` | The message whose item claims a key, from the same table the popup draws |
+
+**A click on an open menu's own word closes it** (pre-Phase-7 Part F.3). The press dismisses the
+menu at the compositor, and the same click's release then reached the word's `on_press`, which
+toggled it open again: a boot showed it every time, the release 20 or 100 ms after the press.
+`dismissed` remembers the bar menu it closed until every button is up, `buttons_up` — which each
+owner calls after routing a pointer event with no button held — and a `toggle` of that menu in the
+meantime is the dismissing click's own release. Either order of the `Dismissed` and the click
+holds: a press elsewhere ends its gesture with its own release, and the pointer's next motion over
+the window clears it after a press on another.
+
+**The three applications' menu windows are one `Host`** (F.3). Each carried 80 to 125 lines that
+opened, switched, closed and routed its drop-down's popup in its main loop. The shell's
+`BarMenus` keeps its own: it keys a filter field, resizes as you type, makes its windows sticky
+and logs as the manager.
 
 **What it replaced.** `menu_bar` and `menu_item` already existed and every application used them;
 what each one had written for itself was the *other* half — open/close state, the anchor capture

@@ -14,7 +14,7 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::{Rect, Size};
 use libdraw::text::Font;
-use librsproto::surface::{CreateWindowRequest, KeyEvent, Role};
+use librsproto::surface::{CreateWindowRequest, KeyEvent, Placement, Role};
 use libsurface::buffers::BufferPool;
 use libsurface::{Session, Transport, WindowEvent};
 
@@ -67,6 +67,21 @@ impl Child {
         theme: &Theme,
         buffers: usize,
     ) -> Option<Self> {
+        Self::open_placed(session, role, at, Placement::AsAsked, content, font, theme, buffers)
+    }
+
+    /// [`open`](Self::open), a popup asking the compositor to place it `how` against the work area.
+    #[allow(clippy::too_many_arguments, reason = "open's inputs, and how the compositor places it")]
+    pub fn open_placed<T: Transport, Msg>(
+        session: &mut Session<T>,
+        role: Role,
+        at: (i32, i32),
+        how: Placement,
+        content: &Element<Msg>,
+        font: &Font,
+        theme: &Theme,
+        buffers: usize,
+    ) -> Option<Self> {
         if !matches!(role, Role::Popup { .. } | Role::Dialog { .. }) {
             return None;
         }
@@ -77,7 +92,8 @@ impl Child {
         if size.w == 0 || size.h == 0 || size.w >= MEASURE_MAX || size.h >= MEASURE_MAX {
             return None;
         }
-        let id = session.create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1), buffers).ok()?;
+        let id =
+            session.create(&CreateWindowRequest::at(size.w, size.h, role, at.0, at.1).placed(how), buffers).ok()?;
         let built = (|| {
             let scratch = compose_buffer(size)?;
             let pool = BufferPool::new(&mut session.window(id)?, size, buffers)?;
@@ -198,6 +214,12 @@ impl Child {
         self.size = size;
         self.tree = Tree::new();
         Some(true)
+    }
+
+    /// The frame last composed, for a test to count its ink.
+    #[cfg(test)]
+    pub(crate) fn frame(&self) -> &[u8] {
+        self.scratch.bytes()
     }
 
     /// The compositor's id for this window — what an event names.

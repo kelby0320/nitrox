@@ -355,3 +355,85 @@ fn select_first_points_at_the_first_choosable_row() {
     s.select_first(&empty);
     assert_eq!(s.cursor(), None);
 }
+
+/// The click on an open menu's own word dismisses it at the press, and its release toggles the
+/// word: it must not open the menu again. A boot showed it did, the release 20 or 100 ms after.
+#[test]
+fn a_click_on_an_open_menus_own_word_closes_it_and_the_next_opens_it() {
+    let mut st = MenuState::new(2);
+    st.toggle(0);
+    st.dismissed(Shown::Bar(0));
+    st.toggle(0);
+    assert_eq!(st.open(), None, "the dismissing click's release opened it again");
+    st.buttons_up();
+    st.toggle(0);
+    assert_eq!(st.open(), Some(0), "a later click opens it");
+
+    // Dismissed by a press elsewhere: its release ends the gesture, and the word works at once.
+    st.dismissed(Shown::Bar(0));
+    st.buttons_up();
+    st.toggle(0);
+    assert_eq!(st.open(), Some(0));
+    // A different word in the same gesture is not held back.
+    st.dismissed(Shown::Bar(0));
+    st.toggle(1);
+    assert_eq!(st.open(), Some(1));
+}
+
+#[test]
+fn a_context_menus_keyboard_skips_rules_and_greyed_rows_and_has_no_left_or_right() {
+    let menu = Menu {
+        title: "",
+        items: alloc::vec![
+            Item::plain("Open", 1u32),
+            Item::Separator,
+            Item::plain("Cut", 2).enabled(false),
+            Item::plain("Rename", 3),
+        ],
+    };
+    let open = || {
+        let mut st = MenuState::new(0);
+        st.open_context(5, 5);
+        st
+    };
+    let mut st = open();
+    let keys = |st: &mut MenuState, codes: &[u16]| codes.iter().map(|&c| st.choose(&ev(c, 0), &[], Some(&menu))).last();
+    assert_eq!(keys(&mut st, &[KEY_DOWN, KEY_DOWN]), Some(None));
+    assert_eq!(st.cursor(), Some(3), "Down skipped the rule and the greyed row");
+    assert_eq!(keys(&mut st, &[KEY_UP]), Some(None));
+    assert_eq!(st.cursor(), Some(0), "and Up skipped them back");
+    assert_eq!(keys(&mut st, &[KEY_LEFT, KEY_RIGHT]), Some(None));
+    assert_eq!((st.context(), st.cursor()), (Some((5, 5)), Some(0)), "Left and Right did nothing");
+    assert_eq!(keys(&mut st, &[KEY_UP, KEY_ENTER]), Some(Some(3)), "Up wrapped to Rename, and Enter chose it");
+    assert_eq!(st.shown(), None, "choosing closed it");
+
+    let mut st = open();
+    assert_eq!(keys(&mut st, &[KEY_ENTER]), Some(None), "Enter with no row chooses nothing");
+    assert_eq!(st.shown(), None, "and closes");
+    let mut st = open();
+    assert_eq!(keys(&mut st, &[KEY_ESC]), Some(None));
+    assert_eq!(st.shown(), None, "Esc closes");
+}
+
+#[test]
+fn choose_on_the_bar_returns_the_row_the_table_holds() {
+    let menus = alloc::vec![Menu { title: "File", items: alloc::vec![Item::plain("New", 7u32)] }];
+    let mut st = MenuState::new(1);
+    st.toggle(0);
+    assert_eq!(st.choose(&ev(KEY_DOWN, 0), &menus, None), None);
+    assert_eq!(st.choose(&ev(KEY_ENTER, 0), &menus, None), Some(7));
+    assert_eq!(st.shown(), None);
+}
+
+#[test]
+fn a_shown_menu_hangs_under_its_word_or_at_its_point() {
+    let mut st = MenuState::new(1);
+    st.set_anchors(alloc::vec![Some(Rect::new(8, 0, 30, 20))]);
+    st.toggle(0);
+    assert_eq!(st.shown_at(), Some((Shown::Bar(0), (8, 20))));
+    st.open_context(40, 50);
+    let Some((Shown::Context(n), at)) = st.shown_at() else { panic!("no context menu") };
+    assert_eq!(at, (40, 50));
+    st.open_context(41, 51);
+    assert_eq!(st.shown(), Some(Shown::Context(n.wrapping_add(1))), "each opening is a new serial");
+}

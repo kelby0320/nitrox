@@ -29,7 +29,7 @@ use libui::chooser::{self, ChooserState};
 use libui::element::{
     Edge, Element, Insets, center_v, column, dock, docked, fill, mono, padding, row, sized, stack, text, with_spacing,
 };
-use libui::menu::{Accel, Item, Menu, MenuState};
+use libui::menu::{Accel, Item, Menu, MenuState, Shown};
 use libui::widget::{
     InkRun, PILL_H, STATUS_GAP, TAB_STRIP_H, TITLE_BAR_H, TabExtras, TextAreaState, TextFieldState, Theme as UiTheme,
     TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame, pill, resize_grip, scrollbar, status_bar,
@@ -1331,9 +1331,9 @@ impl App {
     }
 
     /// The open menu's popup, framed — the root of a second window, not a layer in this one.
-    pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+    pub fn menu_view(&self, shown: Shown, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let menus = self.menu_table();
-        match menus.get(which) {
+        match if let Shown::Bar(i) = shown { menus.get(i) } else { None } {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
         }

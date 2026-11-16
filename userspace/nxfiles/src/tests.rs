@@ -387,7 +387,7 @@ fn the_drop_target_follows_the_pointer_and_only_over_a_folder() {
 fn the_menus_hold_what_they_say() {
     let mut a = app();
     a.update(Msg::MenuBar(0));
-    let file: Element<Msg> = a.menu_view(0, &UiTheme::default(), None);
+    let file: Element<Msg> = a.menu_view(Shown::Bar(0), &UiTheme::default(), None);
     for (i, item) in [
         (0, "New TabCtrl+T"),
         (1, "Close TabCtrl+W"),
@@ -406,7 +406,7 @@ fn the_menus_hold_what_they_say() {
     }
 
     a.update(Msg::MenuBar(1));
-    let edit: Element<Msg> = a.menu_view(1, &UiTheme::default(), None);
+    let edit: Element<Msg> = a.menu_view(Shown::Bar(1), &UiTheme::default(), None);
     for (i, item) in [(0, "CutCtrl+X"), (1, "CopyCtrl+C"), (2, "PasteCtrl+V"), (4, "Duplicate\u{2026}")] {
         assert_eq!(labelled(&edit, MENU_ROW_KEY + i), item, "the Edit menu's row {i}");
     }
