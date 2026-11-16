@@ -68,6 +68,7 @@ on:
       # finding 5). Coverage held by luck: `check-terminal` is unconditional in `ci.yml` and
       # drives the same path.
       - 'userspace/librsproto/src/surface.rs'
+      - 'userspace/librsproto/src/surface/**'
       - 'userspace/libsurface/**'
       - 'userspace/compositor/**'
       - 'tools/xtask/src/**'
