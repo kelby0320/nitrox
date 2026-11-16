@@ -38436,3 +38436,26 @@ Part F's detail pass merged, #445. F.1, `context-menus.md` § F.1, built on
 - Departures, for the maintainer's eye: `panel.rs`'s tests moved too, as the file was at its entry;
   `nxterm`'s two tests that pressed button 0 press the left; a middle click elsewhere on the bottom
   bar sends nothing, where the shell dropped it with an arm of its own.
+
+## 2026-11-16 — Before Phase 7, F.2: the compositor places a popup that asks
+
+F.1 merged, #446. F.2, `context-menus.md` § F.2, built on `pre-phase-7/part-f2-placement`.
+
+- **A popup's role aux16 word is its placement** (`e65ee9a0`), the word the spec had kept as room
+  for a future field. `0` is as asked, as every popup until now. `1` is moved inward the least it
+  takes to lie inside the work area. `2` is flipped about its anchor on each axis it would overhang,
+  then moved inward. An unknown value is refused. A dialog's aux16 stays ignored, and the manager's
+  `WindowCreated` carries a popup's as zero.
+- **A popup longer than the area takes its start**, and a flip that crosses the other edge is moved
+  inward from that edge, so a menu's first rows show.
+- **The compositor computes it once, at creation**, in `i64`: the anchor is a client's saturated
+  offset and the size any `u32`. The stack learns its screen once, through
+  `WindowStack::new().on_screen(..)`, so `dispatch` keeps its signature; a stack with no screen
+  places as asked.
+- **Asking is optional**, so nothing yet keeps an application's popup off the bars: the graphical
+  prompt's first step will require it, through the same function.
+- Three moves came first, by the implementer: the compositor's tests and cursor code, librsproto's
+  create codec, and libsurface's test transport, exported behind a `mock` feature for F.3.
+- Departures, for the maintainer's eye: the compositor's moved tests take a size entry of their
+  own; a comment written twice is written once; `input.yml` runs on the codec's new directory, which
+  the workflow test caught.
