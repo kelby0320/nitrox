@@ -759,17 +759,6 @@ fn route_one_batch(
                     damage.push(r);
                 }
             }
-            // A press landed outside a popup, so its owner is told. Reported, not acted on:
-            // whether a dismissal ends what it offered is the client's to decide.
-            if let Some(window) = routed.dismissed
-                && let Some(slot) = srv.session_of(window)
-            {
-                // `log_route` and `enqueue`, as at every site here, or no gate can see it
-                // (`check-login`).
-                let rec = Outbound::Dismissed { window };
-                log_route(&rec);
-                enqueue(srv, slot, rec);
-            }
             // One event for the gesture, at the release; the manager answers with a
             // `Configure`, so a window's geometry has one path.
             if let Some(e) = routed.ended {

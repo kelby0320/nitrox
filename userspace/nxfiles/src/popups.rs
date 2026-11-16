@@ -8,9 +8,9 @@ impl App {
     /// `hovered` comes from the popup's own router, a different tree from this window's. Which menu
     /// is a parameter, not read from state: `Msg::Choose` clears `self.menu` before the window
     /// closes, so a later event from an *Edit* popup would route against the File tree.
-    pub fn menu_view(&self, which: usize, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+    pub fn menu_view(&self, shown: Shown, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let menus = self.menu_table();
-        match menus.get(which) {
+        match if let Shown::Bar(i) = shown { menus.get(i) } else { None } {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             // Not reachable while a popup exists, but the type demands an answer.
             None => popup_frame(padding(Insets::all(2), libui::element::text("")), ui),

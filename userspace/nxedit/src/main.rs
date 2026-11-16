@@ -27,7 +27,7 @@ use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libui::layout::{Metrics as _, layout};
 use libui::paint::{FontMetrics, Theme};
 
-use libui::menu::{Item, KeyOutcome};
+use libui::menu::{Host, Routed};
 use libui::window::Child;
 use nxedit::{App, Msg, to_bytes};
 
@@ -231,9 +231,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // hidden one would still be a window in the stack.
     let confirm: Option<Child> = None;
     // The menu's window likewise; it holds the keyboard while it is up.
-    let menu: Option<Child> = None;
-    let menu_shown: Option<usize> = None;
-    let menu_hovered: Option<u64> = None;
+    let menu = Host::new(BUFFERS);
     let confirm_hovered: Option<u64> = None;
     let reported = app.revision();
     let reported_name = app.naming_len();
@@ -251,9 +249,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         confirm_hovered: Option<u64>,
         chooser: Option<Child>,
         chooser_hovered: Option<u64>,
-        menu: Option<Child>,
-        menu_shown: Option<usize>,
-        menu_hovered: Option<u64>,
+        menu: Host,
         reported: u64,
         reported_name: Option<usize>,
         reported_title: String,
@@ -283,9 +279,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             confirm_hovered: None,
             chooser: None,
             chooser_hovered: None,
-            menu: None,
-            menu_shown: None,
-            menu_hovered: None,
+            menu: Host::new(BUFFERS),
             reported,
             reported_name,
             reported_title,
@@ -304,8 +298,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         chooser: None,
         chooser_hovered: None,
         menu,
-        menu_shown,
-        menu_hovered,
         reported,
         reported_name,
         reported_title,
@@ -326,8 +318,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 chooser,
                 chooser_hovered,
                 menu,
-                menu_shown,
-                menu_hovered,
                 reported,
                 reported_name,
                 reported_title,
@@ -390,45 +380,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 l.end();
             }
 
-            if *menu_shown != app.menus.open() {
-                if let Some(m) = menu.take() {
-                    m.close(&mut win);
-                }
-                *menu_hovered = None;
-                *menu_shown = app.menus.open();
-                if let Some(which) = menu_shown {
-                    match app.menus.anchor() {
-                        Some(at) => {
-                            let view = app.menu_view(*which, &theme, None);
-                            *menu = Child::open(
-                                &mut win,
-                                Role::Popup { parent: window_id },
-                                at,
-                                &view,
-                                &font,
-                                &theme,
-                                BUFFERS,
-                            );
-                        }
-                        // No anchor means no layout yet; an unplaced menu beats one at 0,0.
-                        None => *menu = None,
-                    }
-                    if menu.is_none() {
-                        log::write(b"nxedit: could not open the menu\n");
-                        app.menus.close();
-                        *menu_shown = None;
-                    }
-                }
+            let view = |shown, h| app.menu_view(shown, &theme, h);
+            let synced = menu.sync(&mut win, window_id, app.menus.shown_at(), view, &font, &theme);
+            if synced.failed {
+                log::write(b"nxedit: could not open the menu\n");
+                app.menus.close();
             }
-            if let Some(m) = menu.as_mut() {
-                let now = m.hovered_key();
-                *menu_hovered = now;
-                if let Some(which) = menu_shown {
-                    let view = app.menu_view(*which, &theme, now);
-                    if !m.present(&mut win, &view, &font, &theme) {
-                        log::write(b"nxedit: the menu could not be drawn\n");
-                    }
-                }
+            if synced.undrawn {
+                log::write(b"nxedit: the menu could not be drawn\n");
             }
 
             // The application names the directory and this lists it: `libui::chooser` cannot
@@ -705,10 +664,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let mut i = 0;
         while i < wins.len() {
             if wins[i].app.closing() {
-                let w = wins.remove(i);
-                if let Some(m) = w.menu {
-                    m.close(&mut win);
-                }
+                let mut w = wins.remove(i);
+                w.menu.close(&mut win);
                 if let Some(c) = w.confirm {
                     c.close(&mut win);
                 }
@@ -746,61 +703,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // A record naming no window is dropped, not routed into the first.
             let Some(wi) = wins.iter().position(|w| {
                 w.top.id() == from
-                    || w.menu.as_ref().is_some_and(|m| m.id() == from)
+                    || w.menu.owns(from)
                     || w.confirm.as_ref().is_some_and(|c| c.id() == from)
                     || w.chooser.as_ref().is_some_and(|c| c.id() == from)
             }) else {
                 continue;
             };
-            let Win {
-                top,
-                app,
-                size,
-                bounds,
-                confirm,
-                confirm_hovered,
-                chooser,
-                chooser_hovered,
-                menu,
-                menu_shown,
-                menu_hovered,
-                ..
-            } = &mut wins[wi];
+            let Win { top, app, size, bounds, confirm, confirm_hovered, chooser, chooser_hovered, menu, .. } =
+                &mut wins[wi];
             let window_id = top.id();
             let ui = app.view(&theme, top.hovered_key());
             let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
             let mut resized = false;
-            if menu.as_ref().is_some_and(|m| m.id() == from) {
-                if matches!(event, WindowEvent::Dismissed) {
-                    app.menus.close();
-                    continue;
-                }
-                // The popup holds the keyboard, so its keys never reach the editor's router.
-                if let WindowEvent::Key(k) = event {
-                    let table = app.menu_table();
-                    match app.menus.key(&k, &table) {
-                        KeyOutcome::Chose { menu, item: i } => {
-                            if let Some(msg) = table.get(menu).and_then(|m| m.items.get(i)).and_then(|it| match it {
-                                Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
-                                _ => None,
-                            }) {
-                                app.update(msg);
-                            }
-                            continue;
+            if menu.owns(from) {
+                match menu.event(&event, |shown, h| app.menu_view(shown, &theme, h), &font, &theme) {
+                    Routed::Dismissed(shown) => app.menus.dismissed(shown),
+                    // The popup holds the keyboard, so its keys never reach the editor's router.
+                    Routed::Key(k) => {
+                        let table = app.menu_table();
+                        if let Some(msg) = app.menus.choose(&k, &table, None) {
+                            app.update(msg);
                         }
-                        KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
-                        KeyOutcome::Ignored => {}
                     }
-                }
-                let msgs = match (*menu_shown, menu.as_mut()) {
-                    (Some(which), Some(m)) => {
-                        let view = app.menu_view(which, &theme, *menu_hovered);
-                        m.route(&view, &font, &theme, &event)
+                    Routed::Msgs(msgs) => {
+                        for msg in msgs {
+                            app.update(msg);
+                        }
                     }
-                    _ => Vec::new(),
-                };
-                for msg in msgs {
-                    app.update(msg);
                 }
                 continue;
             }
@@ -898,6 +827,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
+                    // What is held, so a dismissal holds back only its own click's release.
+                    app.menus.buttons(p.buttons);
                     // Measuring is the binary's: it needs the font the area was drawn with, the
                     // fixed-advance one, or the caret lands off by more the further in.
                     let m = FontMetrics::new(&font, theme.font_px);

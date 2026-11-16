@@ -24,7 +24,7 @@ use librsproto::surface::{
 use libui::element::{
     Edge, Element, Insets, center_v, column, dock, docked, ink, padding, row, sized, text, with_spacing,
 };
-use libui::menu::{Accel, Item, Menu, MenuState};
+use libui::menu::{Accel, Item, Menu, MenuState, Shown};
 use libui::widget::{
     ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, RowButton, STATUS_BAR_H, Swatch, TAB_STRIP_H, TITLE_BAR_H,
     TabExtras, TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame,

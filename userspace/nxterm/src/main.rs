@@ -29,7 +29,7 @@ use libui::layout::layout;
 use libui::paint::FontMetrics;
 use libui::paint::Theme;
 
-use libui::menu::{Item, KeyOutcome, Menu};
+use libui::menu::{Host, Routed};
 use libui::window::Child;
 use nxterm::{App, GRID_KEY, GRID_KIND, Msg, rows_in};
 
@@ -50,16 +50,6 @@ fn fail(msg: &[u8]) -> ! {
     // Under the test-harness kernel this terminates QEMU; elsewhere it returns.
     libos::system::test_verdict(false);
     libos::exit(1);
-}
-
-/// The message on row `i` of menu `open`, if that row is an enabled action.
-///
-/// Read from `App::menu_table`, as a click's message is, so Enter and a click cannot disagree.
-fn chosen(table: &[Menu<Msg>], open: Option<usize>, i: usize) -> Option<Msg> {
-    match table.get(open?)?.items.get(i)? {
-        Item::Action { msg, enabled: true, .. } => Some(*msg),
-        _ => None,
-    }
 }
 
 /// Say which item a menu produced, under the harness; `check-terminal` matches `menu chose`.
@@ -235,16 +225,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     dress(&mut win, top.id());
 
     let bounds = Rect::new(0, 0, size.w, size.h);
-    // The menu's window is a `popup`, not a layer: `libui`'s `offset` clips at its parent's edge,
-    // and a menu clipped to its window is not a menu. Only the screen clips it; it is destroyed,
-    // not hidden, on close.
-    let popup: Option<Child> = None;
-    // The item the pointer was over at the last paint of the menu, kept only so a change can be
-    // reported: the view reads `Child::hovered_key`.
-    let menu_hovered: Option<u64> = None;
-    // The menu the live popup was opened for, so switching menus rebuilds the window at the new
-    // word and size.
-    let menu_shown: Option<usize> = None;
+    // The menu's window is a `popup`, not a layer: a menu clipped to its window is not a menu.
+    let menu = Host::new(BUFFERS);
 
     /// Everything one window of this terminal is: its own tabs (so ttys and shells), surface and
     /// menu popup. The `Session`, fonts and theme are shared.
@@ -253,9 +235,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         app: App,
         backends: alloc::vec::Vec<TabBackend>,
         bounds: Rect,
-        popup: Option<Child>,
-        menu_shown: Option<usize>,
-        menu_hovered: Option<u64>,
+        menu: Host,
     }
 
     /// Open a window of this terminal, dressed and with a shell in its first tab.
@@ -273,15 +253,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         dress(win, top.id());
         let mut backends = alloc::vec::Vec::new();
         reconcile_backends(&mut app, &mut backends, root, env);
-        Some(Win {
-            top,
-            app,
-            backends,
-            bounds: Rect::new(0, 0, size.w, size.h),
-            popup: None,
-            menu_shown: None,
-            menu_hovered: None,
-        })
+        Some(Win { top, app, backends, bounds: Rect::new(0, 0, size.w, size.h), menu: Host::new(BUFFERS) })
     }
 
     let mut quit_pending = false;
@@ -324,11 +296,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     let mut backends: alloc::vec::Vec<TabBackend> = alloc::vec::Vec::new();
     reconcile_backends(&mut app, &mut backends, root, &env);
-    let mut wins = alloc::vec![Win { top, app, backends, bounds, popup, menu_shown, menu_hovered }];
+    let mut wins = alloc::vec![Win { top, app, backends, bounds, menu }];
 
     loop {
         for entry in wins.iter_mut() {
-            let Win { top, app, backends, bounds, popup, menu_shown, menu_hovered } = entry;
+            let Win { top, app, backends, bounds, menu } = entry;
             let window_id = top.id();
             let ui = app.view(&theme, top.hovered_key());
             let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
@@ -337,90 +309,33 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             app.place_menus(&ui, &l);
 
             // Opened and destroyed with the menu, since a `popup` takes the keyboard while up.
-            // Keyed on which menu, not whether one is open: switching File to Edit must rebuild the
-            // window, as `Child::present` lays into a rectangle fixed at open and the new menu's
-            // extra rows would be clipped.
-            if *menu_shown != app.menus.open() {
-                if let Some(p) = popup.take() {
-                    p.close(&mut win);
-                }
-                // Nothing is under the pointer in a destroyed window; left set, the next menu would
-                // report no change.
-                *menu_hovered = None;
-                *menu_shown = app.menus.open();
+            let view = |shown, h| app.menu_view(shown, &theme, h);
+            let synced = menu.sync(&mut win, window_id, app.menus.shown_at(), view, &ui_font, &theme);
+            if synced.failed {
+                // Not fatal: the terminal is usable without its menu.
+                log::write(b"nxterm: could not open the menu popup\n");
+                app.menus.close();
             }
-            match (menu_shown.is_some(), popup.is_some(), app.menus.anchor()) {
-                (true, false, Some(anchor)) => {
-                    // Measured with no hover: the pointer is over the bar item, and a highlight
-                    // does not change a menu's size.
-                    let menu = app.menu_view(&theme, None);
-                    *popup = Child::open(
-                        &mut win,
-                        Role::Popup { parent: window_id },
-                        anchor,
-                        &menu,
-                        &ui_font,
-                        &theme,
-                        BUFFERS,
-                    );
-                    // The gate reads the serial log, and this says the menu became a window
-                    // (`check-terminal` matches `menu popup`); the origin is in screen coordinates,
-                    // for aiming a click.
-                    #[cfg(feature = "test-harness")]
-                    if let Some(p) = popup.as_ref() {
-                        let o = win.window(p.id()).and_then(|w| w.configured()).map_or((0, 0), |c| (c.x, c.y));
-                        Line::new()
-                            .s(b"nxterm: menu popup ")
-                            .u(p.id() as u64)
-                            .s(b" at ")
-                            .i(o.0 as i64)
-                            .s(b",")
-                            .i(o.1 as i64)
-                            .s(b" ")
-                            .u(p.size().w as u64)
-                            .s(b"x")
-                            .u(p.size().h as u64)
-                            .end();
-                    }
-                    if popup.is_none() {
-                        // Not fatal: the terminal is usable without its menu.
-                        log::write(b"nxterm: could not open the menu popup\n");
-                        app.menus.close();
-                        *menu_shown = None;
-                    }
-                }
-                (false, true, _) => {
-                    if let Some(p) = popup.take() {
-                        p.close(&mut win);
-                    }
-                    *menu_hovered = None;
-                }
-                _ => {}
+            if synced.undrawn {
+                log::write(b"nxterm: the menu popup could not be drawn\n");
             }
-            if let Some(p) = popup.as_mut() {
-                let now = p.hovered_key();
-                if now != *menu_hovered {
-                    *menu_hovered = now;
-                    // The item's key is a number this program chose, never typed text;
-                    // `check-terminal` matches `menu hover`.
-                    #[cfg(feature = "test-harness")]
-                    {
-                        let mut l = Line::new();
-                        l.s(b"nxterm: menu hover ");
-                        match now {
-                            Some(k) => {
-                                l.u(k);
-                            }
-                            None => {
-                                l.s(b"none");
-                            }
-                        }
-                        l.end();
-                    }
+            // The gate reads the serial log: the menu became a window, at a screen origin to aim a
+            // click at (`menu popup`), and the row under the pointer, a key this program chose.
+            #[cfg(feature = "test-harness")]
+            {
+                if let Some((id, (x, y), size)) = synced.opened {
+                    let mut l = Line::new();
+                    l.s(b"nxterm: menu popup ").u(id as u64).s(b" at ").i(x as i64).s(b",").i(y as i64);
+                    l.s(b" ").u(size.w as u64).s(b"x").u(size.h as u64).end();
                 }
-                let menu = app.menu_view(&theme, now);
-                if !p.present(&mut win, &menu, &ui_font, &theme) {
-                    log::write(b"nxterm: the menu popup could not be drawn\n");
+                if let Some(now) = synced.hover {
+                    let mut l = Line::new();
+                    l.s(b"nxterm: menu hover ");
+                    match now {
+                        Some(k) => l.u(k),
+                        None => l.s(b"none"),
+                    };
+                    l.end();
                 }
             }
 
@@ -632,10 +547,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let mut i = 0;
         while i < wins.len() {
             if wins[i].app.closing() {
-                let w = wins.remove(i);
-                if let Some(p) = w.popup {
-                    p.close(&mut win);
-                }
+                let mut w = wins.remove(i);
+                w.menu.close(&mut win);
                 // The backends go with the window; their `Drop` closes each channel, which ends
                 // every shell on them.
                 w.top.close(&mut win);
@@ -688,15 +601,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
         for (from, event) in events {
             // A record naming none of the windows is dropped, not routed to the first.
-            let Some(wi) =
-                wins.iter().position(|w| w.top.id() == from || w.popup.as_ref().is_some_and(|p| p.id() == from))
-            else {
+            let Some(wi) = wins.iter().position(|w| w.top.id() == from || w.menu.owns(from)) else {
                 continue;
             };
             // A process's tabs, not a window's: each is a handle in the one `sys_wait`.
             let open: usize = wins.iter().map(|w| w.app.tabs().len()).sum();
             let elsewhere = open - wins[wi].app.tabs().len();
-            let Win { top, app, backends: _, bounds, popup, menu_shown: _, menu_hovered: _ } = &mut wins[wi];
+            let Win { top, app, backends: _, bounds, menu } = &mut wins[wi];
             app.set_tabs_elsewhere(elsewhere);
             let window_id = top.id();
             // Rebuilt for this window, as routing is against its tree. No layout here:
@@ -707,38 +618,25 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let mut resized = false;
             // The menu's window routes through the menu's tree; a stale record for a just-destroyed
             // popup is dropped, not routed into the terminal.
-            if popup.as_ref().is_some_and(|p| p.id() == from) {
-                // A press outside the menu dismisses it; only the compositor knows. Answered here,
-                // not in `Child::route`, as what a dismissal means is the caller's.
-                if matches!(event, WindowEvent::Dismissed) {
-                    app.menus.close();
-                    continue;
-                }
-                // Arrows, Esc and Enter drive the open menu: the popup holds the keyboard, so these
-                // never reach the terminal's router.
-                if let WindowEvent::Key(k) = event {
-                    let table = app.menu_table();
-                    match app.menus.key(&k, &table) {
-                        KeyOutcome::Chose { menu, item } => {
-                            // The menu comes from the outcome, not the state: choosing closes, so
-                            // `open()` is already `None`.
-                            if let Some(m) = chosen(&table, Some(menu), item) {
-                                chose(m);
-                                app.update(m);
-                            }
-                            continue;
+            if menu.owns(from) {
+                match menu.event(&event, |shown, h| app.menu_view(shown, &theme, h), &ui_font, &theme) {
+                    Routed::Dismissed(shown) => app.menus.dismissed(shown),
+                    // The popup holds the keyboard: arrows, Esc and Enter drive the menu, and none
+                    // reaches the grid.
+                    Routed::Key(k) => {
+                        let table = app.menu_table();
+                        if let Some(m) = app.menus.choose(&k, &table, None) {
+                            chose(m);
+                            app.update(m);
                         }
-                        // Neither reaches the grid.
-                        KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
-                        KeyOutcome::Ignored => {}
                     }
-                }
-                let menu = app.menu_view(&theme, popup.as_ref().and_then(|p| p.hovered_key()));
-                let msgs = popup.as_mut().map(|p| p.route(&menu, &ui_font, &theme, &event)).unwrap_or_default();
-                for msg in msgs {
-                    chose(msg);
-                    // The menu closes itself: `App::update` asks the table.
-                    app.update(msg);
+                    Routed::Msgs(msgs) => {
+                        for msg in msgs {
+                            chose(msg);
+                            // The menu closes itself: `App::update` asks the table.
+                            app.update(msg);
+                        }
+                    }
                 }
                 continue;
             }
@@ -784,6 +682,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
+                    // What is held, so a dismissal holds back only its own click's release.
+                    app.menus.buttons(p.buttons);
                 }
                 WindowEvent::Focus(f) => {
                     // Reported under the harness (`check-terminal` waits on `focus=1`): keys go to

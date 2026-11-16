@@ -38459,3 +38459,28 @@ F.1 merged, #446. F.2, `context-menus.md` § F.2, built on `pre-phase-7/part-f2-
 - Departures, for the maintainer's eye: the compositor's moved tests take a size entry of their
   own; a comment written twice is written once; `input.yml` runs on the codec's new directory, which
   the workflow test caught.
+
+## 2026-11-16 — Before Phase 7, F.3: one menu window, and a context menu's state
+
+F.2 merged, #447. F.3, `context-menus.md` § F.3, built on `pre-phase-7/part-f3-menu-host`.
+
+- **`libui::menu::Host` is every application's menu window** (`f638f3c9`). `sync` opens,
+  switches, redraws or closes the popup to match what is shown, asking the compositor to place a
+  drop-down inside the work area and a context menu at its point. `event` routes the popup's
+  events. nxterm's, nxedit's and nxfiles' main loops lose 98, 67 and 78 lines; the shell's
+  `BarMenus` keeps its own, for its filter field and its resizing.
+- **`MenuState` holds a context menu beside the bar's**, one state so a window shows one menu at a
+  time. A serial per opening makes a `Dismissed` close only the menu its window showed, whichever
+  order it and the press arrive in. `choose` is the keyboard for whichever is shown. The plan drew
+  a `Context` type of its own; one state makes "one at a time" the type's rather than every
+  caller's.
+- **A click on an open menu's own word closes it.** A boot on the release image showed it opened
+  again every time: the press dismissed the menu, and the same click's release toggled it. The state
+  remembers the bar menu a `Dismissed` closed until every button is up, and `check-login` now clicks
+  the open File menu's word; with the fix removed, it fails.
+- Departures, for the maintainer's eye: the context state is `MenuState`'s; a drop-down whose word
+  is not laid out yet waits a frame, where nxedit closed the menu.
+- After review, **the compositor sends a `Dismissed` after the press that caused it**, and the
+  state latches a dismissed bar menu only while a button is down, as each loop now reports what its
+  window's pointer holds (`buttons`). A dismissal read after its release had held back the next
+  click on the word. A bar menu reached by the keyboard gives way to a press outside.

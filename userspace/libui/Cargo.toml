@@ -34,3 +34,9 @@ libm = { version = "0.2", default-features = false }
 [lib]
 name = "libui"
 path = "src/lib.rs"
+
+[dev-dependencies]
+# `menu::Host`'s tests open real `Child` windows on libsurface's test transport, whose buffers
+# libos's model of the kernel allocates.
+libsurface = { path = "../libsurface", features = ["mock"] }
+libos = { path = "../libos", features = ["mock"] }

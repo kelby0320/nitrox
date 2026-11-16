@@ -260,6 +260,21 @@ pub(crate) fn login_buffers_and_clipboard(qmp: &mut Qmp, session: &mut Session, 
     // gesture to a repaint between press and release.
     click_at(qmp, session, file_menu.0, file_menu.1)?;
     session.expect("nxfiles: menu popup ")?;
+    // **A click on the open menu's own word closes it.** The press dismisses it at the compositor,
+    // and that click's release once opened it again, held 20 ms or 100.
+    move_pointer_to(qmp, file_menu.0, file_menu.1)?;
+    qmp.send_button("left", true)?;
+    qmp.flush()?;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    qmp.send_button("left", false)?;
+    qmp.flush()?;
+    session.expect("compositor: dismissed win=")?;
+    if session.expect_within("nxfiles: menu popup ", std::time::Duration::from_secs(2))? {
+        return Err("a click on the open File menu's own word opened it again".into());
+    }
+    println!("  ok: a click on the open menu's own word closed it");
+    click_at(qmp, session, file_menu.0, file_menu.1)?;
+    session.expect("nxfiles: menu popup ")?;
     let popup = session.rest_of_line()?;
     let (_, px, py, _pw, ph) =
         parse_menu_popup(&popup).ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;

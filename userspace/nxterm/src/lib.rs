@@ -24,7 +24,7 @@ use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
 use libui::element::{Edge, Element, Insets, custom, dock, docked, padding, sized};
-use libui::menu::{Accel, Item, Menu, MenuState};
+use libui::menu::{Accel, Item, Menu, MenuState, Shown};
 use libui::widget::{
     GRIP_W, TITLE_BAR_H, TitleButtons, WINDOW_CONTENT_X, WINDOW_CONTENT_Y, resize_grip, title_bar,
     window_frame_with_grip,
@@ -956,15 +956,10 @@ impl App {
         body
     }
 
-    /// The menu popup's own element tree — the root of a second window, not a layer in this one.
-    pub fn menu_view(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        self.menu(ui, hovered)
-    }
-
-    /// The popup's contents: whichever menu is open, framed.
-    fn menu(&self, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
+    /// The popup of the menu `shown` — the root of a second window, not a layer in this one.
+    pub fn menu_view(&self, shown: Shown, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
         let menus = self.menu_table();
-        match self.menus.open().and_then(|i| menus.get(i)) {
+        match if let Shown::Bar(i) = shown { menus.get(i) } else { None } {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
         }
@@ -1480,7 +1475,7 @@ mod tests {
 
         let measure = |a: &App| {
             libui::layout::measure(
-                &a.menu_view(&UiTheme::default(), None),
+                &a.menu_view(a.menus.shown().expect("a menu is open"), &UiTheme::default(), None),
                 libui::layout::Constraints::loose(bounds.size),
                 &cell,
             )
@@ -1705,7 +1700,7 @@ mod tests {
         assert!(item.origin.y >= bar_top, "the item is below the title bar");
         assert!(item.bottom() <= (bar_top as u32 + BAR_H) as i64, "the item is inside the menu bar");
 
-        let menu = a.menu_view(&UiTheme::default(), None);
+        let menu = a.menu_view(Shown::Bar(0), &UiTheme::default(), None);
         let size = libui::layout::measure(&menu, libui::layout::Constraints::loose(bounds.size), &cell);
         assert!(size.w > 0 && size.h > 0, "the menu measures to something");
         assert!(

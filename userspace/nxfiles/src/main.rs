@@ -35,7 +35,7 @@ use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libui::layout::layout;
 use libui::paint::{FontMetrics, Theme};
 
-use libui::menu::{Item, KeyOutcome};
+use libui::menu::{Host, Routed};
 use libui::window::Child;
 use nxfiles::{App, Dialog, Drive, Entry, FileOp, Gesture, Msg, TITLE};
 
@@ -405,11 +405,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     dress(&mut *win, top.id());
 
     let bounds = Rect::new(0, 0, size.w, size.h);
-    // The open menu's window and which menu it shows: choosing `Edit` while `File` is open
-    // replaces the window rather than redrawing it at the other anchor.
-    let menu: Option<Child> = None;
-    let menu_shown: Option<usize> = None;
-    let menu_hovered: Option<u64> = None;
+    // The open menu's window.
+    let menu = Host::new(BUFFERS);
     // The delete question's window, alive only while one is being asked.
     let dialog: Option<(Dialog, Child)> = None;
     let dialog_hovered: Option<u64> = None;
@@ -424,9 +421,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         app: App,
         size: Size,
         bounds: Rect,
-        menu: Option<Child>,
-        menu_shown: Option<usize>,
-        menu_hovered: Option<u64>,
+        menu: Host,
         /// The one dialog window this browser window may have open, and which dialog it is; the
         /// kind rides with it so a different dialog opening replaces it.
         dialog: Option<(Dialog, Child)>,
@@ -456,9 +451,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             app,
             size,
             bounds: Rect::new(0, 0, size.w, size.h),
-            menu: None,
-            menu_shown: None,
-            menu_hovered: None,
+            menu: Host::new(BUFFERS),
             dialog: None,
             dialog_hovered: None,
             reported_prompt,
@@ -488,8 +481,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         size,
         bounds,
         menu,
-        menu_shown,
-        menu_hovered,
         dialog,
         dialog_hovered,
         reported_prompt,
@@ -521,8 +512,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 size: _,
                 bounds,
                 menu,
-                menu_shown,
-                menu_hovered,
                 dialog,
                 dialog_hovered,
                 reported_prompt,
@@ -568,81 +557,32 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
             // Opened and destroyed with the menu: a `popup` is a transient role that holds the
             // keyboard while up, and a hidden one would still be a window in the stack.
-            if *menu_shown != app.menus.open() {
-                if let Some(m) = menu.take() {
-                    m.close(&mut *win);
-                }
-                *menu_hovered = None;
-                *menu_shown = app.menus.open();
-                if let Some(which) = menu_shown {
-                    match app.menus.anchor() {
-                        Some(a) => {
-                            let view = app.menu_view(*which, &theme, None);
-                            *menu = Child::open(
-                                &mut *win,
-                                Role::Popup { parent: window_id },
-                                a,
-                                &view,
-                                &font,
-                                &theme,
-                                BUFFERS,
-                            );
-                        }
-                        None => *menu = None,
-                    }
-                    match menu.as_ref() {
-                        // Where it is and how big, unconditionally (`check-login` matches this
-                        // line, and a release image has no `test-harness` line): the gate divides
-                        // the height by the row count rather than read the theme's text size.
-                        Some(m) => {
-                            let o = win.window(m.id()).and_then(|w| w.configured()).map_or((0, 0), |c| (c.x, c.y));
-                            Line::new()
-                                .s(b"nxfiles: menu popup ")
-                                .u(m.id() as u64)
-                                .s(b" at ")
-                                .i(o.0 as i64)
-                                .s(b",")
-                                .i(o.1 as i64)
-                                .s(b" ")
-                                .u(m.size().w as u64)
-                                .s(b"x")
-                                .u(m.size().h as u64)
-                                .end();
-                        }
-                        // Not fatal: the browser is usable without its menu.
-                        None => {
-                            log::write(b"nxfiles: could not open the menu\n");
-                            app.menus.close();
-                            *menu_shown = None;
-                        }
-                    }
-                }
+            let view = |shown, h| app.menu_view(shown, &theme, h);
+            let synced = menu.sync(&mut *win, window_id, app.menus.shown_at(), view, &font, &theme);
+            // Not fatal: the browser is usable without its menu.
+            if synced.failed {
+                log::write(b"nxfiles: could not open the menu\n");
+                app.menus.close();
             }
-            if let Some(m) = menu.as_mut() {
-                let now = m.hovered_key();
-                if now != *menu_hovered {
-                    *menu_hovered = now;
-                    // Which row the pointer is over, unconditionally: `check-login` matches this
-                    // line, walks down and stops at the row it means to click. A key is a number
-                    // this program chose, not a label or a position.
-                    let mut l = Line::new();
-                    l.s(b"nxfiles: menu hover ");
-                    match now {
-                        Some(k) => {
-                            l.u(k);
-                        }
-                        None => {
-                            l.s(b"none");
-                        }
-                    }
-                    l.end();
-                }
-                let view = menu_shown.map(|w| app.menu_view(w, &theme, now));
-                if let Some(view) = view
-                    && !m.present(&mut *win, &view, &font, &theme)
-                {
-                    log::write(b"nxfiles: the menu could not be drawn\n");
-                }
+            // Where it is and how big, and the row under the pointer, unconditionally: `check-login`
+            // matches both, on a release image, dividing the height by the row count and walking
+            // down to a row by its key, a number this program chose.
+            if let Some((id, (x, y), size)) = synced.opened {
+                let mut l = Line::new();
+                l.s(b"nxfiles: menu popup ").u(id as u64).s(b" at ").i(x as i64).s(b",").i(y as i64);
+                l.s(b" ").u(size.w as u64).s(b"x").u(size.h as u64).end();
+            }
+            if let Some(now) = synced.hover {
+                let mut l = Line::new();
+                l.s(b"nxfiles: menu hover ");
+                match now {
+                    Some(k) => l.u(k),
+                    None => l.s(b"none"),
+                };
+                l.end();
+            }
+            if synced.undrawn {
+                log::write(b"nxfiles: the menu could not be drawn\n");
             }
 
             // One line per character typed into the name prompt, a count and not the text: a
@@ -866,10 +806,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         let mut i = 0;
         while i < wins.len() {
             if wins[i].app.closing() {
-                let w = wins.remove(i);
-                if let Some(m) = w.menu {
-                    m.close(&mut *win);
-                }
+                let mut w = wins.remove(i);
+                w.menu.close(&mut *win);
                 if let Some((_, c)) = w.dialog {
                     c.close(&mut *win);
                 }
@@ -914,14 +852,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         for (from, event) in events {
             let Some(wi) = wins.iter().position(|w| {
-                w.top.id() == from
-                    || w.menu.as_ref().is_some_and(|m| m.id() == from)
-                    || w.dialog.as_ref().is_some_and(|(_, c)| c.id() == from)
+                w.top.id() == from || w.menu.owns(from) || w.dialog.as_ref().is_some_and(|(_, c)| c.id() == from)
             }) else {
                 continue;
             };
-            let Win { top, app, size, bounds, menu, menu_shown, menu_hovered, dialog, dialog_hovered, .. } =
-                &mut wins[wi];
+            let Win { top, app, size, bounds, menu, dialog, dialog_hovered, .. } = &mut wins[wi];
             let window_id = top.id();
             // Rebuilt for *this* window: routing is against this window's tree. `Child::route`
             // lays the content out itself.
@@ -929,39 +864,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             let mut resized = false;
             // The menu's window routes through the menu's tree, though the `Msg` updates the same
             // `App` a click in the list does.
-            if menu.as_ref().is_some_and(|m| m.id() == from) {
-                if matches!(event, WindowEvent::Dismissed) {
-                    app.menus.close();
-                    continue;
-                }
-                // Arrows, Esc and Enter drive the open menu: a popup holds the keyboard, so these
-                // never reach the browser's router. The message comes from the table the popup
-                // drew, so Enter and a click on a row cannot differ.
-                if let WindowEvent::Key(k) = event {
-                    let table = app.menu_table();
-                    match app.menus.key(&k, &table) {
-                        KeyOutcome::Chose { menu, item: i } => {
-                            if let Some(msg) = table.get(menu).and_then(|m| m.items.get(i)).and_then(|it| match it {
-                                Item::Action { msg, enabled: true, .. } => Some(msg.clone()),
-                                _ => None,
-                            }) {
-                                app.update(msg);
-                            }
-                            continue;
+            if menu.owns(from) {
+                match menu.event(&event, |shown, h| app.menu_view(shown, &theme, h), &font, &theme) {
+                    Routed::Dismissed(shown) => app.menus.dismissed(shown),
+                    // Arrows, Esc and Enter drive the open menu: a popup holds the keyboard, so these
+                    // never reach the browser's router.
+                    Routed::Key(k) => {
+                        let table = app.menu_table();
+                        if let Some(msg) = app.menus.choose(&k, &table, None) {
+                            app.update(msg);
                         }
-                        KeyOutcome::Dismissed | KeyOutcome::Changed => continue,
-                        KeyOutcome::Ignored => {}
                     }
-                }
-                let msgs = match (*menu_shown, menu.as_mut()) {
-                    (Some(which), Some(m)) => {
-                        let view = app.menu_view(which, &theme, *menu_hovered);
-                        m.route(&view, &font, &theme, &event)
+                    Routed::Msgs(msgs) => {
+                        for msg in msgs {
+                            app.update(msg);
+                        }
                     }
-                    _ => Vec::new(),
-                };
-                for msg in msgs {
-                    app.update(msg);
                 }
                 continue;
             }
@@ -1023,6 +941,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
+                    // What is held, so a dismissal holds back only its own click's release.
+                    app.menus.buttons(p.buttons);
                     // What makes a press a drag is how far it has travelled, which `libui` does
                     // not measure. A drag is this window's until the pointer leaves it, and only
                     // then is it handed to the compositor.
