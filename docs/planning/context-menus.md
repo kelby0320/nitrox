@@ -467,7 +467,7 @@ waits for the compositor's dismissal, expects no popup within two seconds, then 
 again. With the fix removed the gate fails on this step. 4,542 host tests pass, and all nineteen
 gates under KVM.
 
-**After review** (`<fixes>`, after the input router's tests moved to `input/tests.rs`,
+**After review** (`f0064f4c`, after the input router's tests moved to `input/tests.rs`,
 `008778ec`):
 - **The compositor sends a `Dismissed` after the press that caused it.** It used to queue the
   dismissal while routing and the press after the batch, so a client could read them in either
