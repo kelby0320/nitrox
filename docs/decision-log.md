@@ -38368,3 +38368,35 @@ E.10 merged, #443. E.11, `syscall-surface.md` § E.11, built on `pre-phase-7/par
   below `SYSCALLS` is tested to reach a call, and every vacant one to answer `Unsupported` to each
   call's arguments.
 
+
+## 2026-11-16 — Before Phase 7: Part E done, and Part F detailed
+
+**Part E is done**, #444 merged: the surface at twenty-eight calls, every crate on libos, and the
+whole suite under Miri at its end. Part F's detail pass, [`context-menus.md`](planning/context-menus.md),
+on `pre-phase-7/part-f-detail`, measured on `main` at `11a08e2d`.
+
+- **A right click is a left click today.** The router fires a widget's `on_press` on the release of
+  whichever button took the capture, and its `on_press_down` on that press, so a right click on a
+  close button closes the window and a right press on a title bar moves it. A probe test showed it.
+  The shell's middle-click-to-close relies on the same rule. F.1 gives `on_press` and
+  `on_press_down` the left button only, a right press `on_context` and a middle click `on_middle`.
+- **The compositor places a menu when it asks** (the maintainer's call). A popup's role aux16 word,
+  reserved for a future field, says how: `0` as asked, as every popup today; `1` moved inside the
+  work area; `2` flipped about its anchor, then moved inside. A client cannot do this itself: it
+  does not know the bars' reservations. The graphical prompt's step 1 will make `1` required of
+  applications, and will call the same function.
+- **A menu opens on the right press** (the maintainer's call). The compositor's grab sends the
+  release to the window that took the press, so the release cannot choose a row.
+- **One menu window in the toolkit.** `nxterm`, `nxedit` and `nxfiles` each carry 80 to 125 lines
+  that open, switch, close and route their drop-down's popup, and every main loop Part F touches is
+  at its size entry. `libui::menu::Host` takes over that work, for drop-downs and context menus
+  alike. A `Dismissed` closes only the menu its window showed, as nothing promises whether it or
+  the press that caused it arrives first.
+- **No desktop menu and no window menu yet** (the maintainer's calls). A desktop menu would hold
+  wallpaper settings and the desktop's own context, a new file or folder or a terminal opened
+  there, none of which exists yet. `TODO(desktop-menu)` and `TODO(window-menu)` are written with
+  F.1.
+- **Every row of a context menu is an action its window already has**, built by the same definition
+  as the bar's row, so label, chord and availability cannot drift. Part F adds no action.
+- **Miri runs at Part F's end**, on the userspace targets: Part F changes no kernel code, and the
+  kernel's tests ran clean under Miri at Part E's end.

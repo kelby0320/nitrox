@@ -1,7 +1,8 @@
 # The syscall surface, consolidated
 
 **Status: planned 2026-10-08, for between Phase 6 and Phase 7 (the maintainer's call); detailed
-2026-11-02; E.1 to E.5 built by 2026-11-05, and E.6 2026-11-13.** The review below found the drift and the shape a consolidation could take; [*Part E
+2026-11-02; E.1 to E.5 built by 2026-11-05, E.6 to E.9 2026-11-13, and E.10 and E.11 2026-11-15.
+**Done 2026-11-16**, #444 merged. The review below found the drift and the shape a consolidation could take; [*Part E
 in detail*](#part-e-in-detail) is the plan, and where they differ it wins.
 
 ## Why

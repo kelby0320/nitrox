@@ -14,7 +14,8 @@ Part J added for the kernel layers it plans (the maintainer's call); Part I's it
 fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-02; E.1 to E.5
 built by 2026-11-05; Part J detailed 2026-11-05, J.1 to J.5 built 2026-11-06, J.6 to J.8 2026-11-10,
 J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6 to E.9 built
-2026-11-13, E.10 and E.11 2026-11-15, and the whole suite under Miri the same day.** Each later
+2026-11-13, E.10 and E.11 2026-11-15, and the whole suite under Miri the same day; Part E done
+2026-11-16, #444 merged; Part F detailed 2026-11-16.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
 the syscall-surface consolidation, planned separately in
@@ -1043,7 +1044,7 @@ and the docs that describe today naming no removed call. **The whole
 suite runs under Miri at Part E's end**, after E.11, and no sub-part runs it before (the
 maintainer's call, 2026-11-13). **It ran 2026-11-15**: one undefined behaviour, in `libos`'s model
 of the kernel, fixed, and its casts Part J's 38: **Part E's condition is met**
-([`syscall-surface.md`](syscall-surface.md) § E.11).
+([`syscall-surface.md`](syscall-surface.md) § E.11). **Done 2026-11-16**, #444 merged.
 
 **With it, four of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and
 lookup binding it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads
@@ -1055,7 +1056,15 @@ formats (P8), in [`safety-survey.md`](safety-survey.md).
 ## Part F — context menus
 
 A right-click menu: a menu widget in the toolkit, a popup surface the compositor places and
-dismisses, and menus in Files, the editor, the terminal and on the desktop.
+dismisses, and menus in Files, the editor and the terminal. **Detailed 2026-11-16**, in
+[`context-menus.md`](context-menus.md): five sub-parts, a PR each, measured on `main` at PR #444's
+merge. A click made the left button's, with a right press and a middle click their own handlers; a
+popup the compositor keeps inside the work area when it asks, flipped about the cursor for a
+context menu; one menu window in the toolkit for the three applications' copies; then Files', and
+the editor's and the terminal's menus. The pass found that a right click is a left click today, so
+a right click on a close button closes the window. **No menu on the desktop yet, and none on a
+window's title bar** (the maintainer's calls, 2026-11-16): what a desktop menu would hold,
+wallpaper settings and the desktop's own context, does not exist yet.
 
 ## Part G — a manual for a person
 
