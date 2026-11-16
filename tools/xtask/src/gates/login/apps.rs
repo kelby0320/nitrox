@@ -100,6 +100,8 @@ pub(crate) fn login_file_browser(qmp: &mut Qmp, session: &mut Session, st: &mut 
     let row_y = |row: i32| content_top + browser::HEADER_H + row * ROW_H + ROW_H / 2;
     let side_y = |row: i32| content_top + SIDEBAR_PAD + row * ROW_H + ROW_H / 2;
 
+    files_context_menus(qmp, session, st, files_win, row_y(4))?;
+
     // **One press on *Documents* goes there.** **This keeps two spellings of the folder names in
     // step**: `libfs` and the image build each name them, and this crate cannot link a guest
     // library.
@@ -168,6 +170,106 @@ pub(crate) fn login_file_browser(qmp: &mut Qmp, session: &mut Session, st: &mut 
     session.expect("nxfiles: listed /home - ")?;
 
     st.files_win = files_win;
+    Ok(())
+}
+
+/// The browser's context menus: a right click on a row, the Menu key, and the folder's menu at the
+/// bottom-right of a maximized window. Row 4, at `file_y`, is `theme.toml`; a fresh listing selected
+/// row 0, and the navigation after this selects it again.
+fn files_context_menus(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    st: &LoginState,
+    files_win: (u32, i32, i32, u32, u32),
+    file_y: i32,
+) -> R<()> {
+    // `Properties`, the row menu's last row (`nxfiles::menus::tests` pins the number).
+    const PROPERTIES_ROW: u64 = 109;
+    let (id, wx, wy, ww, _) = files_win;
+
+    // **A right click on a row is its menu, not a click**: it selects the row and opens nothing, and
+    // the menu's Properties shows the dialog Ctrl+I did.
+    let before = session.transcript().len();
+    right_click_at(qmp, session, wx + SIDEBAR_W + 120, file_y)?;
+    session.expect("nxfiles: menu popup ")?;
+    let popup = session.rest_of_line()?;
+    let (_, px, py, _, ph) = parse_menu_popup(&popup).ok_or_else(|| format!("no menu placement in {popup:?}"))?;
+    session.expect("nxfiles: context menu at ")?;
+    let asked = session.rest_of_line()?;
+    if parse_context_menu(&asked).map(|(_, _, what)| what) != Some("theme.toml") {
+        return Err(format!("the right click opened a menu for something else: {asked:?}").into());
+    }
+    session.expect("nxfiles: selected theme.toml")?;
+    let span = (py + MENU_FRAME, py + ph as i32 - MENU_FRAME);
+    let props = walk_to_menu_row(qmp, session, "nxfiles: menu hover ", px + 20, span, PROPERTIES_ROW)?;
+    click_at(qmp, session, props.0, props.1)?;
+    session.expect("nxfiles: showing properties")?;
+    session.expect("nxfiles: properties has the keyboard")?;
+    press(qmp, "esc")?;
+    session.expect("nxfiles: properties closed")?;
+    let since = session.transcript()[before..].to_string();
+    if since.contains("nxfiles: asked to open") {
+        return Err(format!("a right click on a file opened it: {since:?}").into());
+    }
+    println!("  ok: a right click on a row opened its menu, and its Properties the dialog");
+
+    // **The Menu key opens the selected row's menu**, from the row's bottom-left; Up from no row is
+    // the last, Properties.
+    press(qmp, "compose")?;
+    session.expect("nxfiles: menu popup ")?;
+    let popup = session.rest_of_line()?;
+    let (_, _, py, _, ph) = parse_menu_popup(&popup).ok_or_else(|| format!("no menu placement in {popup:?}"))?;
+    session.expect("nxfiles: context menu at ")?;
+    let asked = session.rest_of_line()?;
+    let Some((_, ay, "theme.toml")) = parse_context_menu(&asked) else {
+        return Err(format!("the Menu key opened a menu for something else: {asked:?}").into());
+    };
+    // Below the row's bottom, or flipped above it: hung from it, either way.
+    if py != wy + ay && py + ph as i32 != wy + ay {
+        return Err(format!("the menu {popup:?} does not hang from {asked:?} in a window at y={wy}").into());
+    }
+    press(qmp, "up")?;
+    press(qmp, "ret")?;
+    session.expect("nxfiles: showing properties")?;
+    session.expect("nxfiles: properties has the keyboard")?;
+    press(qmp, "esc")?;
+    session.expect("nxfiles: properties closed")?;
+    println!("  ok: the Menu key opened the selected row's menu, and its keys chose Properties");
+
+    // **Maximized, the folder's menu at the listing's bottom-right flips both ways**: the compositor
+    // keeps it inside the work area, its bottom-right at the click.
+    let work = st.work;
+    click_at(qmp, session, wx + ww as i32 - chrome::MAXIMISE_X, wy + chrome::TITLE_Y)?;
+    let maximised = format!("desktop-shell: maximize window {id} to {},{} {}x{}", work.0, work.1, work.2, work.3);
+    let resized = format!("nxfiles: resized to {}x{}", work.2, work.3);
+    session.expect_all(&[&maximised, &format!("desktop-shell: window {id} told state 2"), &resized])?;
+    session.expect(&format!("desktop-shell: window {id} geometry {},{} {}x{}", work.0, work.1, work.2, work.3))?;
+    let at = (work.0 + work.2 as i32 - 30, work.1 + work.3 as i32 - 60);
+    right_click_at(qmp, session, at.0, at.1)?;
+    session.expect("nxfiles: menu popup ")?;
+    let popup = session.rest_of_line()?;
+    let (_, px, py, pw, ph) = parse_menu_popup(&popup).ok_or_else(|| format!("no menu placement in {popup:?}"))?;
+    session.expect("nxfiles: context menu at ")?;
+    let asked = session.rest_of_line()?;
+    if parse_context_menu(&asked) != Some((at.0 - work.0, at.1 - work.1, "the folder")) {
+        return Err(format!("the click at {at:?} asked for {asked:?}, not the folder's menu there").into());
+    }
+    let (right, bottom) = (px + pw as i32, py + ph as i32);
+    let inside = px >= work.0 && py >= work.1 && right <= work.0 + work.2 as i32 && bottom <= work.1 + work.3 as i32;
+    if !inside || (right, bottom) != at {
+        return Err(
+            format!("the folder's menu {popup:?} is not inside {work:?} with its bottom-right at {at:?}").into()
+        );
+    }
+    println!("  ok: the folder's menu at the bottom-right corner opened up and to the left, inside the work area");
+    press(qmp, "esc")?;
+    click_at(qmp, session, work.0 + work.2 as i32 - chrome::MAXIMISE_X, work.1 + chrome::TITLE_Y)?;
+    session.expect_all(&[
+        &format!("desktop-shell: restore window {id} to "),
+        &format!("desktop-shell: window {id} told state 0"),
+        &format!("nxfiles: resized to {}x{}", files_win.3, files_win.4),
+    ])?;
+    session.expect(&format!("desktop-shell: window {id} geometry {wx},{wy} {}x{}", files_win.3, files_win.4))?;
     Ok(())
 }
 

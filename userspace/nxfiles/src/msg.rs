@@ -137,6 +137,8 @@ pub enum Msg {
     Close,
     /// A word on the menu bar was pressed: open that menu, or close it if it was already open.
     MenuBar(usize),
+    /// A right press asked for this one's menu.
+    ContextMenu(Context),
     /// Open another window of this browser — `Ctrl+Shift+N`, or File ▸ New Window.
     ///
     /// **Recorded, not done**: a window is a compositor object and this crate makes no syscalls.

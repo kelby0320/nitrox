@@ -46,8 +46,8 @@ pub struct App {
     clip_read: bool,
     /// The entries picked besides the one the list state holds, by name: indices do not survive
     /// a re-sort.
-    marked: Vec<String>,
-    anchor: Option<usize>,
+    pub(super) marked: Vec<String>,
+    pub(super) anchor: Option<usize>,
     /// This session's home, which the sidebar's first row goes to; `main` reads it from the
     /// environment.
     home: String,
@@ -107,6 +107,8 @@ pub struct App {
     ///
     /// The window it drops into is the binary's, opened and destroyed with this.
     pub menus: MenuState,
+    /// What the context menu is for, and where it was asked for.
+    pub(super) context: ContextMenus,
     /// A name being typed, and what it is for. `Some` is a mode: the keys belong to the field and
     /// the strip shows it in place of the path.
     prompt: Option<(Action, Target, TextFieldState)>,
@@ -178,6 +180,7 @@ impl App {
             quit: false,
             // Zero: `set_anchors` sizes this every frame before anything reads it.
             menus: MenuState::new(0),
+            context: ContextMenus::default(),
             prompt: None,
             confirm: None,
             dialog_focused: true,
@@ -194,7 +197,7 @@ impl App {
         self.panes.iter().find(|p| p.key == self.current).unwrap_or(&self.panes[0])
     }
 
-    fn pane_mut(&mut self) -> &mut Pane {
+    pub(super) fn pane_mut(&mut self) -> &mut Pane {
         let key = self.current;
         let i = self.panes.iter().position(|p| p.key == key).unwrap_or(0);
         &mut self.panes[i]
@@ -321,6 +324,7 @@ impl App {
         // *file* row re-selects without re-listing, which this never sees.
         self.prompt = None;
         self.confirm = None;
+        self.close_context_menu();
     }
 
     /// Turn a wire entry into a row; only an entry with an empty name is dropped.
@@ -348,15 +352,7 @@ impl App {
 
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
-        // Choosing dismisses the menu, whichever row it was. Asked of the table, not repeated in
-        // the arms, so a row added later cannot forget. A message that is not a row leaves it
-        // alone, which keeps `MenuBar` able to open one.
-        if self
-            .menu_table()
-            .iter()
-            .flat_map(|m| m.items.iter())
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
-        {
+        if self.is_menu_row(&msg) {
             self.menus.close();
         }
         match msg {
@@ -420,6 +416,7 @@ impl App {
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
             Msg::Close => self.closing = true,
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::ContextMenu(on) => self.open_context_menu(on),
             Msg::NewWindow => self.new_window = true,
             Msg::Quit => self.quit = true,
             Msg::Choose(a) => self.choose(a),
@@ -756,6 +753,7 @@ impl App {
                 }
             }
             libkern::abi::KEY_BACKSPACE => self.update(Msg::Up),
+            _ if is_menu_key(&k) => self.menu_key(),
             _ => {}
         }
     }
@@ -1526,7 +1524,7 @@ impl App {
                 .collect();
             self.drive_list.selected = here_drive;
             let drives_h = side_h.saturating_sub(places_h + DRIVES_HEADING_H);
-            let drives = list_view(
+            let drives = list_view_with_menus(
                 &drive_rows,
                 &[],
                 &mut self.drive_list,
@@ -1535,6 +1533,7 @@ impl App {
                 drive_row,
                 None,
                 None,
+                drive_menus(),
                 hovered,
                 Some(ui.sidebar),
                 ui,
@@ -1556,7 +1555,7 @@ impl App {
         let stored = self.pane().list.selected;
         let position = stored.and_then(|e| shown.iter().position(|&i| i == e));
         self.pane_mut().list.selected = position;
-        let list = list_view(
+        let list = list_view_with_menus(
             &rows,
             LIST_COLUMNS,
             &mut self.pane_mut().list,
@@ -1565,6 +1564,7 @@ impl App {
             press_row,
             Some(grab_row),
             Some(Msg::Scroll),
+            listing_menus(),
             highlight,
             None,
             ui,

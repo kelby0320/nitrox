@@ -9,8 +9,8 @@ impl App {
     /// is a parameter, not read from state: `Msg::Choose` clears `self.menu` before the window
     /// closes, so a later event from an *Edit* popup would route against the File tree.
     pub fn menu_view(&self, shown: Shown, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let menus = self.menu_table();
-        match if let Shown::Bar(i) = shown { menus.get(i) } else { None } {
+        let (menus, context) = (self.menu_table(), self.context_menu());
+        match if let Shown::Bar(i) = shown { menus.get(i) } else { context.as_ref() } {
             Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
             // Not reachable while a popup exists, but the type demands an answer.
             None => popup_frame(padding(Insets::all(2), libui::element::text("")), ui),

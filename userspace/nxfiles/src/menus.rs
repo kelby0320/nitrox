@@ -1,15 +1,220 @@
-//! The menus: the bar's table, and where its words sit.
+//! The menus: the bar's table and where its words sit, and the context menus.
 
 use super::*;
 
+/// What a context menu is for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Context {
+    /// A listing row, by its key. Its rows act on the selection, which the press made include it.
+    Row(u64),
+    /// The folder shown: the space below the listing's rows.
+    Folder,
+    /// A drive in the sidebar, by its row's key.
+    Drive(u64),
+}
+
+/// A context menu's own state, beside the [`MenuState`] that shows it.
+#[derive(Default)]
+pub(crate) struct ContextMenus {
+    /// What the menu shown is for.
+    on: Option<Context>,
+    /// Where the last right press landed, window-local: the menu it asks for opens there.
+    press: Option<(i32, i32)>,
+    /// What the Menu key asked for a menu for, opened from where it is laid out next.
+    keyed: Option<Context>,
+}
+
+/// The Menu key, or `Shift+F10`: the keyboard's ways to a context menu.
+pub(crate) fn is_menu_key(k: &KeyEvent) -> bool {
+    k.keycode == libkern::abi::KEY_COMPOSE || (k.keycode == libkern::abi::KEY_F10 && k.modifiers & MOD_SHIFT != 0)
+}
+
+/// The listing's menus: a row's, and the folder's below the rows.
+pub(crate) fn listing_menus() -> ListMenus<Msg> {
+    ListMenus { row: |k| Msg::ContextMenu(Context::Row(k)), empty: Some(Msg::ContextMenu(Context::Folder)) }
+}
+
+/// A drive's menu; a place in the sidebar has none, its one action being the press.
+pub(crate) fn drive_menus() -> ListMenus<Msg> {
+    ListMenus { row: |k| Msg::ContextMenu(Context::Drive(k)), empty: None }
+}
+
 impl App {
-    /// Record where each bar word sits, so an open menu knows where to hang from.
+    /// Record where each bar word sits, so an open menu knows where to hang from, and open a menu
+    /// the Menu key asked for from where its row now is.
     ///
     /// One method with one count (the bar's menus), testable on the host: a count kept in the
     /// binary drifted and *View* opened a popup with nowhere to go.
     pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
         let n = self.menu_count();
         self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
+        // A drive's menu outlives its drive by a frame at most, rather than staying up empty.
+        if matches!(self.menus.shown(), Some(Shown::Context(_))) && self.context_menu().is_none() {
+            self.menus.close();
+        }
+        // A row's bottom-left, or the listing's top-left for the folder's. **This frame's**: the
+        // key had the list follow its selection, which this frame's build scrolled into view.
+        let Some(on) = self.context.keyed.take() else { return };
+        let at = match on {
+            Context::Row(key) => libui::layout::locate(view, l, key).map(|r| (r.origin.x, r.bottom() as i32)),
+            _ => libui::layout::locate(view, l, LIST_KEY).map(|r| (r.origin.x, r.origin.y)),
+        };
+        if let Some((x, y)) = at {
+            self.context.on = Some(on);
+            self.menus.open_context(x, y);
+        }
+    }
+
+    /// Note a pointer event before it is routed: a left press counts toward the click run, and a
+    /// right press is where the menu it asks for opens.
+    pub fn note_pointer(&mut self, p: &PointerEvent) {
+        if p.kind != POINTER_BUTTON || p.flags & POINTER_PRESSED == 0 {
+            return;
+        }
+        match p.button {
+            libkern::abi::BTN_LEFT => self.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms, p.modifiers),
+            libkern::abi::BTN_RIGHT => self.context.press = Some((p.x, p.y)),
+            _ => {}
+        }
+    }
+
+    /// A right press asked for `on`'s menu: open it where the press landed.
+    ///
+    /// **Not a press**: a row not in the selection becomes it, alone, but the click run and its
+    /// modifiers are neither read nor changed, so nothing opens and no range moves. A row in it
+    /// keeps the selection and the marks, which the menu then acts on, as the Edit menu does.
+    pub(super) fn open_context_menu(&mut self, on: Context) {
+        let Some((x, y)) = self.context.press.take() else { return };
+        match on {
+            Context::Row(key) => {
+                let Some(i) = list_row_of(key).filter(|&i| i < self.pane().entries.len()) else { return };
+                let name = &self.pane().entries[i].name;
+                if self.pane().list.selected != Some(i) && !self.marked.contains(name) {
+                    self.marked.clear();
+                    self.anchor = Some(i);
+                    self.pane_mut().list.selected = Some(i);
+                }
+                self.notice = None;
+            }
+            Context::Folder => {}
+            Context::Drive(key) => {
+                if !self.drives().iter().any(|d| Some(d.block) == key.checked_sub(DRIVE_ROW_KEY)) {
+                    return;
+                }
+            }
+        }
+        self.context.on = Some(on);
+        self.menus.open_context(x, y);
+    }
+
+    /// The Menu key or `Shift+F10`: the selected row's menu, or with none the folder's.
+    ///
+    /// Opened by the next [`place_menus`](Self::place_menus), from where the row is then: the list
+    /// builds only the rows that fit, so a selection scrolled away has nothing to hang from until
+    /// the list follows it back.
+    pub(super) fn menu_key(&mut self) {
+        let on = match self.pane().list.selected {
+            Some(i) => Context::Row(LIST_ROW_KEY + i as u64),
+            None => Context::Folder,
+        };
+        self.pane_mut().list.follow();
+        self.context.keyed = Some(on);
+    }
+
+    /// The listing was replaced: a context menu shown was for what it held, or for where it was.
+    pub(super) fn close_context_menu(&mut self) {
+        if matches!(self.menus.shown(), Some(Shown::Context(_))) {
+            self.menus.close();
+        }
+        self.context.keyed = None;
+    }
+
+    /// Whether `msg` is a row of the bar's menus or of the context menu shown: choosing one closes
+    /// the menu, whichever row it was.
+    ///
+    /// Asked of the tables, not repeated in the arms, so a row added later cannot forget. A message
+    /// that is not a row leaves the menu alone, which keeps `MenuBar` able to open one.
+    pub(super) fn is_menu_row(&self, msg: &Msg) -> bool {
+        self.menu_table()
+            .into_iter()
+            .chain(self.context_menu())
+            .flat_map(|m| m.items)
+            .any(|it| matches!(it, Item::Action { msg: m, .. } if m == *msg))
+    }
+
+    /// A key the menu's popup received: arrows, `Esc` and `Enter` drive the menu it shows.
+    pub fn menu_key_event(&mut self, k: KeyEvent) {
+        let (bar, context) = (self.menu_table(), self.context_menu());
+        if let Some(msg) = self.menus.choose(&k, &bar, context.as_ref()) {
+            self.update(msg);
+        }
+    }
+
+    /// The context menu shown, if one is.
+    pub fn context_menu(&self) -> Option<Menu<Msg>> {
+        if !matches!(self.menus.shown(), Some(Shown::Context(_))) {
+            return None;
+        }
+        self.context_menu_for(self.context.on?)
+    }
+
+    /// Where the context menu shown was asked for, window-local, and the name of the row or drive it
+    /// is for, or `None` for the folder's: the binary's receipt.
+    pub fn context_shown(&self) -> Option<((i32, i32), Option<&str>)> {
+        if !matches!(self.menus.shown(), Some(Shown::Context(_))) {
+            return None;
+        }
+        let name = match self.context.on? {
+            Context::Row(key) => Some(self.pane().entries.get(list_row_of(key)?)?.name.as_str()),
+            Context::Folder => None,
+            Context::Drive(key) => {
+                let block = key.checked_sub(DRIVE_ROW_KEY)?;
+                Some(self.drives().iter().find(|d| d.block == block)?.name.as_str())
+            }
+        };
+        Some((self.menus.context()?, name))
+    }
+
+    /// `on`'s menu. **A row the bar has is the bar's row**, taken from its table, so its label, its
+    /// chord and whether it is enabled cannot differ from it.
+    pub fn context_menu_for(&self, on: Context) -> Option<Menu<Msg>> {
+        let mut bar: Vec<Item<Msg>> = self.menu_table().into_iter().flat_map(|m| m.items).collect();
+        let mut take = |msg: Msg| {
+            let at = bar.iter().position(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))?;
+            Some(bar.swap_remove(at))
+        };
+        let items = match on {
+            Context::Row(key) => vec![
+                Item::plain("Open", Msg::Activate(list_row_of(key)? as u64)),
+                Item::Separator,
+                take(Msg::CutFiles)?,
+                take(Msg::CopyFiles)?,
+                take(Msg::Choose(Action::Duplicate))?,
+                Item::Separator,
+                take(Msg::Choose(Action::Rename))?,
+                take(Msg::Choose(Action::Delete))?,
+                Item::Separator,
+                take(Msg::Choose(Action::Properties))?,
+            ],
+            Context::Folder => vec![
+                take(Msg::Choose(Action::NewFile))?,
+                take(Msg::Choose(Action::NewFolder))?,
+                Item::Separator,
+                take(Msg::PasteFiles)?,
+                Item::Separator,
+                take(Msg::ToggleHidden)?,
+            ],
+            // What a press on the row and on its eject button send.
+            Context::Drive(key) => {
+                let block = key.checked_sub(DRIVE_ROW_KEY)?;
+                let d = self.drives().iter().find(|d| d.block == block)?;
+                vec![
+                    Item::plain("Open", Msg::Drive(key)),
+                    Item::plain("Eject", Msg::Drive(DRIVE_EJECT_KEY + block)).enabled(d.removable),
+                ]
+            }
+        };
+        Some(Menu { title: "", items })
     }
 
     /// How many menus the bar has — derived from the table, never declared: a constant here
@@ -86,3 +291,6 @@ impl App {
         ]
     }
 }
+
+#[cfg(test)]
+mod tests;
