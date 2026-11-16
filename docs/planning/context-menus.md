@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16; F.1 and F.2 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1, F.2 and F.3 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why
@@ -422,6 +422,48 @@ window says it is.
 
 Docs: `widget-toolkit.md` §8.1. Every gate, as every application's loop changes. `check-terminal`
 and `check-login` open the drop-downs, at the places they log. Author.
+
+**Built 2026-11-16** (`f638f3c9`, after the menu's tests moved to `menu/tests.rs`, `83bae804`).
+`menu::Host` is every application's menu window, and `MenuState` holds a context menu beside the
+bar's. nxterm's, nxedit's and nxfiles' main loops lose 98, 67 and 78 lines, and log the same lines.
+
+**Three departures, for the maintainer's eye:**
+- **The context menu's state is `MenuState`'s, not a `Context` of its own.** One state shows one
+  menu at a time by construction: opening either closes the other, where two types would need
+  every caller to close the one it was not opening.
+- **The bar word's reopening reproduced, and is fixed.** A boot on the release image clicked the
+  open File menu's own word and it opened again every time, released 20 or 100 ms after the press.
+  `dismissed` remembers the bar menu until every button is up (`buttons_up`, which each loop calls
+  after routing a pointer event with none held). The same click's release toggles nothing, and a
+  press elsewhere ends its gesture with its own release.
+- **A drop-down's anchor that is not laid out yet waits a frame.** nxedit used to close the menu
+  then; nothing can ask before the first layout.
+
+**Eleven tests:**
+- the host opens a menu, rebuilds it for another, closes it, and answers a failed open once;
+- one menu at a time;
+- a drop-down placed `1` and a context menu `2`;
+- a dismissal of a replaced menu closes nothing;
+- a right press elsewhere moves the menu in either order, through a real `Session` on the mock;
+- the popup's ink is counted;
+- the state's word click;
+- its context keyboard;
+- `choose` on the bar, and `shown_at`.
+
+Eight mutations each failed the test meant to catch them:
+- the word-click guard removed;
+- no serial;
+- the host keyed on whether a menu is shown, not which;
+- the placements swapped;
+- a failed open unsaid;
+- no skip;
+- a toggle keeping the context menu;
+- nothing drawn.
+
+**`check-login` now clicks the open File menu's own word** (`2cc73038`). It holds the press 100 ms,
+waits for the compositor's dismissal, expects no popup within two seconds, then opens the menu
+again. With the fix removed the gate fails on this step. 4,542 host tests pass, and all nineteen
+gates under KVM.
 
 ### F.4 Files' menus
 
