@@ -326,6 +326,21 @@ untouched.
 
 4,527 host tests pass, and all nineteen gates under KVM: every window is created through `create`.
 
+**After review** (`f523276a`):
+- **A placed popup is placed again when a commit changes its size**, from the anchor it was created
+  at, so a menu that grows after it opens stays inside.
+- **With the work area reserved away, a popup is kept inside the screen** instead of placed below
+  it.
+- **A stack never given its screen refuses a placed popup**, rather than placing it as asked with
+  nothing said.
+- **The wire values are tested against literal bytes**, and so is `WindowCreated`'s zero for a
+  placed popup.
+- **`librsproto` denies `missing_docs`.** Its sweep found three items besides the one the move
+  lost, one of them behind the `io` feature.
+- **The mock's doc says it places nothing.**
+- **The spec and the graphical prompt now read "a placement other than `0`"**, not "`1`", so a
+  context menu keeps its flip; a popup longer than the area still needs bounding there.
+
 ### F.3 A menu's window, once, and a context menu
 
 **`libui::menu::Context` is a context menu's state:**
@@ -379,7 +394,9 @@ sticky and logs as the manager. It is the host's next caller if the host grows t
 **What the tests run on.** `libui` takes `libsurface`, with its `mock` feature (F.2 exports the
 mock), and `libos`, with its `mock` feature, as dev-dependencies: a real `Child` allocates its
 buffers through libos. The failing cases run on `Counting`, the double `window.rs` already has,
-which refuses every request.
+which refuses every request. **The mock places nothing**: its `Configure` carries the origin `(0, 0)`
+whatever was asked, so a test reads a placement from the request the host sent, not from where the
+window says it is.
 
 **Tests:**
 - the host opens a menu when asked, and switches File to Edit by rebuilding the window, since a
