@@ -1564,6 +1564,12 @@ a popup's parent is the whole *bar* rather than the button, and dismissing is ex
 clicking that button a second time close what it opened. The opening press cannot dismiss: the
 popup does not exist when it is routed.
 
+**It follows the press that caused it** (pre-Phase-7 Part F.3): the compositor hands it on after
+that press's own record, so a client whose window the press landed on always reads the press first,
+and knows a button is down when it reads the dismissal. It used to be queued while the batch was
+routed and the press after the batch, which let a client read the dismissal first and the press
+later, with motion between.
+
 **Only the topmost popup is told.** Two can be up at once — `nxterm`'s menu, and the shell's
 rename prompt, which a manager hotkey opens whatever holds focus — and a press outside both
 dismisses the upper one; the next press dismisses the other. Self-healing rather than stuck, and

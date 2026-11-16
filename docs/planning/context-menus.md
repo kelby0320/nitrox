@@ -435,20 +435,22 @@ bar's. nxterm's, nxedit's and nxfiles' main loops lose 98, 67 and 78 lines, and 
   open File menu's own word and it opened again every time, released 20 or 100 ms after the press.
   `dismissed` remembers the bar menu until every button is up (`buttons_up`, which each loop calls
   after routing a pointer event with none held). The same click's release toggles nothing, and a
-  press elsewhere ends its gesture with its own release.
+  press elsewhere ends its gesture with its own release. (Review replaced `buttons_up`; see below.)
 - **A drop-down's anchor that is not laid out yet waits a frame.** nxedit used to close the menu
   then; nothing can ask before the first layout.
 
-**Eleven tests:**
-- the host opens a menu, rebuilds it for another, closes it, and answers a failed open once;
-- one menu at a time;
-- a drop-down placed `1` and a context menu `2`;
-- a dismissal of a replaced menu closes nothing;
+**Eleven tests, seven of the host's and four of the state's:**
+- the host opens a drop-down inside and rebuilds the window for another menu;
+- it closes when nothing is wanted, and asks for nothing more;
+- one menu at a time, and a context menu asks to be placed at its point;
+- a dismissal closes only the menu its window showed;
 - a right press elsewhere moves the menu in either order, through a real `Session` on the mock;
+- a failed open is answered once;
 - the popup's ink is counted;
 - the state's word click;
 - its context keyboard;
-- `choose` on the bar, and `shown_at`.
+- `choose` on the bar;
+- `shown_at`.
 
 Eight mutations each failed the test meant to catch them:
 - the word-click guard removed;
@@ -464,6 +466,21 @@ Eight mutations each failed the test meant to catch them:
 waits for the compositor's dismissal, expects no popup within two seconds, then opens the menu
 again. With the fix removed the gate fails on this step. 4,542 host tests pass, and all nineteen
 gates under KVM.
+
+**After review** (`<fixes>`, after the input router's tests moved to `input/tests.rs`,
+`008778ec`):
+- **The compositor sends a `Dismissed` after the press that caused it.** It used to queue the
+  dismissal while routing and the press after the batch, so a client could read them in either
+  order, with motion between.
+- **The latch is set only while a button is down.** Each loop reports what its window's latest
+  pointer event held (`buttons`, replacing `buttons_up`). A dismissal read after its own release
+  held back the next click on the word; it now holds back nothing.
+- **A loop that forgot the call** now only loses the fix, as the menu reopens, rather than eating a
+  click. `check-login` holds Files' call.
+- **A bar menu reached by Left or Right gives way to a press outside.**
+- **The host's hover, `owns`, configured origin and key routing are tested.** Two mutants survive,
+  routing against the unlit tree and measuring the lit one: a menu row's hover layer lies inside the
+  row, the widget a press captures, and a highlight changes no size.
 
 ### F.4 Files' menus
 

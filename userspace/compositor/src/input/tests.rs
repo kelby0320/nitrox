@@ -4,11 +4,11 @@ use librsproto::surface::{
     SURFACE_FORMAT_XRGB8888,
 };
 
-const SCREEN: Rect = Rect::new(0, 0, 640, 480);
+pub(super) const SCREEN: Rect = Rect::new(0, 0, 640, 480);
 const BTN_LEFT: u16 = 0x110;
 
 /// A window at `(x, y)` of `w × h`, committed and configured: routing ignores any other.
-fn win(stack: &mut WindowStack, role: Role, x: i32, y: i32, w: u32, h: u32) -> u32 {
+pub(super) fn win(stack: &mut WindowStack, role: Role, x: i32, y: i32, w: u32, h: u32) -> u32 {
     let id = stack.create(&CreateWindowRequest::new(w, h, role)).expect("create");
     stack.mark_configured(id);
     let _ = stack.place(id, Point::new(x, y)).expect("origin");
@@ -34,7 +34,7 @@ fn go(r: &mut InputRouter, s: &mut WindowStack, ev: Logical) -> Vec<Outbound> {
     out
 }
 
-fn warp(r: &mut InputRouter, s: &mut WindowStack, x: i32, y: i32) {
+pub(super) fn warp(r: &mut InputRouter, s: &mut WindowStack, x: i32, y: i32) {
     let p = r.pointer();
     go(r, s, motion(x - p.x, y - p.y));
 }
@@ -396,7 +396,7 @@ fn registration_refuses_zero_a_duplicate_and_a_full_table() {
     assert_eq!(r.register_hotkey(MgrHotkey { id: 99, mods: 0, code: 99 }), Err(HotkeyError::TableFull));
 }
 
-fn button(pressed: bool) -> Logical {
+pub(super) fn button(pressed: bool) -> Logical {
     Logical::Button { button: BTN_LEFT, pressed, buttons: if pressed { 1 } else { 0 }, modifiers: 0, time_ns: T }
 }
 

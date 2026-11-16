@@ -184,9 +184,13 @@ pub struct MenuState {
     context: Option<(i32, i32)>,
     /// Bumped by each context menu's opening, so a `Dismissed` closes only the one it names.
     serial: u32,
-    /// A bar menu a `Dismissed` closed, until every button is up: the press that dismissed it may be
-    /// on its own word, whose release would otherwise open it again.
+    /// A bar menu a `Dismissed` closed while the press that caused it was still down, until every
+    /// button is up: the press may be on its own word, whose release would otherwise open it again.
     dismissed: Option<usize>,
+    /// A button is down on the window, as its last pointer event said.
+    held: bool,
+    /// The bar menu shown was reached by Left or Right, not by a click on its word.
+    by_key: bool,
 }
 
 /// Which menu a window shows: a bar menu by index, or a context menu by its opening's serial.
@@ -250,22 +254,32 @@ impl MenuState {
         self.dismissed = None;
     }
 
-    /// A press landed outside the window showing `shown`: close it, if it is still what is shown.
+    /// A press landed outside the window showing `shown`: close it, if it is still what is shown,
+    /// or if the bar menu shown since was reached by the keyboard rather than chosen by this click.
     ///
-    /// **Either order**: the press that dismissed a context menu may have opened another first.
+    /// **The compositor sends it after the press**, so the owner has already been told the button is
+    /// down: a dismissal read after the release has nothing to hold back.
     pub fn dismissed(&mut self, shown: Shown) {
-        if self.shown() == Some(shown) {
-            if let Shown::Bar(i) = shown {
+        let now = self.shown();
+        if now == Some(shown) {
+            if let Shown::Bar(i) = shown
+                && self.held
+            {
                 self.dismissed = Some(i);
             }
+            self.close();
+        } else if matches!((now, shown), (Some(Shown::Bar(_)), Shown::Bar(_))) && self.by_key {
             self.close();
         }
     }
 
-    /// Every pointer button is up, so a gesture that dismissed a menu has ended; the owner calls it
-    /// after routing each of its window's pointer events with no button held.
-    pub fn buttons_up(&mut self) {
-        self.dismissed = None;
+    /// The buttons the window's latest pointer event held; the owner calls it after routing each.
+    /// With none held, a gesture that dismissed a menu has ended.
+    pub fn buttons(&mut self, held: u16) {
+        self.held = held != 0;
+        if !self.held {
+            self.dismissed = None;
+        }
     }
 
     /// Which menu is open.
@@ -294,6 +308,7 @@ impl MenuState {
         self.open = if self.open == Some(i) { None } else { Some(i) };
         self.context = None;
         self.cursor = None;
+        self.by_key = false;
     }
 
     /// Close, choosing nothing.
@@ -345,6 +360,7 @@ impl MenuState {
                 let d = if ev.keycode == KEY_RIGHT { 1 } else { menus.len() - 1 };
                 self.open = Some((open + d) % menus.len());
                 self.cursor = None;
+                self.by_key = true;
                 KeyOutcome::Changed
             }
             KEY_ENTER => match self.cursor {

@@ -38480,3 +38480,7 @@ F.2 merged, #447. F.3, `context-menus.md` § F.3, built on `pre-phase-7/part-f3-
   the open File menu's word; with the fix removed, it fails.
 - Departures, for the maintainer's eye: the context state is `MenuState`'s; a drop-down whose word
   is not laid out yet waits a frame, where nxedit closed the menu.
+- After review, **the compositor sends a `Dismissed` after the press that caused it**, and the
+  state latches a dismissed bar menu only while a button is down, as each loop now reports what its
+  window's pointer holds (`buttons`). A dismissal read after its release had held back the next
+  click on the word. A bar menu reached by the keyboard gives way to a press outside.

@@ -7,7 +7,7 @@
 "kernel/src/object/file_object.rs" = 1093
 "kernel/src/pci/mod.rs" = 1032
 "kernel/src/syscall/table.rs" = 1544
-"userspace/compositor/src/main.rs" = 1926
+"userspace/compositor/src/main.rs" = 1915
 "userspace/compositor/src/input/tests.rs" = 1716
 "userspace/compositor/src/tests.rs" = 1548
 "userspace/desktop-shell/src/main.rs" = 1388
@@ -22,7 +22,7 @@
 "userspace/libui/src/widget/tests.rs" = 2231
 "userspace/nxedit/src/lib.rs" = 3601
 "userspace/nxfiles/src/app.rs" = 1719
-"userspace/nxfiles/src/main.rs" = 1017
+"userspace/nxfiles/src/main.rs" = 1015
 "userspace/nxfiles/src/tests.rs" = 2275
 "userspace/nxsh/src/eval.rs" = 4137
 "userspace/nxsh/src/lex.rs" = 1089

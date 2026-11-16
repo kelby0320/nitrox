@@ -682,10 +682,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
-                    // A gesture that dismissed a menu ends with every button up.
-                    if p.buttons == 0 {
-                        app.menus.buttons_up();
-                    }
+                    // What is held, so a dismissal holds back only its own click's release.
+                    app.menus.buttons(p.buttons);
                 }
                 WindowEvent::Focus(f) => {
                     // Reported under the harness (`check-terminal` waits on `focus=1`): keys go to

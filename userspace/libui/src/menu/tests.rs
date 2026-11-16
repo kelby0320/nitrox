@@ -362,22 +362,63 @@ fn select_first_points_at_the_first_choosable_row() {
 fn a_click_on_an_open_menus_own_word_closes_it_and_the_next_opens_it() {
     let mut st = MenuState::new(2);
     st.toggle(0);
+    // The press on the word is down when its dismissal is read, as the compositor sends it after.
+    st.buttons(1);
     st.dismissed(Shown::Bar(0));
     st.toggle(0);
     assert_eq!(st.open(), None, "the dismissing click's release opened it again");
-    st.buttons_up();
+    st.buttons(0);
+    st.buttons(1);
     st.toggle(0);
     assert_eq!(st.open(), Some(0), "a later click opens it");
 
     // Dismissed by a press elsewhere: its release ends the gesture, and the word works at once.
     st.dismissed(Shown::Bar(0));
-    st.buttons_up();
+    st.buttons(0);
     st.toggle(0);
     assert_eq!(st.open(), Some(0));
     // A different word in the same gesture is not held back.
+    st.buttons(1);
     st.dismissed(Shown::Bar(0));
     st.toggle(1);
     assert_eq!(st.open(), Some(1));
+}
+
+/// A dismissal read after its click's release holds nothing back: the next click on the word is a
+/// click of its own. A right press, or one released off a widget, toggles nothing on its release.
+#[test]
+fn a_dismissal_read_after_its_release_holds_back_no_later_click() {
+    let mut st = MenuState::new(2);
+    st.toggle(0);
+    st.buttons(1);
+    st.buttons(0);
+    st.dismissed(Shown::Bar(0));
+    assert_eq!(st.open(), None, "it closed");
+    st.buttons(1);
+    st.toggle(0);
+    assert_eq!(st.open(), Some(0), "the next click on the word was eaten");
+}
+
+/// A menu switched to by Left or Right gives way to a press outside; one a click chose does not.
+#[test]
+fn a_press_outside_closes_a_menu_the_keyboard_switched_to_but_not_one_a_click_chose() {
+    let menus = alloc::vec![
+        Menu { title: "File", items: alloc::vec![Item::plain("New", 1u32)] },
+        Menu { title: "Edit", items: alloc::vec![Item::plain("Copy", 2u32)] },
+    ];
+    let mut st = MenuState::new(2);
+    st.toggle(0);
+    assert_eq!(st.choose(&ev(KEY_RIGHT, 0), &menus, None), None);
+    st.dismissed(Shown::Bar(0));
+    assert_eq!(st.shown(), None, "Edit, reached by the keyboard, stayed open after a press outside");
+
+    st.toggle(0);
+    st.buttons(1);
+    st.toggle(1);
+    st.dismissed(Shown::Bar(0));
+    assert_eq!(st.shown(), Some(Shown::Bar(1)), "the click on Edit chose it");
+    st.toggle(0);
+    assert_eq!(st.open(), Some(0), "and no click on File is held back by File's dismissal");
 }
 
 #[test]

@@ -576,11 +576,17 @@ the widget set that is a small type system rather than a function:
 **A click on an open menu's own word closes it** (pre-Phase-7 Part F.3). The press dismisses the
 menu at the compositor, and the same click's release then reached the word's `on_press`, which
 toggled it open again: a boot showed it every time, the release 20 or 100 ms after the press.
-`dismissed` remembers the bar menu it closed until every button is up, `buttons_up` — which each
-owner calls after routing a pointer event with no button held — and a `toggle` of that menu in the
-meantime is the dismissing click's own release. Either order of the `Dismissed` and the click
-holds: a press elsewhere ends its gesture with its own release, and the pointer's next motion over
-the window clears it after a press on another.
+- **The compositor sends a `Dismissed` after the press that caused it**, so a window's owner reads
+  the press first.
+- **Each owner tells the state what its window's latest pointer event held**, `buttons`, after
+  routing it.
+- **`dismissed` remembers the bar menu it closed only while a button is down**, until none is. A
+  `toggle` of that menu in the meantime is the dismissing click's own release. A dismissal read
+  after its release, from a right press or one released off a widget, holds back no later click.
+- **An owner that forgot `buttons` loses only this**: a missing call leaves nothing held, so the
+  menu reopens as before rather than eating a click.
+- **A bar menu reached by Left or Right gives way to a press outside**, as one shown by a click
+  does. A dismissal naming the menu it switched from, read after the switch, closes it too.
 
 **The three applications' menu windows are one `Host`** (F.3). Each carried 80 to 125 lines that
 opened, switched, closed and routed its drop-down's popup in its main loop. The shell's

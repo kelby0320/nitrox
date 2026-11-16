@@ -347,6 +347,11 @@ impl InputRouter {
                     let flags = if pressed { POINTER_PRESSED } else { 0 };
                     self.emit(window, POINTER_BUTTON, button, flags, stack, out);
                 }
+                // **The dismissal follows the press that caused it**, so its client reads the press
+                // first and knows the button is down when it is told.
+                if let Some(window) = dismissed {
+                    out.push(Outbound::Dismissed { window });
+                }
 
                 if !pressed && buttons == 0 {
                     // The drag ends with its grab; the stack records the gesture's one geometry
@@ -902,3 +907,24 @@ impl InputRouter {
 
 #[cfg(test)]
 mod tests;
+
+/// What the router hands on puts a dismissal after the press that caused it, so its client reads
+/// the press first and knows a button is down when it is told.
+#[cfg(test)]
+#[test]
+fn a_dismissal_follows_the_press_that_caused_it() {
+    use librsproto::surface::Role;
+    use tests::{SCREEN, button, warp, win};
+    let mut s = WindowStack::new();
+    let window = win(&mut s, Role::Normal, 0, 0, 400, 400);
+    let menu = win(&mut s, Role::Popup { parent: window }, 10, 10, 100, 100);
+    let mut r = InputRouter::new(SCREEN);
+    warp(&mut r, &mut s, 300, 300);
+    let mut out = Vec::new();
+    r.route(&button(true), &mut s, &mut out);
+    let at = |want: &dyn Fn(&Outbound) -> bool| out.iter().position(want);
+    let press =
+        at(&|o| matches!(o, Outbound::Pointer { event } if event.kind == POINTER_BUTTON && event.window == window));
+    let dismissed = at(&|o| matches!(o, Outbound::Dismissed { window: w } if *w == menu));
+    assert!(press.is_some() && dismissed.is_some() && press < dismissed, "{out:?}");
+}

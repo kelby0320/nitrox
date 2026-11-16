@@ -6,8 +6,9 @@ use core::cell::{Cell, RefCell};
 
 use libdraw::geom::Rect;
 use librsproto::surface::{
-    CreateWindowRequest, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_DISMISSED, OP_POINTER_EVENT, POINTER_BUTTON,
-    POINTER_PRESSED, PointerEvent, WindowRef, parse_create_window_request,
+    ConfigureEvent, CreateWindowRequest, OP_CONFIGURE, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_DISMISSED,
+    OP_POINTER_EVENT, POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent, WindowRef,
+    parse_create_window_request,
 };
 use libsurface::UiError;
 use libsurface::mock::MockTransport;
@@ -17,7 +18,8 @@ use crate::menu::{Item, Menu, MenuState, popup};
 const DEJAVU: &[u8] = include_bytes!("../../../../../assets/fonts/DejaVuSans.ttf");
 
 /// The mock, shared, so a test can read what was sent and queue what arrives while a `Session`
-/// owns the transport; and every request counted, refused ones included.
+/// owns the transport; every request counted, refused ones included; and a window configured at
+/// the offset it asked for, where the mock says `(0, 0)`, so an origin can be told from its swap.
 #[derive(Clone, Default)]
 struct Shared(Rc<RefCell<MockTransport>>, Rc<Cell<usize>>);
 
@@ -30,7 +32,16 @@ impl Transport for Shared {
         reply: &mut [u8],
     ) -> Result<Option<usize>, UiError> {
         self.1.set(self.1.get() + 1);
-        self.0.borrow_mut().request(op, body, handle, reply)
+        let answer = self.0.borrow_mut().request(op, body, handle, reply);
+        if op == OP_CREATE_WINDOW
+            && let Some(req) = parse_create_window_request(body)
+            && let Some((OP_CONFIGURE, cfg)) = self.0.borrow_mut().events.first_mut()
+            && let Some(mut c) = ConfigureEvent::read(cfg)
+        {
+            (c.x, c.y) = (req.offset_x, req.offset_y);
+            c.write(cfg);
+        }
+        answer
     }
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
         self.0.borrow_mut().poll_event(buf)
@@ -121,6 +132,7 @@ fn a_drop_down_opens_inside_and_another_menu_rebuilds_the_window() {
     let mut r = Rig::new();
     r.state.toggle(0);
     let file = r.sync().opened.expect("File opened");
+    assert_eq!(file.1, (10, 20), "the origin it was configured at");
     let asked = r.popups();
     assert_eq!(asked.len(), 1);
     assert_eq!((asked[0].place, asked[0].offset_x, asked[0].offset_y), (Placement::Inside, 10, 20), "under its word");
@@ -256,4 +268,95 @@ fn the_popup_draws_its_rows() {
     let ground = px[px.len() / 2 + 2];
     let ink = px.iter().filter(|p| **p != ground).count();
     assert!(ink > 100, "{ink} pixels differ from the ground: the rows were not drawn");
+}
+
+/// The row under the pointer is reported once as it changes, the popup is drawn with it, and a
+/// press routes against that tree; a window opened again starts with nothing under the pointer.
+#[test]
+fn the_row_under_the_pointer_is_reported_drawn_and_routed_against() {
+    let mut r = Rig::new();
+    r.state.toggle(0);
+    r.sync();
+    let popup = r.host.child.as_ref().expect("up").id();
+    let at = |kind, buttons, flags| PointerEvent {
+        window: popup,
+        kind,
+        button: libkern::abi::BTN_LEFT,
+        buttons,
+        flags,
+        x: 20,
+        y: 16,
+        ..Default::default()
+    };
+    assert_eq!(r.event(&WindowEvent::Pointer(at(POINTER_MOTION, 0, 0))), Routed::Msgs(vec![]));
+    assert_eq!(r.sync().hover, Some(Some(100)), "the pointer is over New, row key 100");
+    assert_eq!(r.sync().hover, None, "and said once");
+    assert_eq!(r.event(&WindowEvent::Pointer(at(POINTER_BUTTON, 1, POINTER_PRESSED))), Routed::Msgs(vec![]));
+    assert_eq!(r.event(&WindowEvent::Pointer(at(POINTER_BUTTON, 0, 0))), Routed::Msgs(vec![1]), "a click on New");
+
+    r.state.close();
+    r.sync();
+    r.state.toggle(0);
+    assert_eq!(r.sync().hover, None, "a window opened again reports no change from the last one's row");
+}
+
+#[test]
+fn the_host_owns_only_its_popup_and_hands_its_keys_on() {
+    let mut r = Rig::new();
+    assert!(!r.host.owns(r.parent), "no popup yet");
+    r.state.toggle(0);
+    r.sync();
+    let popup = r.host.child.as_ref().expect("up").id();
+    assert!(r.host.owns(popup));
+    assert!(!r.host.owns(r.parent) && !r.host.owns(popup + 1), "nor any other window");
+    let k = KeyEvent::new(popup, libkern::abi::KEY_DOWN, 1, 0);
+    assert_eq!(r.event(&WindowEvent::Key(k)), Routed::Key(k));
+}
+
+/// The press, its dismissal and its release in one pump, as the compositor now sends them: the
+/// session hands out the window's two events first, and a dismissal read after the release holds
+/// back no later click on the word.
+#[test]
+fn a_right_press_outside_and_its_release_in_one_pump_hold_back_no_later_click() {
+    let mut r = Rig::new();
+    r.state.toggle(0);
+    r.sync();
+    let popup = r.host.child.as_ref().expect("up").id();
+    let ev = |buttons, flags| PointerEvent {
+        window: r.parent,
+        kind: POINTER_BUTTON,
+        button: libkern::abi::BTN_RIGHT,
+        buttons,
+        flags,
+        x: 300,
+        y: 200,
+        ..Default::default()
+    };
+    {
+        let mut b = [0u8; 64];
+        let mut m = r.t.0.borrow_mut();
+        let n = ev(2, POINTER_PRESSED).write(&mut b).expect("encodes");
+        m.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
+        let n = WindowRef { window: popup }.write(&mut b).expect("encodes");
+        m.events.insert(0, (OP_DISMISSED, b[..n].to_vec()));
+        let n = ev(0, 0).write(&mut b).expect("encodes");
+        m.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
+    }
+    r.s.pump().expect("pumps");
+    while let Some((from, e)) = r.s.next_event() {
+        match e {
+            WindowEvent::Pointer(p) if from == r.parent => r.state.buttons(p.buttons),
+            e if r.host.owns(from) => {
+                if let Routed::Dismissed(shown) = r.event(&e) {
+                    r.state.dismissed(shown);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(r.state.shown(), None, "dismissed");
+    r.sync();
+    r.state.buttons(1);
+    r.state.toggle(0);
+    assert_eq!(r.state.open(), Some(0), "a click on File after it opened File");
 }

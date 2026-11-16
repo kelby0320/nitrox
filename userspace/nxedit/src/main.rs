@@ -827,10 +827,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     for m in msgs {
                         app.update(m);
                     }
-                    // A gesture that dismissed a menu ends with every button up.
-                    if p.buttons == 0 {
-                        app.menus.buttons_up();
-                    }
+                    // What is held, so a dismissal holds back only its own click's release.
+                    app.menus.buttons(p.buttons);
                     // Measuring is the binary's: it needs the font the area was drawn with, the
                     // fixed-advance one, or the caret lands off by more the further in.
                     let m = FontMetrics::new(&font, theme.font_px);
