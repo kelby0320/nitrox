@@ -38484,3 +38484,24 @@ F.2 merged, #447. F.3, `context-menus.md` § F.3, built on `pre-phase-7/part-f3-
   state latches a dismissed bar menu only while a button is down, as each loop now reports what its
   window's pointer holds (`buttons`). A dismissal read after its release had held back the next
   click on the word. A bar menu reached by the keyboard gives way to a press outside.
+
+## 2026-11-16 — Before Phase 7, F.4: Files' context menus
+
+F.3 merged, #448. F.4, `context-menus.md` § F.4, built on `pre-phase-7/part-f4-files-menus`.
+
+- **A list's menus are `libui::widget::list_view_with_menus`'s** (`c6fb94d6`, `1adbcba0`). A row's menu hangs
+  on the row, and the space below the rows has its own on the rows' column, never on the element
+  that also holds the scrollbar. `list_view` keeps its signature for the chooser and the reference
+  picture.
+- **Files has a row's, the folder's and a drive's menu.** A right press on a row outside the
+  selection selects it alone, but reads no click run and no modifiers, so it opens nothing and moves
+  no range. On a row inside the selection it keeps the selection and the marks, which the menu acts
+  on. The Menu key and `Shift+F10` open the selected row's menu at its bottom-left once the list has
+  followed the row back into view, or the folder's with nothing selected.
+- **A context row the bar has is the bar's row**, taken from its table by its message, so the two
+  cannot differ in label, chord or availability. The plan drew a definition the two share.
+- **A new listing closes a context menu, and so does a drive's going.** Not in the plan: a drive
+  pulled under a row's menu re-lists home, and its rows would act on home's first row.
+- `check-login` right-clicks a file and chooses Properties, opens the same menu with the Menu key,
+  and maximizes Files to show the folder's menu flipped inside the work area, its bottom-right at
+  the click.
