@@ -38414,3 +38414,23 @@ on `pre-phase-7/part-f-detail`, measured on `main` at `11a08e2d`.
   - **`ScrollGrab` takes a left press only.**
   - **A failed open is answered once.**
   - **`libsurface`'s mock is exported for `libui`'s tests.**
+
+## 2026-11-16 — Before Phase 7, F.1: a click is the left button's
+
+Part F's detail pass merged, #445. F.1, `context-menus.md` § F.1, built on
+`pre-phase-7/part-f1-left-click`.
+
+- **`on_press` and `on_press_down` answer the left button only** (`a89531e2`). They answered
+  whichever button took the capture, so a right click on a close box closed the window, a right
+  press on a title bar moved it, and in Files a right click after a double click opened a file.
+- **A right press goes to `on_context`**, the nearest on the hit's path, at the press, and only on a
+  press that opens the capture: the compositor dismisses a menu only on a press that takes its grab,
+  so a menu opened mid-gesture would never close. It carries no point; a widget that needs one reads
+  its own `on_pointer`, which still sees every button.
+- **A middle click goes to `on_middle`**, and the shell's task buttons close their window on it; the
+  shell no longer asks the event which button made a message. `ScrollGrab` answers the left button
+  only.
+- **`TODO(desktop-menu)` and `TODO(window-menu)`** are written, the maintainer's calls.
+- Departures, for the maintainer's eye: `panel.rs`'s tests moved too, as the file was at its entry;
+  `nxterm`'s two tests that pressed button 0 press the left; a middle click elsewhere on the bottom
+  bar sends nothing, where the shell dropped it with an arm of its own.

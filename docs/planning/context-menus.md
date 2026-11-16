@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why
@@ -176,6 +176,42 @@ implementer's.
 
 Docs: [`widget-toolkit.md`](../architecture/widget-toolkit.md) §7.1 and §8.2. Every gate, as every
 window routes through it. Author.
+
+**Built 2026-11-16** (`a89531e2`, after two moves: `route.rs`'s tests, `c77508f3`, and
+`panel.rs`'s, `737993e6`).
+- `on_press` and `on_press_down` answer the left button only.
+- A right press reaches `on_context` at the press, and only on a press that opens the capture.
+- A middle click reaches `on_middle`. The shell's task buttons close their window on it, and the
+  shell no longer asks the event which button made a message.
+- `ScrollGrab` answers the left button only, and keeps no button of its own.
+
+**Three departures, for the maintainer's eye:**
+- **`desktop-shell/src/panel.rs` moved its tests as well.** It sat at its 1,211-line entry, and the
+  task button's `on_middle` and its test needed room.
+- **`nxterm`'s two tests that pressed button 0 now press the left one.** Before this change any
+  button clicked, button 0 included.
+- **A middle click anywhere else on the bottom bar now sends nothing.** The shell used to drop it
+  with an arm of its own.
+
+**Seven tests, each failing with its guard removed:**
+- a right or a middle click on a title bar, its close box, a button, a tab and a list row sends
+  nothing, where the left sends each one's message;
+- `on_context` fires on the nearest handler, once, at the press;
+- no `on_context` fires inside a left gesture;
+- a middle click reaches `on_middle`;
+- every button still focuses and still reaches `on_pointer`;
+- the scrollbar ignores a right or middle press;
+- the shell's middle click closes a task.
+
+Five mutations each failed the test meant to catch them:
+- the click by any button;
+- the press-down by any button;
+- `on_context` on any press;
+- the middle button as a left click;
+- the scrollbar taking any button.
+
+So did removing the task's `on_middle`. 4,510 host tests pass, and all nineteen gates under KVM.
+`check-login` middle-clicks the editor's task and waits for the close it asks for.
 
 ### F.2 The compositor places a menu
 
