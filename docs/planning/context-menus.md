@@ -28,9 +28,18 @@ sub-parts, a PR each.**
    test, `only_the_capturing_buttons_release_is_a_click`, pins "the capturing button" without
    saying which. **The shell's middle-click-to-close depends on it**: the bottom bar routes the
    event, then asks the event whether its button was the middle one (`desktop-shell/src/main.rs`).
+
+   **In Files it opens files nobody asked to open.** A right click on a row reaches `Msg::Press`,
+   which reads the click run and its modifiers. Only a left press updates those (`note_press`).
+   A second probe test sent a press the counter never saw, as a right press is:
+   - after a double click on one file, it **opened** the next;
+   - after a Shift-click range, it shrank the range to end at that row.
 2. **The editor drops its selection on any press.** `take_area_pointer` places the caret on a
    press of any button, so a right click on a selection would lose what Copy acts on. The terminal's
-   grid and both click counters (Files' and the terminal's) already read only `BTN_LEFT`.
+   grid and both click counters (Files' and the terminal's) already read only `BTN_LEFT`. **The
+   editor places its caret late**: its `on_pointer` only stores the event (`Msg::AreaPointer`), and
+   the binary resolves it in `take_area_pointer`, after every routed message, because only the
+   binary has the font to turn a pixel into a line and a column.
 3. **A client cannot keep a menu on screen.** It knows its window's origin, from the last
    `Configure`, and the screen's size, from `/dev/draw/screen`. It does not know the bars'
    reservations, and the compositor places a popup exactly where asked:
@@ -45,29 +54,43 @@ sub-parts, a PR each.**
 
    A context menu would make a second copy in each. The shell's `BarMenus` is a fourth, with a
    filter field and a size that changes as you type.
-5. **Every file Part F would grow is at its size entry**:
+5. **Most files Part F would grow are at their size entry, or one line under the limit**:
 
    | Crate | Files at their entry |
    |---|---|
    | `libui` | `route.rs` 1,235 |
+   | `librsproto` | `surface.rs` 2,561 |
+   | `libsurface` | `lib.rs` 1,423 |
    | `nxfiles` | `app.rs` 1,719, `main.rs` 1,095 |
    | `nxedit` | `lib.rs` 3,811 |
    | `nxterm` | `lib.rs` 2,339 |
-   | `compositor` | `lib.rs` 2,643, `input.rs` 2,636, `main.rs` 1,926 |
+   | `compositor` | `lib.rs` 2,643, `input.rs` 2,636, `main.rs` 1,926; `server.rs` is 999 with no entry |
    | `desktop-shell` | `main.rs` 1,392 |
 
-   New code goes into new modules, and a shared helper is what lets the main loops shrink.
-6. **A press that dismisses a menu also arrives, and nothing promises the order.** The compositor
-   queues the `Dismissed` while routing the batch (`route_one_batch`), and delivers the press after
-   every batch (`deliver`). So today the `Dismissed` arrives first, but the spec says nothing about
-   the order. A loop written for the other order would close a menu that a second right-click meant
+   `nxterm`'s and `nxedit`'s `main.rs`, 862 and 957 lines, have room. A move that lowers a file's
+   entry gives it no room, since the entry follows it down, unless the file drops under 1,000. So
+   new code goes into new modules, and each sub-part says what moves first.
+6. **A press that dismisses a menu also arrives, and nothing promises the order.** On the wire,
+   the `Dismissed` goes first: the compositor queues it while routing the batch
+   (`route_one_batch`), and delivers the press after every batch (`deliver`). **The application
+   sees the other order** when one pump picks up both: `libsurface`'s `next_event` drains its
+   windows in creation order, so the parent's press comes before its popup's `Dismissed`. Neither
+   order is in the spec. A loop written for one would close a menu that a second right-click meant
    to move.
-7. **Both keyboards already send the Menu key**: PS/2 scancode `0x5D` and USB usage `0x65`, as
+7. **The compositor's `create` cannot see the screen.** `WindowStack` holds none, and neither
+   `create` nor `server::dispatch` is handed one: only `main.rs`'s `Server` has it. `work_area`
+   takes the screen as an argument.
+8. **Two of the tools the plan needs are not reachable yet.** `libsurface`'s `MockTransport` is
+   private to its own tests, and `libui` has no dev-dependencies. Its one transport double,
+   `Counting`, refuses every request. And Miri's job leaves `libui` and the three applications out
+   by name (`tools/xtask/miri.rs`, `LEFT_OUT`), so "the userspace targets" never reach Part F's
+   router, its menu host or its menus.
+9. **Both keyboards already send the Menu key**: PS/2 scancode `0x5D` and USB usage `0x65`, as
    `KEY_COMPOSE`. Nothing reads it.
-8. **The graphical prompt plans the same placement**
-   ([`graphical-prompt.md`](../design/graphical-prompt.md), step 1): *an application's popup is kept
-   inside the work area… a menu near an edge moves inward.* It also needs the compositor to know
-   which connection is the manager's, so that the rule can be required of applications.
+10. **The graphical prompt plans the same placement**
+    ([`graphical-prompt.md`](../design/graphical-prompt.md), step 1): *an application's popup is
+    kept inside the work area… a menu near an edge moves inward.* It also needs the compositor to
+    know which connection is the manager's, so that the rule can be required of applications.
 
 ### The maintainer's calls (2026-11-16)
 
@@ -90,27 +113,45 @@ Every sub-part gets a `/pr-review` and the host tests. Each runs the KVM gates i
 F.1 to F.3 reach every window, so they run all of them. Each new test fails without its change,
 which is its control.
 
-**Miri runs once, at Part F's end**, by the maintainer's rule for a part's end (2026-11-06). It runs
-the userspace targets: Part F changes no kernel code, and the kernel's tests ran clean under Miri
-at Part E's end. Part F is done when F.5 has merged and what Miri reports is triaged.
+**Miri runs once, at Part F's end**, by the maintainer's rule for a part's end (2026-11-06). It
+does not run the kernel: Part F changes no kernel code, and the kernel's tests ran clean under
+Miri at Part E's end. What it runs:
+- **The job's targets that Part F changes**: `compositor`, `librsproto`, `libsurface` and
+  `desktop-shell`.
+- **`libui`, named on its own** (`cargo xtask miri libui`), as the job leaves it out for the half
+  hour its tests take, and its router and menu host are Part F's core.
+- **Not the three applications.** The job leaves them out because they hold no `unsafe` and spend
+  sixteen minutes each rasterising, and Part F adds no `unsafe` to them. That is a gap: their menus
+  are never run under Miri.
+
+Part F is done when F.5 has merged and what Miri reports is triaged.
 
 ### F.1 A click is the left button's
 
 **The router gives each button its own meaning.**
 - `on_press` and `on_press_down` answer `BTN_LEFT` only.
 - A right press goes to a new `on_context: Option<Msg>`, the nearest one on the hit's path. It fires
-  on the press, once, and after any `on_pointer` on the same path. So a widget that places a caret
-  has placed it before the menu reads the selection.
+  on the press, once, and **only on a press that opens the capture**, as `on_press_down` does. A
+  right press made while another button is held is part of that gesture: it opens no menu, and the
+  compositor, which dismisses only on a press that takes its grab, would not close one.
+- **`on_context` carries no point**: like every press handler, it is a fixed message. A widget that
+  needs the press, to place a caret or pick a cell, reads it through its own `on_pointer`. Files
+  takes the point from the press its loop sees before routing, as it takes a left press for its
+  click counter.
 - A middle click, pressed and released inside, goes to a new `on_middle`.
 - A capture still opens on whichever button goes down first. So a release outside, or a drag,
-  still reaches the widget that took it, and `ScrollGrab` keeps answering its own button.
+  still reaches the widget that took it.
+- **`ScrollGrab` takes a left press only**, as a click is the left button's. A right press on a
+  scrollbar scrolls nothing, and so cannot both scroll a list and open the menu of the listing
+  around it.
 - Click-to-focus is unchanged for every button.
 
 **The shell's bottom bar moves its middle-click to `on_middle`**, and stops asking the event which
 button it was.
 
-**`route.rs`'s tests move first**, to `route/tests.rs`, in a commit of their own that lowers the
-file's entry. That commit can be the implementer's.
+**`route.rs`'s tests move first**, to `route/tests.rs`, in a commit of their own. The file drops
+from 1,235 lines to about 525 and leaves the size list, which gives it room. That commit can be the
+implementer's.
 
 **Two deferrals are written here**, each entry with its marker:
 - `TODO(desktop-menu)` at the wallpaper's surface. Trigger: wallpaper settings, or a desktop that
@@ -123,8 +164,15 @@ file's entry. That commit can be the implementer's.
 - A right press on a title bar starts no move.
 - `on_context` fires on the press, the nearest one, once, and not on the release.
 - A right press on a widget without `on_context`, inside one with it, reaches the outer one.
+- A right press while the left button holds a capture fires no `on_context`.
 - A middle click on a task reaches `on_middle`.
-- The scrollbar's second-button tests still pass, unchanged.
+- A right press on a scrollbar's track scrolls nothing.
+
+**And tests that hold what must not change**, passing before and after:
+- a left drag, and a left release outside its widget, still reach the widget that took the press;
+- a right press still focuses the focusable widget it lands on, as a left press does;
+- `on_pointer` still sees every button's press;
+- the scrollbar's second-button tests, unchanged.
 
 Docs: [`widget-toolkit.md`](../architecture/widget-toolkit.md) §7.1 and §8.2. Every gate, as every
 window routes through it. Author.
@@ -145,8 +193,28 @@ the area's top-left corner and is clipped. Any other value is refused with `Inva
 resolved once (`TODO(popup-follows-parent)`). The client's first `Configure` carries the origin
 the popup got, so a client that logs where its menu is logs where it landed.
 
-**The code goes in a module of its own**, as `lib.rs` is at its entry: one pure function from the
-anchor, the size, the work area and the value to an origin. `create` calls it, a net-zero edit.
+**The placement is one pure function in a module of its own**: from the anchor, the size, the work
+area and the value to an origin. It computes in `i64`, since the anchor is a saturating `i32` sum
+of a client's offset and the size any `u32`, so a flip cannot wrap.
+
+**Three moves come first**, each in a commit of its own, which can be the implementer's:
+- **`compositor/src/lib.rs`** sends its tests (line 1,088 on) to `tests.rs`, and the cursor, the
+  move outline and key repeat (lines 250 to 414) to a module of their own. The file drops under
+  1,000 lines and leaves the size list, which gives it room for what follows.
+- **`librsproto/src/surface.rs`** sends its window-creation codec to `surface/create.rs`,
+  re-exported, so no caller changes: `Edge`, `Role`, `CreateWindowRequest`, and the create
+  request's and reply's writers and readers, lines 43 to 390, with `WindowInfo` and `ScreenInfo`,
+  which sit among them. The placement value lands there. `surface.rs` stays over 1,000 lines, so
+  its entry is lowered and it takes none of F.2's lines.
+- **`libsurface/src/lib.rs`** sends its `MockTransport` to an exported `mock` module, which F.3's
+  tests need too. Its entry is lowered.
+
+**How the work area reaches `create` (finding 7).** The stack learns its screen once:
+`WindowStack::new().on_screen(r)`, in the one line where `main.rs` builds the stack, which already
+has the rectangle. `create` then asks `work_area` itself. So `server::dispatch` keeps its signature,
+and `server.rs`, at 999 lines, is not touched. **A stack with no screen places every popup as
+asked**, so the host tests' 175 `WindowStack::new()`s keep their meaning.
+
 In librsproto, `CreateWindowRequest` carries the value, written into aux16 for a popup and as zero
 for every other role. Its decoder refuses a value it does not know.
 
@@ -158,7 +226,11 @@ but the manager's, which needs the manager's connection marked first. It will ca
 - an overhang of one pixel on each of the four edges, and a popup exactly flush;
 - a flip that fits, and a flip that does not fit and is moved inward;
 - a popup larger than the area;
-- `0` unchanged;
+- the extremes: an offset of `i32::MIN` and of `i32::MAX`, and a width above `i32::MAX`, for both
+  values;
+- `0` unchanged, and a stack with no screen placing `1` and `2` as asked;
+- `create` placing a popup against the stack's own work area, through `dispatch`, with both bars
+  up;
 - the decoder handed a `3` it must refuse. A round trip through the encoder would never produce one.
 
 Docs: [`rsproto-surface-ops.md`](../spec/rsproto-surface-ops.md) (the aux16 word, and "not
@@ -192,18 +264,52 @@ The last is the serial's job (finding 6). A right press elsewhere in the same wi
 whichever event arrives first. **A window shows one menu at a time**: a context menu closes an open
 drop-down, and the other way round.
 
+**An open that fails is answered once.** `Child::open` returns `None` when:
+- the session already holds 64 windows;
+- a buffer cannot be had;
+- the content measures to nothing;
+- the compositor refuses the placement.
+
+Each copy the host replaces then logs and closes the application's menu state, and so does the
+host: the bar word goes dark, and nothing is asked again until the person asks again. Without
+that, `sync` would issue a `CreateWindow` on every pass of the loop, which in the terminal is every
+burst of output.
+
+**Clicking an open drop-down's own bar word may open it again** (found by this plan's review, and
+older than Part F). The press dismisses the menu, and the same click's release then reaches the word's
+`on_press`, which toggles it open. It needs the press and the release in different pumps, which a
+person's click usually is. **F.3 reproduces it in a boot first**: open File, then press and,
+100 ms later, release on File. If it reopens, the host fixes it. A `Dismissed` that closes a
+drop-down is remembered until every button is up, and that same gesture's toggle of the same menu
+does not reopen it.
+
 **The three applications' drop-downs move onto it**, and their main loops shrink by about what
 finding 4 counts. A context menu is then a second kind of request to the same host. The shell's
 `BarMenus` stays as it is, because it keys a filter field, resizes as you type, makes its windows
 sticky and logs as the manager. It is the host's next caller if the host grows those.
 
-**Tests**, with `libsurface`'s `MockTransport`:
+**What the tests run on.** `libui` takes `libsurface`, with its `mock` feature (F.2 exports the
+mock), and `libos`, with its `mock` feature, as dev-dependencies: a real `Child` allocates its
+buffers through libos. The failing cases run on `Counting`, the double `window.rs` already has,
+which refuses every request.
+
+**Tests:**
 - the host opens a menu when asked, and switches File to Edit by rebuilding the window, since a
   `Child`'s size is fixed when it opens;
 - it closes when nothing is wanted;
+- **one menu at a time**: a context menu asked for while a drop-down is up closes the drop-down,
+  and the other way round;
 - a `Dismissed` naming a replaced menu closes nothing, and one naming the menu on show closes it;
-- a key chooses the row the popup drew;
-- a context menu asks for placement `2` at its point;
+- **a right press elsewhere moves the menu in either order**: the press then the `Dismissed`, as
+  `libsurface` hands them out, through a real `Session` on the mock; and the `Dismissed` then the
+  press, as the wire carries them;
+- `Context::key`: Up and Down skip separators and disabled rows in both directions, Enter chooses
+  the row the popup drew, Enter with no row closes, Esc closes, and Left and Right do nothing;
+- **a failed open**, on `Counting`: one `CreateWindow`, the state closed, and a second `sync`
+  issues none;
+- a context menu asks for placement `2` at its point, and a drop-down for `1`;
+- if the bar word's reopening reproduced: a `Dismissed`, then the same gesture's release on that
+  word, leaves the menu closed, and a later click on the word opens it;
 - the popup's ink is painted and counted, since a widget can be present and draw nothing.
 
 `the_popup_diffs_from_one_highlight_to_the_next`, and each application's
@@ -214,10 +320,20 @@ and `check-login` open the drop-downs, at the places they log. Author.
 
 ### F.4 Files' menus
 
-**A right press on a row selects it**, as a press does, without counting toward a double click,
-and opens that row's menu at the press. `list_view` gives each row a context message beside
-`activate`'s. The library's other two callers, the chooser and the reference picture, pass none.
-**The listing's own `on_context` opens the folder's menu**; a row's, being nearer, shadows it.
+**A right press on a row opens that row's menu at the press, and is not `Msg::Press`.** That path
+reads the click run and its modifiers, which only a left press sets (finding 1), so it would open
+files and reshape ranges. Instead:
+- **On a row already selected or marked**, the selection and the marks stay, and the menu acts on
+  all of them, as Cut and Copy already do. So a right click inside a Ctrl- or Shift-picked set
+  copies the set.
+- **On any other row**, that row alone is selected and the marks are cleared, as a plain click
+  would. But the click run and its modifiers are neither read nor changed, so nothing opens and
+  no range moves.
+
+`list_view` gives each row a context message beside `activate`'s. The library's other two callers,
+the chooser and the reference picture, pass none. **The folder's menu hangs on the rows' area**, a
+row's `on_context` shadowing it as the nearer, and **not on `list_view`'s whole element**, which
+holds the scrollbar too.
 
 | Where | Rows |
 |---|---|
@@ -225,14 +341,31 @@ and opens that row's menu at the press. `list_view` gives each row a context mes
 | The listing's empty space | New File · New Folder · — · Paste · — · Show Hidden Files |
 | A drive in the sidebar | Open · Eject |
 
-**Every row is a message the window already sends, built by the same definition as the bar's
-row.** So its label, its chord and whether it is enabled cannot differ from the bar's: Delete in
-`deny`, Paste offered whatever is on the clipboard, Show Hidden Files marked. A context menu adds
-no action. The bar's tables keep their rows, since `check-login` aims at the File menu's by index.
-A place in the sidebar gets no menu: its one action is the press.
+**Every row sends a message the window already sends, and a row that is also on the bar is built
+by the bar row's definition.** So its label, its chord and whether it is enabled cannot differ
+from the bar's: Delete in `deny`, Paste offered whatever is on the clipboard, Show Hidden Files
+marked. **Three rows have no bar row** and so get a definition of their own: Open, which sends
+`Activate`, and a drive's Open and Eject, which send `Drive` with the row's key and its eject
+button's, as a press on either does. A context menu adds no action. The bar's tables keep their
+rows, since `check-login` aims at the File menu's by index. A place in the sidebar gets no menu:
+its one action is the press.
 
-**The Menu key and `Shift+F10`** open the selected row's menu at the row's bottom-left. With
-nothing selected, they open the folder's at the listing's top-left.
+**The Menu key and `Shift+F10`** open the selected row's menu at the row's bottom-left. **A selected
+row scrolled out of view is brought into view first**: `list_view` builds only the rows that fit,
+so there is nothing to hang the menu from until it is. The key makes the list follow its selection
+again (`ensure_visible`), and the menu opens on the next frame, at the row as it is then laid out.
+With nothing selected, they open the folder's menu at the listing's top-left.
+
+**Tests**, each failing without its change:
+- after a double click on one file, a right press on another opens nothing and selects it alone;
+- after a Shift range, a right press inside it keeps the range, and Copy copies every file in it;
+- after Ctrl marks, a right press on a marked row keeps the marks, and on an unmarked row clears
+  them;
+- a right press on a row opens the row's menu, and on the rows' empty space the folder's;
+- a right press on the scrollbar opens nothing;
+- the Menu key and `Shift+F10` open the selected row's menu at its bottom-left, and with the
+  selection scrolled away bring it into view first;
+- a row's label and availability equal the bar row's for every row the two share.
 
 **The gate**, `check-login`'s Files flow:
 - a right click on a file's row, then Properties: its dialog's lines, which the gate knows already;
@@ -247,16 +380,35 @@ Docs: `widget-toolkit.md` (`list_view`). Author; the menu tables can be the impl
 
 **The editor**: Undo · Redo · — · Cut · Copy · Paste · — · Select All. These are the Edit menu's
 rows, from the same definitions, so they are greyed while a field is open, as the bar's are.
-- `take_area_pointer` acts on a left press only.
-- A right press outside the selection places the caret. One inside the selection keeps it, so
-  Copy copies what was selected.
-- The Menu key and `Shift+F10` open the menu at the caret.
+
+**The menu opens from `take_area_pointer`, not from `on_context`** (finding 2). That is the one
+place that has both the press, with its point and its button, and the font that turns the point
+into a line and a column. For a right press, it:
+1. finds the line and column under the press;
+2. keeps the selection if that position is inside it, or places the caret there if not, dropping
+   the selection;
+3. asks for the menu at the press, the area's origin added back to make the point window-local.
+
+So the menu's rows read the selection as it stands after the press: Cut never removes text away
+from the click. A left press is handled as today, and a middle press does nothing. The text area
+takes no `on_context`. The Menu key and `Shift+F10` open the menu at the caret, the bottom-left of
+its cell.
 
 **The terminal**: Copy · Paste · — · Select All · — · Find · Clear Scrollback. These are the Edit
 menu's rows, Copy enabled only with a selection. Clear and Reset stay on the bar only.
-- A right press keeps the selection: the grid already ignores every button but the left.
+- **The menu opens from the grid's own pointer handler**, which already sees every press. A right
+  press keeps the selection and asks for the menu at the press, the grid's origin added back.
 - The Menu key and `Shift+F10` open the menu at the cursor's cell. A program in the terminal no
   longer receives `Shift+F10`, as in GNOME Terminal.
+
+**Tests**, each failing without its change:
+- the editor: a right press inside a selection keeps it and opens the menu; outside, it places the
+  caret, drops the selection, then opens; Cut after either acts on what the menu showed;
+- the editor: a left press is unchanged, and a middle press moves nothing;
+- the editor: with a field open, the menu's rows are greyed as the bar's are;
+- both: the Menu key and `Shift+F10` open the menu at the caret's or the cursor's cell;
+- the terminal: a right press keeps the selection and opens the menu at the press;
+- the terminal: `Shift+F10` reaches no program, and every other F-key still does.
 
 **The gates:**
 - `check-terminal`: a right click on a selection, then Copy; a second right click, then Paste. The

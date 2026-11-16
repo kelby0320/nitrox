@@ -38388,15 +38388,29 @@ on `pre-phase-7/part-f-detail`, measured on `main` at `11a08e2d`.
 - **A menu opens on the right press** (the maintainer's call). The compositor's grab sends the
   release to the window that took the press, so the release cannot choose a row.
 - **One menu window in the toolkit.** `nxterm`, `nxedit` and `nxfiles` each carry 80 to 125 lines
-  that open, switch, close and route their drop-down's popup, and every main loop Part F touches is
-  at its size entry. `libui::menu::Host` takes over that work, for drop-downs and context menus
-  alike. A `Dismissed` closes only the menu its window showed, as nothing promises whether it or
-  the press that caused it arrives first.
+  that open, switch, close and route their drop-down's popup, and most files Part F would grow are
+  at their size entries: Files' `main.rs` and `app.rs`, the editor's and the terminal's `lib.rs`.
+  `libui::menu::Host` takes over that work, for drop-downs and context menus alike. A `Dismissed`
+  closes only the menu its window showed: the wire carries it before the press that caused it,
+  and `libsurface` hands the press out first.
 - **No desktop menu and no window menu yet** (the maintainer's calls). A desktop menu would hold
   wallpaper settings and the desktop's own context, a new file or folder or a terminal opened
   there, none of which exists yet. `TODO(desktop-menu)` and `TODO(window-menu)` are written with
   F.1.
-- **Every row of a context menu is an action its window already has**, built by the same definition
-  as the bar's row, so label, chord and availability cannot drift. Part F adds no action.
-- **Miri runs at Part F's end**, on the userspace targets: Part F changes no kernel code, and the
-  kernel's tests ran clean under Miri at Part E's end.
+- **Every row of a context menu sends a message its window already sends**, and a row that is
+  also on the bar is built by the bar row's definition, so label, chord and availability cannot
+  drift. Files' Open and a drive's Open and Eject have no bar row. Part F adds no action.
+- **Miri runs at Part F's end**, without the kernel, which Part F does not change: the job's
+  targets Part F changes, and `libui` by name, as the job leaves it out. The three applications
+  stay out, as the job has them, so their menus never run under Miri.
+- **After review**, the plan says where each piece lands and what moves first.
+  - **The screen reaches the compositor's `create`** through `WindowStack::new().on_screen(..)`,
+    after its tests and cursor code leave `lib.rs`.
+  - **The editor's menu opens from `take_area_pointer`**, the one place with both the press and
+    the font.
+  - **A right press in Files is not `Msg::Press`.** A probe showed that path open a file after a
+    double click, which a right click on `main` does today.
+  - **`on_context` fires only on a press that opens a capture.**
+  - **`ScrollGrab` takes a left press only.**
+  - **A failed open is answered once.**
+  - **`libsurface`'s mock is exported for `libui`'s tests.**
