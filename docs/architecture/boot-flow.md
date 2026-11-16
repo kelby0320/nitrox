@@ -303,10 +303,10 @@ construct:
   of § 3).
 - Make the **power node** — the capability to stop the machine, a char `DeviceNode` — and a handle
   to it with `WRITE` and `INSPECT` and neither `DUPLICATE` nor `TRANSFER` (administration Part
-  E.3, [`power.md`](power.md); a `SystemControl` object until 2026-11-15).
+  E.3, [`power.md`](power.md)).
 - Make the **clock node** — the capability to set the wall clock, a char `DeviceNode` — and a
   handle to it with `WRITE`, `INSPECT`, `TRANSFER` and `DUPLICATE` (`kernel/src/clock.rs`;
-  [`io-operation.md`](../spec/io-operation.md); a `SYSTEM_CLOCK` syscap on `sys_clock_set` until 2026-11-15).
+  [`io-operation.md`](../spec/io-operation.md)).
 - Spawn with exactly four handles — the notification channel in `rdi`, the namespace root in
   `rsi`, the power node in `rdx`, and the clock node in `rcx`.
 

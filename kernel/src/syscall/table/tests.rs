@@ -8,6 +8,7 @@ use crate::object::Process;
 
 mod acting;
 mod installs;
+mod numbers;
 mod object_casts;
 
 /// **A block map the page cache cannot use is refused**, each bound at the values either
@@ -73,19 +74,6 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
     let mut claims_more = body(512, &[(0, 2048, 8)]);
     claims_more[12..16].copy_from_slice(&200_000u32.to_le_bytes());
     assert_eq!(block_map(&claims_more).err(), Some(KError::KernelError), "a count past the body");
-}
-
-#[test]
-fn unknown_number_is_unsupported() {
-    assert_eq!(dispatch(0xDEAD, 0, 0, 0, 0, 0, 0), KError::Unsupported.as_isize());
-}
-
-#[test]
-fn a_removed_number_is_unsupported_before_it_reads_an_argument() {
-    for removed in [18, 26, 27, 29, 31, 32, 33, 34, 35, 37, 38, 39, 40, 41] {
-        let refused = dispatch(removed, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
-        assert_eq!(refused, KError::Unsupported.as_isize(), "number {removed}");
-    }
 }
 
 #[test]

@@ -202,7 +202,7 @@ mod tests {
 
     const SAMPLE: &str = "boot\nSCDUMP spawn pid=4 seq=0\nSC seq=0 pid=4 name=nxsh total=3 10:2 15:1\nSCEND seq=0\n\
                           noise SCDUMP exit pid=9 seq=1\nSC seq=1 pid=9 name=- total=5 0:1 10:4\n\
-                          SC seq=1 pid=3 name=fs-server total=7 28:7\nSC seq=1 pid=4 name=nxsh total=1 kprint:1\n\
+                          SC seq=1 pid=3 name=fs-server total=7 27:7\nSC seq=1 pid=4 name=nxsh total=1 kprint:1\n\
                           SCEND seq=1\n";
 
     #[test]
@@ -212,7 +212,7 @@ mod tests {
         assert_eq!((d[0].exit, d[0].who, d[0].at), (false, 4, 5));
         assert_eq!((d[1].exit, d[1].who, d[1].seq, d[1].rows.len()), (true, 9, 1, 3));
         assert!(SAMPLE[d[1].at..].starts_with("SCDUMP exit"));
-        assert_eq!(d[1].rows[1], Row { pid: 3, name: FS_SERVER.into(), counts: [("28".into(), 7)].into() });
+        assert_eq!(d[1].rows[1], Row { pid: 3, name: FS_SERVER.into(), counts: [("27".into(), 7)].into() });
     }
 
     #[test]
@@ -223,7 +223,7 @@ mod tests {
         assert!(r.contains("| `whoami` | 5 | 7 |"), "{r}");
         assert!(!r.contains("`list .`"), "no program ran");
         assert!(r.contains("The session's 16 calls"), "{r}");
-        assert!(r.contains("wait") && r.contains("#28") && r.contains("debug_kprint"), "{r}");
+        assert!(r.contains("wait") && r.contains("#27") && r.contains("debug_kprint"), "{r}");
     }
 
     /// **Two dumps at once, and another CPU's line between rows**: each row goes to the dump its
@@ -255,8 +255,8 @@ mod tests {
     #[test]
     fn the_names_come_from_libkern_and_the_kernels_two_are_its_own() {
         let n = names(&fs::read_to_string(repo_root().join("userspace/libkern/src/syscall.rs")).unwrap());
-        assert_eq!(n["10"], "wait");
+        assert_eq!((n["10"].as_str(), n["27"].as_str()), ("wait", "io_submit"));
         assert_eq!((n["kprint"].as_str(), n["other"].as_str()), ("debug_kprint", "other"));
-        assert!(!n.contains_key("42"), "no number past the last is named");
+        assert!(!n.contains_key("28"), "no number from `SYSCALLS` on is named");
     }
 }

@@ -42,15 +42,9 @@ pub(super) fn file_io(m: &mut Mock, file: u64, op: &IoOp) -> i64 {
     let (from, from_at, to, to_at) =
         if read { (f, op.offset, b, op.buf_offset) } else { (b, op.buf_offset, f, op.offset) };
     let mut bytes = vec![0; n];
-    for (k, byte) in bytes.iter_mut().enumerate() {
-        let at = from_at as usize + k;
-        *byte = pages(&m.objects[from]).0.get(at / PAGE).map_or(0, |page| page.0[at % PAGE]);
-    }
+    pages(&m.objects[from]).read(from_at as usize, &mut bytes);
     if let Object::Memory(p) | Object::File { bytes: p, .. } = &mut m.objects[to] {
-        for (k, &byte) in bytes.iter().enumerate() {
-            let at = to_at as usize + k;
-            p.0[at / PAGE].0[at % PAGE] = byte;
-        }
+        p.write(to_at as usize, &bytes);
     }
     let never = read && m.reads_never;
     let short = if read { core::mem::take(&mut m.read_short) } else { 0 };
@@ -79,7 +73,7 @@ pub(super) fn entropy_read(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
         Ok(_) => return e(KError::InvalidArgument),
         Err(r) => return r,
     };
-    let room = pages(&m.objects[b]).0.len() * PAGE;
+    let room = pages(&m.objects[b]).len();
     if op.flags != 0 || op.buf_offset.checked_add(op.length).is_none_or(|end| end > room as u64) {
         return e(KError::InvalidArgument);
     }
@@ -93,10 +87,8 @@ pub(super) fn entropy_read(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     }
     let n = op.length.min(256) as usize;
     if let Object::Memory(p) = &mut m.objects[b] {
-        for k in 0..n {
-            let at = op.buf_offset as usize + k;
-            p.0[at / PAGE].0[at % PAGE] = (k as u8).wrapping_mul(37).wrapping_add(11);
-        }
+        let bytes: Vec<u8> = (0..n).map(|k| (k as u8).wrapping_mul(37).wrapping_add(11)).collect();
+        p.write(op.buf_offset as usize, &bytes);
     }
     m.po(Po { ready: true, never: false, status: 0, result: n as u64, lookup: None })
 }
@@ -112,7 +104,7 @@ pub(super) fn power_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
         Err(r) => return r,
     };
     let at = op.buf_offset as usize;
-    let byte = pages(&m.objects[b]).0.get(at / PAGE).map(|page| page.0[at % PAGE]);
+    let byte = pages(&m.objects[b]).get(at);
     match byte.map(u64::from).filter(|_| op.length == 1) {
         Some(stop) if stop == libkern::POWER_HALT || stop == libkern::POWER_REBOOT => panic!("power({stop})"),
         _ => e(KError::InvalidArgument),
@@ -144,7 +136,7 @@ pub(super) fn clock_write(m: &mut Mock, h: u64, op: &IoOp) -> i64 {
     }
     let at = op.buf_offset as usize;
     let pages = pages(&m.objects[b]);
-    let bytes: Vec<u8> = (at..at + 8).filter_map(|i| pages.0.get(i / PAGE).map(|page| page.0[i % PAGE])).collect();
+    let bytes: Vec<u8> = (at..at + 8).filter_map(|i| pages.get(i)).collect();
     let Ok(bytes) = <[u8; 8]>::try_from(bytes.as_slice()) else { return e(KError::InvalidArgument) };
     let ns = u64::from_le_bytes(bytes);
     if !(Y2000..Y2100).contains(&ns) {

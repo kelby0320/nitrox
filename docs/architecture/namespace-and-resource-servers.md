@@ -342,8 +342,8 @@ filesystem at `/` and so confines nothing to begin with. The kernel test
 `unbinding_a_narrower_binding_in_a_copy_exposes_the_broader_one`
 (`kernel/src/object/namespace.rs`) pins the behaviour.
 
-**Copying a namespace** (`sys_ns_create(from)`; `sys_ns_derive` until 2026-11-13) copies every
-binding of one the caller can `LOOKUP` into a new namespace it holds with full rights. The copy is a
+**Copying a namespace** (`sys_ns_create(from)`) copies every binding of one the caller can
+`LOOKUP` into a new namespace it holds with full rights. The copy is a
 **snapshot** — the targets are shared (a registration stays alive while either binds it), but a
 later bind or unbind in one does not reach the other — so a copy can be sent, pruned, or have
 bindings added by a holder of `BIND_NAMESPACE`, and the source is untouched. It exists for the view
@@ -676,7 +676,7 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
   `path`, requesting at most `rights`; the PO completes with the resolved handle
   (`IoResult.result`) or an error (`IoResult.status`). Needs `LOOKUP`.
 
-Numbers `22`–`25` and `30` (`sys_ns_enumerate`); pre-stabilization.
+Their numbers are in [`syscall-abi.md`](../spec/syscall-abi.md#syscall-numbering); pre-stabilization.
 
 ## Scope summary
 

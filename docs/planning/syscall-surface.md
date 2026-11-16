@@ -852,6 +852,62 @@ every removed name across those finds nothing.** It also takes `release_initramf
 `exception_extend_timeout` out of `syscall-abi.md`, `overview.md`, `notifications.md`, `syscaps.md`
 and `init`'s `CLAUDE.md`. The implementer; `/pr-review`.
 
+**Built 2026-11-15** (`ee948649` the numbers; `8e35260f` the docs).
+- **The numbers are `0` to `27`, dense and in family order**, the order "What stays" lists. Four
+  move: `process_terminate` 36 to 17, beside `process_exit`; `thread_exit` 17 to 18;
+  `ns_enumerate` 30 to 26; `io_submit` 28 to 27. **`SYSCALLS` (28)**, in the kernel and `libkern`
+  both, is how many, so `abi-sync-check` holds it as it does each number; the counters size their
+  table by it, and every number from it on answers `Unsupported`. A host test pins the family
+  order and the density.
+- **The docs that describe today name no removed call**: the grep of every removed name across
+  `spec/`, `architecture/`, `reference/`, `conventions/` and `init`'s `CLAUDE.md` finds nothing,
+  and the same pattern finds 116 lines in the decision log. `release_initramfs` and
+  `exception_extend_timeout` are gone from the five docs. `scheduler.md` no longer describes
+  `thread_set_affinity` as present. The renumbering is mine, an ABI change; the docs were
+  delegated, and I read the diff.
+- **A check beyond the plan's**: its grep of removed *names* cannot see a moved *number*, and
+  `syscall-abi.md` states each call's in a sentence after its block, which `check-docs` does not
+  read; four were stale. A script checks each "Syscall number" sentence against the call it
+  follows, and all eighteen agree.
+- **The controls**: two numbers swapped fail the family-order test; a vacant number served fails
+  the past-the-last test; a slot past the last fails the counters'; `SYSCALLS` changed on one
+  side fails `abi-sync-check`; a number wrong in the table fails `check-docs`.
+
+4,498 host tests; **all 19 CI gates pass under KVM**.
+
+**The whole suite under Miri, Part E's end** (2026-11-15, at `73a20a63`): every target
+`cargo xtask miri` lists under Stacked Borrows, in 2 hours 9 minutes, and the kernel and `libos`
+under Tree Borrows as well, the kernel in 1 hour 54.
+- **One undefined behaviour, in `libos`'s model of the kernel, not in what it models.** The model
+  kept an object's pages in a `Box`, gave out their address for a mapping, then wrote through a
+  fresh `&mut` on the box, which retires that address: the entropy source, mapping its page once
+  and reading it many times, was the first test to read a mapping after a write. Miri stops at the
+  first, so 111 of `libos`'s tests had not run. `Pages` now keeps the box's raw pointer for its
+  life and is reached only through it (`277a08a2`), and all 127 pass in both models.
+- **A byte loop that read as a hang**: E.8's spawn-image test, added after Part J's run, reads a
+  4 MiB image through the model, which copied it a byte at a time, for hours. One copy makes it
+  seconds.
+- **The kernel's 1,333 tests pass in both models**, nine ignored with their reasons, **and the 32
+  other userspace targets' 1,805 under Stacked Borrows**, thirteen ignored with theirs.
+- **Its integer-to-pointer casts are the 38 Part J left**, at the same sites in both models, each
+  found at `ab0319e7`: Part E adds none. The one in userspace, `libos`'s mapping, is an address
+  the kernel answers.
+
+**After review** (`c38d4829`):
+- **`check-docs` reads every syscall number the docs state in prose**: each "Syscall number"
+  sentence against the call above it, and each `sys_name = N` or `sys_name` (`N`) against the table.
+  The I/O core's intro still said 28 for `sys_io_submit`, a form the one-off script never read, and
+  two architecture docs restated ranges, which now point at the table.
+- **`abi-sync-check` reads a family both ways under its closed prefix**, so a `SYS_` name only
+  `libkern` keeps is a finding, where a stale one would reach whatever takes its number next.
+- **Every number below `SYSCALLS` reaches a call**, each refusing its own arguments with an error
+  other than `Unsupported`, and a vacant number answers `Unsupported` to every call's arguments.
+- **The debug calls are the exception** to "every other number answers `Unsupported`";
+  `sys_thread_set_tls` and the ring's two calls are marked not built; and `shell-language.md` says
+  `sys_process_terminate` exists.
+
+**Part E's condition is met**: E.11 built, and the whole suite's Miri run at its end triaged.
+
 ### What this part does not do
 
 No new call for speed, and no ring. No page-cache reclaim beyond `IO_NOCACHE`: the clock algorithm

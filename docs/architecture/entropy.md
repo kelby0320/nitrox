@@ -18,13 +18,11 @@ this is the *why* and the *shape*. The original sketch is
 > **Implementation phasing.** The subsystem landed across **Phase 2 slice 2** and one consumer
 > in slice 3:
 > - **Slice 2:** the ChaCha20 CSPRNG, the hardware-RNG arch interface, the entropy pool + boot
->   seeding + interrupt-jitter mixing + periodic reseed, and an `EntropyObject` with the
->   `sys_entropy_create` / `sys_entropy_read` syscalls. The kernel's own PRNGs (handle-table
+>   seeding + interrupt-jitter mixing + periodic reseed. The kernel's own PRNGs (handle-table
 >   shuffle; later ASLR) re-seed from it.
 > - **Slice 3:** the `/dev/entropy` binding.
 >
-> On 2026-11-13 the slice-3 binding became the char node: `EntropyObject` and both syscalls were
-> removed, and `/dev/entropy` is read with `sys_io_submit`. The sections below mark which wave a
+> `/dev/entropy` is a char node, read with `sys_io_submit`. The sections below mark which wave a
 > feature belongs to.
 
 ## Goals and non-goals
@@ -182,9 +180,6 @@ resolves `/dev/entropy` in the namespace the caller passes, `fill` waits for the
 reads again as needed, and `try_fill` is refused `WouldBlock` before the seeding, for a caller
 that cannot wait. libos holds no namespace of its own.
 
-Until 2026-11-13 the generator was an `EntropyObject` handle from `sys_entropy_create` (`26`),
-read with `sys_entropy_read` (`27`); both numbers are now vacant.
-
 ## Lock discipline (slice 2)
 
 Sampling runs in **interrupt context** (timer tick + device IRQs), so the pool's
@@ -214,7 +209,6 @@ when the code lands (Part C).
 | Item | Slice |
 |---|---|
 | CSPRNG + pool + sources + seeding + reseed | **2** |
-| `EntropyObject` + `sys_entropy_create`/`sys_entropy_read` (removed 2026-11-13) | **2** |
 | `/dev/entropy` binding via the kernel server | **3** |
 | `/dev/entropy` as a char `DeviceNode`, read with `sys_io_submit` | 2026-11-13 |
 

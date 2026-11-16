@@ -50,7 +50,6 @@ resource-agnostic so future resource kinds (char devices, sockets) reuse them.
 
 **Nothing cancels an operation once it is submitted** (`io-cancel` in
 `deferred-decisions.md`): a waiter may give up its wait, and the operation runs to its end.
-`sys_io_cancel`, which only ever answered `Unsupported`, went on 2026-11-13.
 
 ## Layout
 

@@ -38342,3 +38342,29 @@ E.9 merged, #442. E.10, `syscall-surface.md` § E.10, built on `pre-phase-7/part
   the clock's moves, the act's call site and init's kept power node are host-tested, and
   `abi-sync-check` pairs the syscap bits.
 
+## 2026-11-15 — Before Phase 7, E.11: the numbers, and the record
+
+E.10 merged, #443. E.11, `syscall-surface.md` § E.11, built on `pre-phase-7/part-e11-numbers`.
+
+- **The syscall numbers are `0` to `27`, dense and in family order** (`ee948649`): the handles,
+  memory, the clock and timers, waits and notifications, the channels, processes and threads,
+  namespaces, and I/O. Four move: `process_terminate` 36 to 17, `thread_exit` 17 to 18,
+  `ns_enumerate` 30 to 26, `io_submit` 28 to 27. **`SYSCALLS` (28)** names how many on both
+  sides, held by `abi-sync-check`; every number from it on answers `Unsupported`. Numbers are no
+  ABI-hash input, and every caller names them through `libkern`.
+- **The docs that describe today name no removed call** (`8e35260f`): the removed calls and
+  objects were kept there as asides, and go, the history being here; `release_initramfs` and
+  `exception_extend_timeout`, never built, leave the design.
+- **The whole suite under Miri, at Part E's end, finds one undefined behaviour, in `libos`'s model
+  of the kernel**: it gave out a `Box`'s address for a mapping, then wrote through a fresh `&mut`
+  on the box, retiring that address. Its pages are now reached only through the box's raw pointer
+  (`277a08a2`), and the model copies a range at once, as a byte loop held a spawn-image test for
+  hours. The kernel's 1,333 tests pass in both models, `libos`'s 127 too, and the other userspace
+  targets' 1,805 under Stacked Borrows. Its casts are Part J's 38: Part E adds none. **Part E's
+  condition is met.**
+- After review (`c38d4829`), **`check-docs` reads every syscall number the docs state in prose**,
+  where a sentence the renumbering missed still gave `sys_io_submit` 28, and **`abi-sync-check`
+  reads the syscall family both ways**, so a name only `libkern` keeps is a finding. Every number
+  below `SYSCALLS` is tested to reach a call, and every vacant one to answer `Unsupported` to each
+  call's arguments.
+

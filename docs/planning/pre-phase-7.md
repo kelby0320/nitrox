@@ -14,7 +14,7 @@ Part J added for the kernel layers it plans (the maintainer's call); Part I's it
 fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-02; E.1 to E.5
 built by 2026-11-05; Part J detailed 2026-11-05, J.1 to J.5 built 2026-11-06, J.6 to J.8 2026-11-10,
 J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6 to E.9 built
-2026-11-13, and E.10 2026-11-15.** Each later
+2026-11-13, E.10 and E.11 2026-11-15, and the whole suite under Miri the same day.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
 the syscall-surface consolidation, planned separately in
@@ -1038,9 +1038,12 @@ carries its operation, and a flush answers through a PO. **E.8 built 2026-11-13*
 resources, a copy bounded by the wire rather than memory, and spawn from memory alone. **E.9
 built 2026-11-13**: entropy a char node every namespace binds, the namespace calls folded, and
 the two unused calls gone. **E.10 built 2026-11-15**: one authority model, the stop and the clock
-set each a `Write` to a node. **The whole
+set each a `Write` to a node. **E.11 built 2026-11-15**: the numbers dense and in family order,
+and the docs that describe today naming no removed call. **The whole
 suite runs under Miri at Part E's end**, after E.11, and no sub-part runs it before (the
-maintainer's call, 2026-11-13).
+maintainer's call, 2026-11-13). **It ran 2026-11-15**: one undefined behaviour, in `libos`'s model
+of the kernel, fixed, and its casts Part J's 38: **Part E's condition is met**
+([`syscall-surface.md`](syscall-surface.md) § E.11).
 
 **With it, four of the bash's findings** ([`bug-bash.md`](bug-bash.md)): `sys_file_sync`'s name and
 lookup binding it to files (kmem-30), and three in the memory-mapping path that Phase 7's threads

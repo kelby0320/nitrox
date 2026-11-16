@@ -56,7 +56,6 @@ SMP is a **complete stub**:
   under SMP").
 - The local APIC runs in **xAPIC (MMIO)** mode (`arch/x86_64/apic.rs`); `send_ipi` and
   TLB shootdown do not exist. `flush_tlb_page` / `flush_tlb_all` are **local-only**.
-- `sys_thread_set_affinity` is a validating **no-op** (`syscall/table.rs:384`).
 
 The good news: the spinlocks are already **SMP-correct** (atomic CAS,
 `spinlock.rs:72`), so the locking substrate carries over unchanged. The single-CPU
@@ -219,11 +218,10 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 - **Affinity placement on wake**: a woken thread is enqueued on a CPU permitted by its
   affinity mask, preferring its last CPU (cache warmth) then the least-loaded
   permitted CPU.
-- **`sys_thread_set_affinity`** becomes functional (replaces the `table.rs:384`
-  no-op); it went on 2026-11-13, having no caller, so a thread's mask is set when it is
-  made (`thread-affinity`), and `sys_thread_create` validates it the same way. Validation as implemented (corrected 2026-07-21, review F9): the mask is
-  clamped to `MAX_CPUS` bits and rejected only if empty — it is **not** checked
-  against the *online* set, so a mask naming only offline CPUs is accepted.
+- **A thread's mask** is set when it is made and nothing changes it after
+  (`thread-affinity`); `sys_thread_create` validates it. Validation as implemented (corrected
+  2026-07-21, review F9): the mask is clamped to `MAX_CPUS` bits and rejected only if empty —
+  it is **not** checked against the *online* set, so a mask naming only offline CPUs is accepted.
   Placement then falls back to **the least-loaded CPU that accepts work**, outside
   the requested affinity, rather than stranding the thread (corrected 2026-08-14).
   It fell back to *CPU 0 unconditionally* until then, which was a hang rather than a
@@ -262,7 +260,7 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 | **0** | This doc + the **per-CPU substrate**: `CPU0`→`CPUS[N]`, GS-based per-CPU block, neutral `current_cpu()` (RDTSCP), per-CPU scheduler `current`/`idle`, and lifting the ctx-0 handle grace-period shim. **Still single-CPU; no APs, no x2APIC, no IPIs.** | Boots exactly as today on the current QEMU; host tests for the per-CPU structures. |
 | **1** ✅ | **SMP bring-up** *(landed; correctness items → slice 3)*: Limine AP startup; per-CPU GDT/TSS + shared IDT; **x2APIC** (MSR accessors + single-`WRMSR` IPI); per-CPU timer; APs run a per-CPU idle thread and pull from the **shared** global runqueue. Fixed a per-CPU `reap` UAF. **Deferred to slice 3:** TLB shootdown + `active_cpus`, and **user-thread-migration safety**. | `-smp 4`: 4 CPUs online, APs executing, full userspace boot clean 6/6. |
 | **2** ✅ | **Scheduler classes** *(landed)*: `SchedClass` RealTime/TimeShared/Idle + `rt_priority`/`nice`/`vruntime` on `Thread`; class-aware `dequeue_front` (policy scan over the shared `ready`); CFS-like vruntime (nice-weight table + `min_vruntime` floor/wake-boost); kernel-thread `spawn_with_class`. **Wired in the SysCaps slice (6):** the `REAL_TIME` gate + the user-facing `ThreadArgs` class/nice/affinity ABI — `sys_thread_create` now reads them and gates the RealTime class on the `REAL_TIME` syscap (see `docs/architecture/syscaps.md`). | `sched_class_demo`: RealTime finishes before any TimeShared round; nice-0 outpaces nice-10. |
-| **3** ✅ | **Per-CPU runqueues + work stealing + affinity** *(landed)*: `ready`/`min_vruntime` per-CPU (one `SCHED` lock); placement (kernel → least-loaded, wake → home CPU); idle-CPU work stealing; `cpu_mask` affinity + functional `sys_thread_set_affinity`; online CPUs tracked by a `cpu_online[]` mask; `has_live_siblings` scans other CPUs' `current[]`. **User threads were pinned to their creating CPU here** (structurally dodging the migration hazards) — lifted in 3b. | distribution demo → all APs (`0b1111`); affinity demo → each worker on its pinned CPU; `-smp 4` 12/12 clean. |
+| **3** ✅ | **Per-CPU runqueues + work stealing + affinity** *(landed)*: `ready`/`min_vruntime` per-CPU (one `SCHED` lock); placement (kernel → least-loaded, wake → home CPU); idle-CPU work stealing; `cpu_mask` affinity (fixed when the thread is made); online CPUs tracked by a `cpu_online[]` mask; `has_live_siblings` scans other CPUs' `current[]`. **User threads were pinned to their creating CPU here** (structurally dodging the migration hazards) — lifted in 3b. | distribution demo → all APs (`0b1111`); affinity demo → each worker on its pinned CPU; `-smp 4` 12/12 clean. |
 | **3b** ✅ | **SMP correctness completion** *(landed 2026-07-01)*: TLB shootdown (broadcast IPI + synchronous ack) for the shared kernel vmap; the migration hazards root-caused and fixed (SCE re-arm at descent, APIC-id dense index, the **`on_cpu` switch-out-race guard**, and the misplaced-`init_this_cpu` dense-index collision), so **user threads distribute across and migrate between CPUs**. See [smp.md](smp.md) for the full mechanics + bug postmortem. **Deferred** (no consumer yet): cross-CPU deschedule IPI + per-`AddressSpace` `active_cpus`, which land with the first multi-threaded user process. (The deschedule came with a process's exit, 2026-10-25: [smp.md](smp.md) § Deferred.) | `-smp 4` KVM boot-loop 0/150 with userspace on the APs; scripted `eshell` stress 50/50 clean. |
 
 ### Slice 0 in detail
@@ -399,8 +397,7 @@ than slots, and a give-back of slots never promised.
   frequency (e.g. 1000 Hz) is the cheap stopgap, trading steady IRQ overhead for
   granularity.
 - **Post-spawn class / priority change syscall** — class, nice, and affinity are set at
-  spawn via `ThreadArgs`, and since `sys_thread_set_affinity` went (2026-11-13,
-  `thread-affinity`) none changes after. A `renice`-style
+  spawn via `ThreadArgs`, and none changes after (`thread-affinity`). A `renice`-style
   `sys_thread_set_priority` / `sys_thread_set_class` for changing class or nice *after*
   spawn (e.g. a shell `renice`, a supervisor retuning a service, a thread self-elevating
   to RealTime) is a real but non-urgent case — added when a consumer needs it.

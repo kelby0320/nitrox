@@ -547,8 +547,8 @@ syscalls while migratable.
   cores instead of broadcasting to all online cores. A correctness-neutral
   optimization; broadcast-to-all is already correct.
 - **Active migration on an affinity change** — nothing changes a thread's affinity after
-  it is made since `sys_thread_set_affinity` went (2026-11-13, `thread-affinity`); one that
-  excluded a thread's current core would not forcibly migrate it mid-slice.
+  it is made (`thread-affinity`); a change that excluded a thread's current core would not
+  forcibly migrate it mid-slice.
 - **SMP panic path** (review F8, 2026-07-21) — **half resolved 2026-08-19.** A panicking or
 faulting CPU now *does* stop the others: `Cpu::stop_the_machine` sends an **NMI** to every
 online CPU and they halt without dumping (NMI rather than a fixed vector because the CPUs most

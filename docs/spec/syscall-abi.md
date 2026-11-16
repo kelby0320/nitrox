@@ -66,9 +66,14 @@ A page of the user buffer not yet faulted in is served where nothing has to wait
 
 ## Syscall numbering
 
-Syscall numbers are not yet stabilized. The current convention is sequential allocation in `kernel/src/syscall/table.rs`, with stable assignments to be made before the v1.0 ABI freeze. Userspace code should reference syscalls by name through `libkern`, not by number.
+Syscall numbers are not yet stabilized; stable assignments are made before the v1.0 ABI freeze.
+Userspace code references syscalls by name through `libkern`, not by number, and both copies are
+held equal by `cargo xtask abi-sync-check`.
 
-The first stable numbers, allocated sequentially from `0`, are the handle operations:
+**The numbers are `0` to `27`, dense and in family order**: the handles, memory, the clock and
+timers, waits and notifications, the channels, processes and threads, namespaces, and I/O.
+`SYSCALLS` (`28`) is how many there are, and **every other number below the debug calls'
+(§ *Debug syscalls*) answers `Unsupported`**, as one past the last does:
 
 | Number | Syscall |
 |---|---|
@@ -89,7 +94,8 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `14` | `sys_channel_recv` |
 | `15` | `sys_process_spawn` |
 | `16` | `sys_process_exit` |
-| `17` | `sys_thread_exit` |
+| `17` | `sys_process_terminate` |
+| `18` | `sys_thread_exit` |
 | `19` | `sys_thread_create` |
 | `20` | `sys_thread_get_registers` |
 | `21` | `sys_exception_resume` |
@@ -97,18 +103,10 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `23` | `sys_ns_lookup` |
 | `24` | `sys_ns_bind` |
 | `25` | `sys_ns_unbind` |
-| `28` | `sys_io_submit` |
-| `30` | `sys_ns_enumerate` |
-| `36` | `sys_process_terminate` |
+| `26` | `sys_ns_enumerate` |
+| `27` | `sys_io_submit` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. **Fourteen are
-vacant**, and answer `Unsupported`, as any number nothing holds does, until they are assigned
-again: `31` to `35`, `38` and `39` went when a resolve came to carry its operation and a file's
-flush became an `io_submit` (pre-Phase-7 E.7); `18` (`thread_set_affinity`) and `29`
-(`io_cancel`) went for want of a caller, `26` and `27` (`entropy_create`, `entropy_read`) when
-entropy became a char node, and `37` (`ns_derive`) when `ns_create` came to copy (E.9); `40` (`power`) when the power node
-came to take a one-byte write, and `41` (`clock_set`) when the clock became a node (both
-2026-11-15).
+A new syscall takes the next number, `SYSCALLS`, and `SYSCALLS` moves past it.
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -121,7 +119,7 @@ A small set of **debug-only** syscalls exists to bootstrap and exercise the kern
 
   **It does not diverge, and a caller must not assume it does.** Only `cargo xtask test-qemu` attaches the device; `check-input`, `check-display`, `check-terminal` and `test-interactive` boot the same `test-harness` image without it, because they need the guest alive afterwards. With no device the port write is ignored and the syscall **returns `Unsupported`** — the same answer a production kernel gives, which is the point: one code, one meaning. So `Unsupported` means "no verdict was delivered", never "your kernel is the wrong build". Writing a `-> !` helper around this and falling off its end is undefined behaviour on four of the five gates; the earlier `-> !` in this entry was wrong (corrected 2026-08-13, see the decision log).
 
-(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (17); its number is left vacant — `sys_test_exit` deliberately takes the next one to avoid conflation.)
+(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (18); its number is left vacant — `sys_test_exit` deliberately takes the next one to avoid conflation.)
 
 ## The complete syscall set
 
@@ -178,8 +176,8 @@ layout assertions, which is why the drift was invisible.
 ### I/O Core
 
 The system's single generic asynchronous-I/O entry point; full descriptor and
-semantics in [`io-operation.md`](io-operation.md). Syscall numbers:
-`sys_io_submit = 28` (introduced with the storage slice, Phase 2 slice 5).
+semantics in [`io-operation.md`](io-operation.md). Syscall number:
+`sys_io_submit = 27` (introduced with the storage slice, Phase 2 slice 5).
 
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
@@ -203,11 +201,10 @@ request returns a **pre-signalled** PO, so callers have one code path.
 `resource`, malformed/misaligned `IoOp`, an unusable `buffer`, PO/handle
 exhaustion) return a negative `KError` **synchronously**, with no PO created;
 *device/medium* failures are delivered **through the PO** — the same split as the
-namespace lookup. (Syscall number `28`.)
+namespace lookup. (Syscall number `27`.)
 
 **Nothing cancels an operation once it is submitted** (`TODO(io-cancel)`): a waiter may give up
-its wait, and the operation runs to its end. `sys_io_cancel` (`29`), which only ever answered
-`Unsupported`, went on 2026-11-13, to come back with IRP cancellation and a caller.
+its wait, and the operation runs to its end.
 
 ```rust
 fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>, count: u64) -> isize
@@ -224,7 +221,7 @@ listing may shift what follows, and each is written whole, its path's unused byt
 binding path's true length), `kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max
 rights), and the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
 bindings** — mount points + kernel resources — not the files inside a mounted filesystem (that is an
-fs-server `readdir`, deferred). Synchronous (the kernel holds the bindings). (Syscall number `30`.)
+fs-server `readdir`, deferred). Synchronous (the kernel holds the bindings). (Syscall number `26`.)
 
 ```rust
 fn sys_wait(
@@ -422,8 +419,7 @@ broker (`docs/planning/administration.md` § Part A). (Syscall number `22`.)
 `DeviceNode`, with `sys_io_submit` (`Read`, into a `MemoryObject` held with `MAP_WRITE`). A read
 answers at most 256 bytes, so a reader reads again for more. Before the generator seeds (only on a
 CPU with neither `RDSEED` nor `RDRAND`) the operation waits and completes with `result` 0; a reader
-reads again. `sys_entropy_create` (`26`) and `sys_entropy_read` (`27`) went on 2026-11-13, and
-their numbers are vacant. The contract is in [`docs/architecture/entropy.md`](../architecture/entropy.md)
+reads again. The contract is in [`docs/architecture/entropy.md`](../architecture/entropy.md)
 and [`io-operation.md`](io-operation.md).
 
 ### Process and Thread
@@ -446,7 +442,7 @@ Creates a new thread in the **calling process** and returns a `Thread` handle (`
 ```rust
 fn sys_thread_exit(status: i32) -> !
 ```
-Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive); after a `sys_process_exit` by another of its threads, its `status` is that call's, not this one's. Does not return. (Syscall number `17`.)
+Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive); after a `sys_process_exit` by another of its threads, its `status` is that call's, not this one's. Does not return. (Syscall number `18`.)
 
 ```rust
 fn sys_process_exit(status: i32) -> !
@@ -454,13 +450,13 @@ fn sys_process_exit(status: i32) -> !
 Exits the **calling process** with `status`: the kernel closes the process's handles, records `status` (a second `sys_process_exit` racing the first exits with the first's), and sets every other thread of the process on its way to end: a blocked one is woken and its `sys_wait` never returns to it, a suspended one is resumed to terminate, and one running on another CPU is stopped by an interrupt. Each ends on its way back to ring 3, so whatever it held is let go. The last thread out delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), and the process is reaped (freeing its address space). Does not return. (Syscall number `16`.)
 
 **A thread's CPUs are set when it is made** (`ThreadArgs::cpu_affinity`, `sys_thread_create`), and
-nothing changes them after (`TODO(thread-affinity)`): `sys_thread_set_affinity` (`18`), which had
-no caller, went on 2026-11-13, to come back with the `std` port's.
+nothing changes them after (`TODO(thread-affinity)`).
 
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize
 ```
-Sets the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
+Would set the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
+**Not built, and no number**: deferred with the `std` port (`deferred-decisions.md`).
 
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize
@@ -472,7 +468,7 @@ fn sys_exception_resume(thread: RawHandle, disposition: u64, code: u64) -> isize
 ```
 Acts on a thread **suspended on a fault**. `disposition` is `0` = **Resume** (re-enter the faulting instruction — without first fixing the fault's cause it simply re-faults) or `2` = **Terminate** (exit the thread with `code`); other values are reserved and return `Unsupported`. Requires `SIGNAL` right and a `Thread` handle; the thread must currently be suspended (else `InvalidArgument`). Returns `0`. (Syscall number `21`.)
 
-The exception model is **suspend + supervised resume/terminate**: a ring-3 fault suspends the faulting thread and delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel`; a supervisor (a sibling thread holding the faulter's handle) inspects it via `sys_thread_get_registers` and resumes or terminates it. **Deferred to Phase 2:** the `ResumeSkip` / `ModifyAndResume` dispositions (`1` / `3`), the 30 s auto-terminate timeout (`sys_exception_extend_timeout`), and the debugger exception-channel priority chain.
+The exception model is **suspend + supervised resume/terminate**: a ring-3 fault suspends the faulting thread and delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel`; a supervisor (a sibling thread holding the faulter's handle) inspects it via `sys_thread_get_registers` and resumes or terminates it. **Deferred to Phase 2:** the `ResumeSkip` / `ModifyAndResume` dispositions (`1` / `3`), the 30 s auto-terminate timeout, and the debugger exception-channel priority chain.
 
 ```rust
 fn sys_process_terminate(process: RawHandle) -> isize
@@ -481,7 +477,7 @@ fn sys_process_terminate(process: RawHandle) -> isize
 body) on the target's own `NotificationChannel` and wakes anything blocked on it. Requires
 `SIGNAL` right and a `Process` handle. Returns `0`, or `Unsupported` if the target has no
 notification channel attached — it cannot be asked, and saying so beats succeeding at a
-message nobody will read. (Syscall number `36`.)
+message nobody will read. (Syscall number `17`.)
 
 **It is a request, and the kernel does nothing else.** No thread is stopped, no stack is
 unwound, and the target's execution is not touched — so there is no "safe point" question
@@ -496,11 +492,6 @@ leaving `TERMINATE` unspent keeps it available to gate a forcible kill if one is
 built. The authority is the handle itself: no syscall accepts a pid, so "you may terminate
 your own children" needs no rule — a child's handle is the only one you have unless a
 supervisor was *given* more, which is hand-down policy rather than a kernel check.
-
-```rust
-fn sys_exception_extend_timeout(thread: RawHandle, additional_ns: u64) -> isize
-```
-Extends the deadline before the kernel auto-terminates a suspended thread. Used by debuggers that need more time to inspect.
 
 ### Memory
 
@@ -588,7 +579,7 @@ Reads the current value of the specified clock (Monotonic, Realtime, ProcessCpu,
 
 **`Monotonic` and `Realtime` are serviced**; `ProcessCpu` and `ThreadCpu` return `Unsupported`, since the per-CPU clocks need scheduler CPU accounting (`TODO(sched-acct)`). `Realtime` is the monotonic counter plus an offset anchored from the RTC at boot (2026-07-24), and returns `Unsupported` on a machine whose RTC could not be read, until something sets it. The selector and the `out` pointer are validated before any clock is read, so an unknown `ClockId` returns `InvalidArgument` and an unsupported clock returns `Unsupported` without touching `*out`. (This paragraph said `Monotonic` only until 2026-09-29.)
 
-**No syscall sets the clock** (`sys_clock_set`, number `41`, until 2026-11-15). The **clock node**
+**No syscall sets the clock.** The **clock node**
 does: a char node `init` holds from boot and moves on to the view broker, written with
 **eight bytes**, little-endian nanoseconds since the Unix epoch, by `sys_io_submit`
 ([`io-operation.md`](io-operation.md) § *The clock node*). `sys_clock_read` is unchanged.
@@ -602,15 +593,9 @@ fn sys_device_map_mmio(
 ```
 Returns a `MemoryObject` handle for the MMIO region indexed by `region_idx` in the device's resource descriptor (see [`device-node.md`](device-node.md)). Requires appropriate rights on `device`. Subsequent `sys_memory_map` on the returned object installs MMIO PTEs. **Deferred** — this is the *userspace*-driver path; Phase 2's Tier 1 drivers map their BARs in kernel space directly, so the syscall is unimplemented until userspace drivers + IOMMU land (`deferred-decisions.md`).
 
-```rust
-fn sys_release_initramfs() -> isize
-```
-Unbinds `/initramfs` from the root namespace and frees the initramfs physical pages. One-shot — succeeds once, returns `AlreadyReleased` thereafter. Requires `BIND_NAMESPACE`. **Deferred** — not implemented, and neither is the `AlreadyReleased` error it names. The initramfs must currently stay resident because the root fs-server's restart image can only come from it (`deferred-decisions.md`, "Filesystem server restart"). Marked 2026-08-18: this signature carried no deferred marker for as long as it has existed, three lines below one that does, and `check-docs`' syscall cross-check reads *numbered* table rows and prose bullets, so an unnumbered code block is invisible to it (audit D.5f).
-
 ### Power
 
-There is no power syscall (`sys_power`, number `40`, was removed on 2026-11-15; it answers
-`Unsupported`). **The machine is stopped by a write to the power node**
+There is no power syscall. **The machine is stopped by a write to the power node**
 ([`power.md`](../architecture/power.md)): one char `DeviceNode`, made by the kernel at boot and
 handed to `init` in `rdx`, bound in no namespace, with `WRITE` and `INSPECT` and neither
 `DUPLICATE` nor `TRANSFER`. `init` submits a one-byte `Write` of `POWER_HALT` (`0`) or
@@ -623,6 +608,9 @@ processor and halts or resets the machine. A machine that is stopping has nothin
 length or byte is refused `InvalidArgument`, synchronously, with no `PendingOperation` made.
 
 ### High-Throughput Ring (additive optimization)
+
+**Not built, and neither call has a number**: every operation goes through `sys_io_submit` today.
+The ring is designed as an addition beside it ([`why-async-syscalls.md`](../rationale/why-async-syscalls.md)).
 
 ```rust
 fn sys_ring_create(sq_depth: u32, cq_depth: u32, flags: RingFlags) -> isize
@@ -650,7 +638,7 @@ Argument types referenced above are defined in `libkern`:
 - `IoOp`, `IoOpcode`: `#[repr(C)]` / `#[repr(u32)]`, see [io-operation.md](io-operation.md); an ABI-version-hash input.
 - `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents ([ThreadArgs](thread-args.md))
 - `ClockId`: `#[repr(u32)]` enum, `Monotonic = 0`, `Realtime = 1`, `ProcessCpu = 2`, `ThreadCpu = 3`; defined in `kernel/src/libkern/clock.rs`
-- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
+- `Disposition`, `SendMode`, `MemFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. `MmioFlags` and `RingFlags` come with their calls, which are not built. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
 
 <a id="registervalues"></a>
 - `RegisterValues`: `#[repr(C)]` snapshot a faulted thread's registers are read into by `sys_thread_get_registers`. On x86_64: 18 `u64`s = the 16 GPRs in the order `rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8..r15` (offsets 0–120), then `rip` (offset 128) and `rflags` (offset 136); 144 bytes, 8-aligned. aarch64 will define its own ordering when that arch lands. **This is a per-architecture type** — it lives behind the arch boundary in `kernel/src/arch/<arch>/registers.rs` (exposed neutrally as `crate::arch::RegisterValues`, decoded by the arch's fault path and copied into the `Thread` as it suspends), not in `libkern`, because the register set itself is arch-specific. **An ABI-version-hash input** (a cross-boundary layout, like `SpawnArgs` / `ThreadArgs`); its hashed layout is the active architecture's.

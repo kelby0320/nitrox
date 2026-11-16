@@ -327,8 +327,8 @@ amplify — a child can never gain a capability its parent lacks).
 | `PHYSICAL_MEMORY` | **no** | Only `init` keeps this, for extreme recovery. A supervisor has no business with raw physical memory (called out explicitly in `userspace/init/CLAUDE.md`). |
 | `REAL_TIME` / `AUDIT_CONTROL` | **no** | No service-mgr need; a service wanting `REAL_TIME` acquires it another way, `AUDIT_CONTROL` belongs to the audit service's own grant path. |
 
-**The clock is not a syscap** (`SYSTEM_CLOCK` until 2026-11-15). `service-mgr` holds the clock node,
-the fourth handoff, and **moves it on** to the one service whose declaration says `clock = true`,
+**The clock is not a syscap.** `service-mgr` holds the clock node, the fourth handoff, and
+**moves it on** to the one service whose declaration says `clock = true`,
 the view broker, as a message on its control channel right after its spawn (after the log
 endpoint, for a non-server). It holds it until then and does not use it
 ([`service-toml-schema.md`](../spec/service-toml-schema.md) § `clock`).

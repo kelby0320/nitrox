@@ -4,6 +4,7 @@
 //! It panics on a wait for ever that nothing will end, a loop of waits that never does, and an
 //! exit, which ends the test that reaches it.
 
+use core::ptr::NonNull;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
 
@@ -81,7 +82,16 @@ impl Object {
 }
 
 /// An object's bytes, in whole pages as the kernel maps them, so a mapping starts on a page.
-struct Pages(Box<[Page]>);
+///
+/// **Held by one raw pointer, never a `Box`**: a mapping reaches the bytes by the address [`base`]
+/// gave out, and a write through a fresh `&mut [Page]`, or a moved `Box`, would retire that address
+/// for Miri. The model reads and writes through the same pointer the address came from.
+///
+/// [`base`]: Pages::base
+struct Pages {
+    first: NonNull<Page>,
+    count: usize,
+}
 
 #[repr(C, align(4096))]
 #[derive(Clone, Copy)]
@@ -89,15 +99,51 @@ struct Page([u8; PAGE]);
 
 impl Pages {
     fn new(bytes: usize) -> Pages {
-        Pages(vec![Page([0; PAGE]); bytes.div_ceil(PAGE)].into_boxed_slice())
+        let pages = vec![Page([0; PAGE]); bytes.div_ceil(PAGE)].into_boxed_slice();
+        let count = pages.len();
+        let first = NonNull::new(Box::into_raw(pages)).expect("a box is never null").cast();
+        Pages { first, count }
     }
 
     fn len(&self) -> usize {
-        self.0.len() * PAGE
+        self.count * PAGE
     }
 
-    fn base(&mut self) -> u64 {
-        self.0.as_mut_ptr() as u64
+    fn base(&self) -> u64 {
+        self.first.as_ptr().expose_provenance() as u64
+    }
+
+    /// The byte at `at`, or `None` past the last page.
+    fn get(&self, at: usize) -> Option<u8> {
+        // SAFETY: `at` is inside the `count` pages `first` owns.
+        (at < self.len()).then(|| unsafe { self.first.cast::<u8>().add(at).read() })
+    }
+
+    /// `out.len()` bytes from `at`, in one copy: Miri takes a byte loop over an image for hours.
+    /// What lies past the last page is left as `out` had it.
+    fn read(&self, at: usize, out: &mut [u8]) {
+        let n = out.len().min(self.len().saturating_sub(at));
+        if n > 0 {
+            // SAFETY: `at..at + n` is inside the pages `first` owns, which no slice ever borrows.
+            unsafe { core::ptr::copy_nonoverlapping(self.first.cast::<u8>().as_ptr().add(at), out.as_mut_ptr(), n) }
+        }
+    }
+
+    fn write(&mut self, at: usize, from: &[u8]) {
+        if from.is_empty() {
+            return;
+        }
+        assert!(at.checked_add(from.len()).is_some_and(|end| end <= self.len()), "a write past the last page");
+        // SAFETY: as in `read`; the bytes are plain memory any byte may be written to.
+        unsafe { core::ptr::copy_nonoverlapping(from.as_ptr(), self.first.cast::<u8>().as_ptr().add(at), from.len()) }
+    }
+}
+
+impl Drop for Pages {
+    fn drop(&mut self) {
+        let pages = core::ptr::slice_from_raw_parts_mut(self.first.as_ptr(), self.count);
+        // SAFETY: `first` and `count` are the box `new` let go of, taken back once, here.
+        drop(unsafe { Box::from_raw(pages) });
     }
 }
 
