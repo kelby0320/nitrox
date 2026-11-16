@@ -34,6 +34,7 @@ use libui::widget::{
 
 mod app;
 mod keys;
+mod menus;
 mod model;
 mod msg;
 mod popups;
