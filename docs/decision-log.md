@@ -38355,4 +38355,11 @@ E.10 merged, #443. E.11, `syscall-surface.md` § E.11, built on `pre-phase-7/par
 - **The docs that describe today name no removed call** (`8e35260f`): the removed calls and
   objects were kept there as asides, and go, the history being here; `release_initramfs` and
   `exception_extend_timeout`, never built, leave the design.
+- **The whole suite under Miri, at Part E's end, finds one undefined behaviour, in `libos`'s model
+  of the kernel**: it gave out a `Box`'s address for a mapping, then wrote through a fresh `&mut`
+  on the box, retiring that address. Its pages are now reached only through the box's raw pointer
+  (`277a08a2`), and the model copies a range at once, as a byte loop held a spawn-image test for
+  hours. The kernel's 1,333 tests pass in both models, `libos`'s 127 too, and the other userspace
+  targets' 1,805 under Stacked Borrows. Its casts are Part J's 38: Part E adds none. **Part E's
+  condition is met.**
 

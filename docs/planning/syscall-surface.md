@@ -873,8 +873,27 @@ and `init`'s `CLAUDE.md`. The implementer; `/pr-review`.
   the past-the-last test; a slot past the last fails the counters'; `SYSCALLS` changed on one
   side fails `abi-sync-check`; a number wrong in the table fails `check-docs`.
 
-4,498 host tests; **all 19 CI gates pass under KVM**. The whole suite's Miri run, Part E's end,
-follows.
+4,498 host tests; **all 19 CI gates pass under KVM**.
+
+**The whole suite under Miri, Part E's end** (2026-11-15, at `73a20a63`): every target
+`cargo xtask miri` lists under Stacked Borrows, in 2 hours 9 minutes, and the kernel and `libos`
+under Tree Borrows as well, the kernel in 1 hour 54.
+- **One undefined behaviour, in `libos`'s model of the kernel, not in what it models.** The model
+  kept an object's pages in a `Box`, gave out their address for a mapping, then wrote through a
+  fresh `&mut` on the box, which retires that address: the entropy source, mapping its page once
+  and reading it many times, was the first test to read a mapping after a write. Miri stops at the
+  first, so 111 of `libos`'s tests had not run. `Pages` now keeps the box's raw pointer for its
+  life and is reached only through it (`277a08a2`), and all 127 pass in both models.
+- **A byte loop that read as a hang**: E.8's spawn-image test, added after Part J's run, reads a
+  4 MiB image through the model, which copied it a byte at a time, for hours. One copy makes it
+  seconds.
+- **The kernel's 1,333 tests pass in both models**, nine ignored with their reasons, **and the 32
+  other userspace targets' 1,805 under Stacked Borrows**, thirteen ignored with theirs.
+- **Its integer-to-pointer casts are the 38 Part J left**, at the same sites in both models, each
+  found at `ab0319e7`: Part E adds none. The one in userspace, `libos`'s mapping, is an address
+  the kernel answers.
+
+**Part E's condition is met**: E.11 built, and the whole suite's Miri run at its end triaged.
 
 ### What this part does not do
 
