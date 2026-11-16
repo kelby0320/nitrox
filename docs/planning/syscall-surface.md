@@ -893,6 +893,19 @@ under Tree Borrows as well, the kernel in 1 hour 54.
   found at `ab0319e7`: Part E adds none. The one in userspace, `libos`'s mapping, is an address
   the kernel answers.
 
+**After review** (`c38d4829`):
+- **`check-docs` reads every syscall number the docs state in prose**: each "Syscall number"
+  sentence against the call above it, and each `sys_name = N` or `sys_name` (`N`) against the table.
+  The I/O core's intro still said 28 for `sys_io_submit`, a form the one-off script never read, and
+  two architecture docs restated ranges, which now point at the table.
+- **`abi-sync-check` reads a family both ways under its closed prefix**, so a `SYS_` name only
+  `libkern` keeps is a finding, where a stale one would reach whatever takes its number next.
+- **Every number below `SYSCALLS` reaches a call**, each refusing its own arguments with an error
+  other than `Unsupported`, and a vacant number answers `Unsupported` to every call's arguments.
+- **The debug calls are the exception** to "every other number answers `Unsupported`";
+  `sys_thread_set_tls` and the ring's two calls are marked not built; and `shell-language.md` says
+  `sys_process_terminate` exists.
+
 **Part E's condition is met**: E.11 built, and the whole suite's Miri run at its end triaged.
 
 ### What this part does not do

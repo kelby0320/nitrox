@@ -38362,4 +38362,9 @@ E.10 merged, #443. E.11, `syscall-surface.md` § E.11, built on `pre-phase-7/par
   hours. The kernel's 1,333 tests pass in both models, `libos`'s 127 too, and the other userspace
   targets' 1,805 under Stacked Borrows. Its casts are Part J's 38: Part E adds none. **Part E's
   condition is met.**
+- After review (`c38d4829`), **`check-docs` reads every syscall number the docs state in prose**,
+  where a sentence the renumbering missed still gave `sys_io_submit` 28, and **`abi-sync-check`
+  reads the syscall family both ways**, so a name only `libkern` keeps is a finding. Every number
+  below `SYSCALLS` is tested to reach a call, and every vacant one to answer `Unsupported` to each
+  call's arguments.
 
