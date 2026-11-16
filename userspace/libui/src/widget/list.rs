@@ -136,6 +136,12 @@ impl ListState {
         true
     }
 
+    /// Follow the selection again at the next build, though it has not changed: for a caller about
+    /// to hang something from the selected row, which may have been scrolled away.
+    pub fn follow(&mut self) {
+        self.followed = None;
+    }
+
     /// Scroll so the selected row is on screen, given how many rows fit; [`list_view`] calls it.
     pub fn ensure_visible(&mut self, visible: usize) {
         let Some(i) = self.selected else {
@@ -222,6 +228,70 @@ pub fn list_view<Msg>(
     ground: Option<Rgb>,
     theme: &Theme,
 ) -> Element<Msg> {
+    let handlers = Handlers { activate, grab, scroll, menus: None };
+    build(rows, columns, state, height, row_height, handlers, hovered, ground, theme)
+}
+
+/// What a right press on a [`list_view_with_menus`] asks for.
+pub struct ListMenus<Msg> {
+    /// A row's menu, given its key; a press on the row's button asks for the row's.
+    pub row: fn(u64) -> Msg,
+    /// The menu of the space the rows leave below them, if it has one.
+    pub empty: Option<Msg>,
+}
+
+/// [`list_view`], with menus on the right button. **The scrollbar has none**: a right press there
+/// asks for nothing.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the list's rows, handlers and appearance are separate inputs of one constructor"
+)]
+pub fn list_view_with_menus<Msg>(
+    rows: &[ListRow<'_>],
+    columns: &[ListColumn],
+    state: &mut ListState,
+    height: u32,
+    row_height: u32,
+    activate: fn(u64) -> Msg,
+    grab: Option<fn(u64) -> Msg>,
+    scroll: Option<fn(PointerEvent) -> Msg>,
+    menus: ListMenus<Msg>,
+    hovered: Option<u64>,
+    ground: Option<Rgb>,
+    theme: &Theme,
+) -> Element<Msg> {
+    let handlers = Handlers { activate, grab, scroll, menus: Some(menus) };
+    build(rows, columns, state, height, row_height, handlers, hovered, ground, theme)
+}
+
+/// What a list's rows and bar send.
+struct Handlers<Msg> {
+    activate: fn(u64) -> Msg,
+    grab: Option<fn(u64) -> Msg>,
+    scroll: Option<fn(PointerEvent) -> Msg>,
+    menus: Option<ListMenus<Msg>>,
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the list's rows, handlers and appearance are separate inputs of one constructor"
+)]
+fn build<Msg>(
+    rows: &[ListRow<'_>],
+    columns: &[ListColumn],
+    state: &mut ListState,
+    height: u32,
+    row_height: u32,
+    handlers: Handlers<Msg>,
+    hovered: Option<u64>,
+    ground: Option<Rgb>,
+    theme: &Theme,
+) -> Element<Msg> {
+    let Handlers { activate, grab, scroll, menus } = handlers;
+    let (row_menu, empty_menu) = match menus {
+        Some(m) => (Some(m.row), m.empty),
+        None => (None, None),
+    };
     let visible = height.checked_div(row_height).unwrap_or(0) as usize;
     // The selection is clamped first: it indexes a list that may have just been replaced, and a
     // stale index paints nothing and leaves `down` dead. Clamped, not cleared.
@@ -266,6 +336,9 @@ pub fn list_view<Msg>(
             let mut item = sized(Size::new(0, row_height), row_el).key(r.key).on_press(activate(r.key));
             if let Some(f) = grab {
                 item = item.on_press_down(f(r.key));
+            }
+            if let Some(f) = row_menu {
+                item = item.on_context(f(r.key));
             }
             items.push(item);
             continue;
@@ -323,10 +396,18 @@ pub fn list_view<Msg>(
         if let Some(f) = grab {
             item = item.on_press_down(f(r.key));
         }
+        if let Some(f) = row_menu {
+            item = item.on_context(f(r.key));
+        }
         items.push(item);
     }
 
-    let list = column(items);
+    // The rows' column spans the space below them, so that space's menu hangs here and not on the
+    // element that also holds the scrollbar.
+    let mut list = column(items);
+    if let Some(m) = empty_menu {
+        list = list.on_context(m);
+    }
     let body = if rows.len() > visible {
         let bar = ScrollState { offset: state.offset as u32, visible: visible as u32, total: rows.len() as u32 };
         // The bar takes the pointer when the caller has somewhere to send it.

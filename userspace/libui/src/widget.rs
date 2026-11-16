@@ -88,6 +88,9 @@ const RING: u32 = 2;
 const BORDER: u32 = 1;
 
 #[cfg(test)]
+mod list_menu_tests;
+
+#[cfg(test)]
 mod list_view_tests;
 
 #[cfg(test)]
