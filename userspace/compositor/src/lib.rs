@@ -13,6 +13,7 @@ pub mod cursor;
 pub mod input;
 pub mod manager;
 pub mod outbox;
+pub mod placement;
 pub mod server;
 
 pub use cursor::*;
@@ -277,6 +278,8 @@ pub struct WindowStack {
     ///
     /// Here because the manager path must refuse a `Place` for it and never sees the router.
     dragging: Option<(u32, Point)>,
+    /// The screen a popup asking to be kept on it is placed against; with none, as asked.
+    screen: Option<Rect>,
 }
 
 impl Default for WindowStack {
@@ -295,13 +298,18 @@ impl WindowStack {
             next_id: 1,
             removed_log: Vec::new(),
             geometry_log: Vec::new(),
-            // One, not zero: zero is `STICKY_DESKTOP`, and a sticky current desktop would make
-            // every new window sticky.
             // One, not zero: zero is `STICKY_DESKTOP`, which would make every new window sticky.
             current_desktop: 1,
             scheme: Scheme::Light,
             dragging: None,
+            screen: None,
         }
+    }
+
+    /// The same stack, placing popups that ask against `screen` less its panels' reservations.
+    pub fn on_screen(mut self, screen: Rect) -> Self {
+        self.screen = Some(screen);
+        self
     }
 
     /// Windows, bottom-first.
@@ -333,11 +341,17 @@ impl WindowStack {
         // A dialog names a parent for desktop membership and lifetime, not position; it is placed
         // like a `normal` window.
         let origin = match req.role {
-            // Anywhere its creator asks, at any size, above the bars: an application's popup can
-            // cover the whole screen and take the keyboard — `TODO(app-covers-panels)`.
+            // Where its creator asks, or kept inside the work area if it asks that. Nothing makes an
+            // application ask, so its popup can still cover the bars — `TODO(app-covers-panels)`.
             Role::Popup { parent } => {
                 let base = self.window(parent).expect("checked above").origin;
-                Point::new(base.x.saturating_add(req.offset_x), base.y.saturating_add(req.offset_y))
+                let anchor = Point::new(base.x.saturating_add(req.offset_x), base.y.saturating_add(req.offset_y));
+                match self.screen {
+                    Some(screen) => {
+                        placement::place(anchor, (req.width, req.height), self.work_area(screen), req.place)
+                    }
+                    None => anchor,
+                }
             }
             // A `normal` or `dialog` window starts where it asked and a manager overrides it: the
             // configure is held until it answers. Without a manager (the login greeter) it appears

@@ -2,7 +2,7 @@
 
 ## Status
 
-**Built, and checked 2026-09-03; §4a checked 2026-09-18** — this document describes what exists.
+**Built, and checked 2026-09-03; §4a checked 2026-09-18, and again 2026-11-16, when a popup could ask to be kept inside the work area** — this document describes what exists.
 Since then the compositor rounds the corners of the roles that float (desktop refresh, Part B —
 §4a). Two things changed under it before that: a surface may name `ARGB8888` and be composited translucent (M13 Part B — §6's resolved
 note carries the extension), and the compositor no longer paints the aperture as it composes. `compositor::Screen` builds
@@ -152,7 +152,11 @@ each changes what the compositor does:
   current, and **never takes keyboard focus**, so clicking the clock does not steal input from
   the terminal.
 - **`popup`** — a menu or a modal. Transient, parented to another window, and may extend beyond
-  its parent's bounds. Menus force this: a menu clipped to its window is not a menu.
+  its parent's bounds. Menus force this: a menu clipped to its window is not a menu. Its creator
+  places it, at an offset from its parent, and **it may ask the compositor to keep it inside the
+  work area** (pre-Phase-7 Part F.2): moved inward, or first flipped about the point it hangs
+  from, for a menu at the pointer. A client knows neither the panels nor, for certain, where its
+  window is now, so only the compositor can.
 - **`dialog`** — parented, on its parent's desktop, and **listed**. Its parent carries its
   desktop membership and its lifetime, not its position: a manager places a dialog as it places
   any other listed window. (An earlier revision also distinguished it as "not offered as a

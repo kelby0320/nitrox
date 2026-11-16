@@ -541,6 +541,10 @@ an application's connection either. An application can draw anything, then, incl
 dimmed behind something asking for a password — though it cannot read another window's pixels or
 take a key typed into another window.
 
+**A popup can now ask to stay inside the work area** (pre-Phase-7 Part F.2): its `CreateWindow`
+aux16 word, placement `1` or `2`, and `compositor::placement::place`. Asking is optional, so this
+closes nothing by itself: the fix's second bullet is to require it of every application.
+
 **Harmless until something depends on the bars being the system's, and the graphical prompt does**
 ([`graphical-prompt.md`](../design/graphical-prompt.md) Guarantee 2). **Trigger: building it.** The
 fix is the prompt's first piece:

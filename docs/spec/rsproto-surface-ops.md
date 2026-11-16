@@ -314,7 +314,7 @@ Request, 24 bytes:
 | 0 | 4 | `width` |
 | 4 | 4 | `height` |
 | 8 | 2 | `role` tag |
-| 10 | 2 | role aux16 — a panel's `dock` edge; otherwise **zero** |
+| 10 | 2 | role aux16 — a panel's `dock` edge, or a popup's **placement**; otherwise **zero** |
 | 12 | 4 | role aux32 — a panel's `reserve`, or a popup/dialog's `parent`; otherwise **zero** |
 | 16 | 4 | `offset_x`, signed — a **popup's** offset from its parent's origin, a `normal` or `dialog`'s requested origin on the screen; **zero** for a `panel` |
 | 20 | 4 | `offset_y`, signed — likewise |
@@ -347,9 +347,33 @@ does not follow its parent afterwards; moving a parent leaves its popups where t
 is a deliberate limit of M6 — tracking would mean re-placing children on every parent move,
 which is placement policy — recorded as `TODO(popup-follows-parent)`.
 
-The offset is **not clamped**. A popup may be placed partly or wholly off the screen; it is
-clipped and nothing more. The compositor does not slide it back into view, because that would
-silently disagree with where the client asked for it with no way to say so.
+The offset is **not clamped unless the popup asks**. By default a popup may be placed partly or
+wholly off the screen; it is clipped and nothing more, and the compositor does not slide it back
+into view, which would silently disagree with where the client asked for it. **A popup may ask, in
+its aux16 word, to be placed against the work area**, the screen less the panels' reservations
+(pre-Phase-7 Part F.2). A client cannot do this for itself: it does not know the panels, and its
+window may have moved since the last `Configure` it read.
+
+| aux16 | Placement |
+|---|---|
+| `0` | **As asked**: at the offset, as above. Every popup created before F.2 |
+| `1` | **Inside**: moved inward the least it takes to lie inside the work area. A drop-down under its word |
+| `2` | **At a point**: on each axis where it would overhang the far edge, flipped to the other side of its anchor (the parent's origin plus the offset), so it opens to the left of or above the point; then moved inward as `1` is. A context menu at the pointer |
+
+- **A popup longer than the work area on an axis takes the area's start** (its left or top), so its
+  first rows are what show, and is clipped. A flip that crosses the other edge is moved inward from
+  that edge, for the same reason.
+- **It is computed once, at creation**, against the work area at that moment, as the offset is
+  resolved once.
+- **The client learns where it went from its first `Configure`**, which carries the origin. So the
+  disagreement the default avoids is one the client asked for, and is told of.
+- **Any other value is refused** (`InvalidArgument`).
+- **The manager's `WindowCreated` carries a popup's aux16 as zero.** Where a popup lands is the
+  client's and the compositor's affair, not the manager's.
+
+**This does not keep an application off the bars.** Nothing makes an application ask, so its popup
+can still cover them, `TODO(app-covers-panels)`. The graphical prompt's first step will require `1`
+of every connection but the manager's, through the same placement.
 
 An unknown role tag, a panel docked to an edge that does not exist, and a `reserve` above
 the bound are all **rejected** rather than defaulted.
@@ -366,9 +390,10 @@ dialog or two) and far below what would let one client exhaust the compositor.
 
 **Encoders write unused role words zero**, so two otherwise-identical requests are
 identical on the wire. Decoders do **not** currently require it: for `normal` both words
-are ignored, and for `popup`/`dialog` the aux16 word is, so several encodings map to one
-role. That is deliberate room for a future field, not an invariant to rely on — do not
-treat a zeroed word as proof of anything.
+are ignored, and for `dialog` the aux16 word is, so several encodings map to one role. That is
+deliberate room for a future field, not an invariant to rely on — do not treat a zeroed word as
+proof of anything. A `popup`'s aux16 was that room until F.2: it is now the popup's placement, and
+a value the decoder does not know is refused.
 
 Reply, 4 bytes: the new `window` id.
 

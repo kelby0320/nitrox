@@ -264,6 +264,47 @@ pub const CREATE_WINDOW_REPLY_LEN: usize = 4;
 const _: () = assert!(CREATE_WINDOW_REQUEST_LEN == 24);
 const _: () = assert!(CREATE_WINDOW_REPLY_LEN == 4);
 
+/// A popup's placement, in its aux16 word: at its offset, as every popup was placed before.
+pub const PLACE_AS_ASKED: u16 = 0;
+/// A popup's placement: moved inward the least it takes to lie inside the work area.
+pub const PLACE_INSIDE: u16 = 1;
+/// A popup's placement: flipped about its anchor on each axis it would overhang, then moved inward.
+pub const PLACE_AT_POINT: u16 = 2;
+
+/// How the compositor places a popup against the **work area**, the screen less the panels'
+/// reservations, which a client does not know (`rsproto-surface-ops.md` § `CreateWindow`).
+#[derive(Copy, Clone, PartialEq, Eq, Debug, Default)]
+pub enum Placement {
+    /// At its offset, clipped and nothing more.
+    #[default]
+    AsAsked,
+    /// Moved inward the least it takes to lie inside: a drop-down.
+    Inside,
+    /// Flipped about its anchor on each axis it would overhang, then moved inward: a context menu.
+    AtPoint,
+}
+
+impl Placement {
+    /// The wire word.
+    pub const fn tag(self) -> u16 {
+        match self {
+            Placement::AsAsked => PLACE_AS_ASKED,
+            Placement::Inside => PLACE_INSIDE,
+            Placement::AtPoint => PLACE_AT_POINT,
+        }
+    }
+
+    /// The placement a wire word names; `None` for one unknown, which a decoder refuses.
+    pub const fn from_wire(tag: u16) -> Option<Self> {
+        match tag {
+            PLACE_AS_ASKED => Some(Placement::AsAsked),
+            PLACE_INSIDE => Some(Placement::Inside),
+            PLACE_AT_POINT => Some(Placement::AtPoint),
+            _ => None,
+        }
+    }
+}
+
 /// A parsed `CreateWindowRequest`.
 #[derive(Copy, Clone, Debug)]
 pub struct CreateWindowRequest {
@@ -280,19 +321,27 @@ pub struct CreateWindowRequest {
     pub offset_x: i32,
     /// Vertical half of [`offset_x`](Self::offset_x).
     pub offset_y: i32,
+    /// How a popup is placed from its offset; only a popup carries one, written zero for the rest.
+    pub place: Placement,
 }
 
 impl CreateWindowRequest {
     /// A window with no offset — the only meaningful shape for a role that has no parent.
     pub const fn new(width: u32, height: u32, role: Role) -> Self {
-        Self { width, height, role, offset_x: 0, offset_y: 0 }
+        Self { width, height, role, offset_x: 0, offset_y: 0, place: Placement::AsAsked }
     }
 
     /// A window at `(x, y)` — from its parent's origin for a popup, from the screen's otherwise.
     ///
     /// A `normal` or `dialog` offset is a preference; a `panel` ignores it.
     pub const fn at(width: u32, height: u32, role: Role, x: i32, y: i32) -> Self {
-        Self { width, height, role, offset_x: x, offset_y: y }
+        Self { width, height, role, offset_x: x, offset_y: y, place: Placement::AsAsked }
+    }
+
+    /// The same request, its popup placed `how` against the work area.
+    pub const fn placed(mut self, how: Placement) -> Self {
+        self.place = how;
+        self
     }
 }
 
@@ -309,7 +358,8 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     let (aux16, aux32) = match req.role {
         Role::Normal => (0, 0),
         Role::Panel { dock, reserve } => (dock.tag(), reserve),
-        Role::Popup { parent } | Role::Dialog { parent } => (0, parent),
+        Role::Popup { parent } => (req.place.tag(), parent),
+        Role::Dialog { parent } => (0, parent),
     };
     put_u16(out, 10, aux16);
     put_u32(out, 12, aux32);
@@ -350,7 +400,11 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
         Role::Popup { .. } | Role::Normal | Role::Dialog { .. } => (offset_x, offset_y),
         Role::Panel { .. } => (0, 0),
     };
-    Some(CreateWindowRequest { width, height, role, offset_x, offset_y })
+    let place = match role {
+        Role::Popup { .. } => Placement::from_wire(aux16)?,
+        _ => Placement::AsAsked,
+    };
+    Some(CreateWindowRequest { width, height, role, offset_x, offset_y, place })
 }
 
 /// Write a `CreateWindowReply` body (the new window's id).
@@ -365,4 +419,47 @@ pub fn build_create_window_reply(out: &mut [u8], window: u32) -> Option<usize> {
 /// Parse a `CreateWindowReply` body.
 pub fn parse_create_window_reply(body: &[u8]) -> Option<u32> {
     Reader::new(body).u32()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn encoded(req: &CreateWindowRequest) -> [u8; CREATE_WINDOW_REQUEST_LEN] {
+        let mut b = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
+        build_create_window_request(&mut b, req).expect("encodes");
+        b
+    }
+
+    #[test]
+    fn a_popups_placement_rides_in_its_aux16_and_round_trips() {
+        for how in [Placement::AsAsked, Placement::Inside, Placement::AtPoint] {
+            let req = CreateWindowRequest::at(80, 60, Role::Popup { parent: 7 }, 12, -4).placed(how);
+            let b = encoded(&req);
+            assert_eq!(u16::from_le_bytes([b[10], b[11]]), how.tag(), "{how:?} is the aux16 word");
+            let back = parse_create_window_request(&b).expect("parses");
+            assert_eq!((back.place, back.role, back.offset_x, back.offset_y), (how, req.role, 12, -4));
+        }
+    }
+
+    /// Bytes no encoder here writes: read as "as asked", a menu would leave the screen silently.
+    #[test]
+    fn a_placement_the_decoder_does_not_know_is_refused() {
+        for tag in [3u16, 0x0100, u16::MAX] {
+            let mut b = encoded(&CreateWindowRequest::new(80, 60, Role::Popup { parent: 7 }));
+            b[10..12].copy_from_slice(&tag.to_le_bytes());
+            assert!(parse_create_window_request(&b).is_none(), "placement {tag:#x} was accepted");
+        }
+    }
+
+    /// A `dialog`'s aux16 stays ignored on read, room for a field of its own.
+    #[test]
+    fn only_a_popup_carries_a_placement() {
+        let inside = |role| encoded(&CreateWindowRequest::new(80, 60, role).placed(Placement::Inside));
+        assert_eq!(inside(Role::Normal)[10..12], [0, 0]);
+        assert_eq!(inside(Role::Dialog { parent: 7 })[10..12], [0, 0]);
+        let mut b = encoded(&CreateWindowRequest::new(80, 60, Role::Dialog { parent: 7 }));
+        b[10..12].copy_from_slice(&3u16.to_le_bytes());
+        assert_eq!(parse_create_window_request(&b).map(|r| r.place), Some(Placement::AsAsked));
+    }
 }
