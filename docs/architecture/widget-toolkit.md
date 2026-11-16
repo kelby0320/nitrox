@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`, and 2026-11-16, when pre-Phase-7 Part F.1 made a click the left button's and gave a right press `on_context` and a middle click `on_middle`), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -437,6 +437,26 @@ bar can carry a drag and hold buttons, and pressing close does not also move the
 shadowing rule is the toolkit's, not the widget's: a widget that handles clicks handles the press
 that begins them (M9 Part A).
 
+**A click is the left button's** (pre-Phase-7 Part F.1). `on_press` and `on_press_down` answer the
+left button only. Until then they answered whichever button took the capture, so a right click on a
+close button closed the window, and one on a file in Files could open it.
+- **A right press goes to `on_context`**, the nearest on the hit's path, at the press: a menu opens
+  on the press.
+- **A press opens a gesture only with no other button held**, by the event's own `buttons`. One that
+  joins a held button belongs to that gesture, even where nothing captured the first, so it fires no
+  `on_press_down`, no `on_context` and no click: a menu asked for mid-drag would be asked of what
+  holds the capture, not of what is under the pointer. A press made alone ends any capture left
+  over, as a grab the compositor loses with buttons down closes with a release that still reports
+  them.
+- **`on_context` carries no point**, like every press handler. A widget that needs where the press
+  landed reads it through its own `on_pointer`, which still sees every button.
+- **A middle click goes to `on_middle`**, pressed and released inside as a left click is. The shell's
+  task buttons close their window on it.
+- **The capture still opens on whichever button goes down first**, so a release outside or a drag
+  still reaches the widget that took it. Click-to-focus still follows every button.
+- **A scrollbar's `ScrollGrab` answers the left button alone**, so a right press on a list's
+  scrollbar cannot both scroll it and open the list's menu.
+
 **A press captures.** Every pointer event up to the release of the last button goes to the
 widget the press landed on, even after the cursor leaves it. This is the same rule the
 compositor applies between windows, one layer down, and it exists for the same reason: a
@@ -744,11 +764,12 @@ makes a drag that leaves a button still that button's drag. It stores a **widget
 come from the diff: `reconcile` keeps one when the node's kind matches and mints a fresh one
 otherwise.
 
-**It captures the node carrying a pointer handler**, searched from the hit outwards, so a widget
-that handles its own events (`nxterm`'s grid is a `custom` node with `on_pointer`) captures
-exactly itself. That node keeps its id across a hover change because `reconcile` keeps an id
-whenever the *kind* matches, and a `menu_item` is a `Stack` lit or resting — **not** because
-applications key it, which they do and which the regression test passes without.
+**It captures the node carrying a pointer handler** (`on_press`, `on_press_down`, `on_pointer`,
+`on_context` or `on_middle`), searched from the hit outwards, so a widget that handles its own
+events (`nxterm`'s grid is a `custom` node with `on_pointer`) captures exactly itself. That node
+keeps its id across a hover change because `reconcile` keeps an id whenever the *kind* matches, and
+a `menu_item` is a `Stack` lit or resting — **not** because applications key it, which they do and
+which the regression test passes without.
 
 **It used to capture whatever `hit_test` returned, which is the deepest node** — a button's
 label, not the button — and that lost clicks. A press is also what establishes hover, so the next

@@ -584,6 +584,19 @@ Found by writing C1's gate probe and having the compositor correctly refuse a po
 across connections. Closing it also made the *compositor's* limit real: nothing bounded windows
 per connection, because the API was the bound — see `MAX_WINDOWS_PER_CONNECTION`.
 
+**The desktop has no menu — `TODO(desktop-menu)`.** A right press on the wallpaper opens nothing
+(pre-Phase-7 Part F, the maintainer's call, 2026-11-16). A desktop's menu holds wallpaper settings
+and the desktop's own context, a new file or folder or a terminal opened there, and none of that
+exists: the theme file names the wallpaper, and the desktop is not a folder. **Trigger: a wallpaper
+setting a person can change, or a desktop that is a folder.** The menu would hang from the
+wallpaper's surface, a `panel` the shell owns. With no wallpaper there is no surface to press, so
+the shell would open its ground as one.
+
+**A window has no menu — `TODO(window-menu)`.** A right press on a title bar or a task button opens
+nothing (Part F, the maintainer's call). Its rows would be what the title bar's buttons already do.
+**Trigger: something to do to a window that neither its title bar nor the bottom bar offers.** It
+would hang from `title_bar`, through `on_context`, which the toolkit has since F.1.
+
 **Buffers per window are unbounded — `TODO(window-buffer-cap)`.** Nothing limits how many
 *distinct* buffer ids one window may attach, so a client may keep inventing them and the
 compositor maps each. Pre-existing, and not reachable by a well-behaved client: `libsurface`

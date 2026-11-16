@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why
@@ -131,9 +131,9 @@ Part F is done when F.5 has merged and what Miri reports is triaged.
 **The router gives each button its own meaning.**
 - `on_press` and `on_press_down` answer `BTN_LEFT` only.
 - A right press goes to a new `on_context: Option<Msg>`, the nearest one on the hit's path. It fires
-  on the press, once, and **only on a press that opens the capture**, as `on_press_down` does. A
-  right press made while another button is held is part of that gesture: it opens no menu, and the
-  compositor, which dismisses only on a press that takes its grab, would not close one.
+  on the press, once, and **only on a press that opens a gesture**, as `on_press_down` does: one
+  with no other button held. A right press made while another button is held is part of that
+  gesture, and opens no menu.
 - **`on_context` carries no point**: like every press handler, it is a fixed message. A widget that
   needs the press, to place a caret or pick a cell, reads it through its own `on_pointer`. Files
   takes the point from the press its loop sees before routing, as it takes a left press for its
@@ -176,6 +176,54 @@ implementer's.
 
 Docs: [`widget-toolkit.md`](../architecture/widget-toolkit.md) §7.1 and §8.2. Every gate, as every
 window routes through it. Author.
+
+**Built 2026-11-16** (`a89531e2`, after two moves: `route.rs`'s tests, `c77508f3`, and
+`panel.rs`'s, `737993e6`).
+- `on_press` and `on_press_down` answer the left button only.
+- A right press reaches `on_context` at the press, and only on a press that opens the capture.
+- A middle click reaches `on_middle`. The shell's task buttons close their window on it, and the
+  shell no longer asks the event which button made a message.
+- `ScrollGrab` answers the left button only, and keeps no button of its own.
+
+**Three departures, for the maintainer's eye:**
+- **`desktop-shell/src/panel.rs` moved its tests as well.** It sat at its 1,211-line entry, and the
+  task button's `on_middle` and its test needed room.
+- **`nxterm`'s two tests that pressed button 0 now press the left one.** Before this change any
+  button clicked, button 0 included.
+- **A middle click anywhere else on the bottom bar now sends nothing.** The shell used to drop it
+  with an arm of its own.
+
+**Seven tests, each failing with its guard removed:**
+- a right or a middle click on a title bar, its close box, a button, a tab and a list row sends
+  nothing, where the left sends each one's message;
+- `on_context` fires on the nearest handler, once, at the press;
+- no `on_context` fires inside a left gesture;
+- a middle click reaches `on_middle`;
+- every button still focuses and still reaches `on_pointer`;
+- the scrollbar ignores a right or middle press;
+- the shell's middle click closes a task.
+
+Five mutations each failed the test meant to catch them:
+- the click by any button;
+- the press-down by any button;
+- `on_context` on any press;
+- the middle button as a left click;
+- the scrollbar taking any button.
+
+So did removing the task's `on_middle`. 4,510 host tests pass, and all nineteen gates under KVM.
+`check-login` middle-clicks the editor's task and waits for the close it asks for.
+
+**After review** (`af2d4cd7`, after the editor's document tests moved to a module of their own,
+`e85e9368`):
+- **A press opens a gesture only with no other button held**, by the event's own `buttons`. One
+  joining a held button fires nothing, even where nothing captured the first. A press made alone
+  ends a capture whose release never came.
+- **The capture's two new terms have tests**: a menu handler inside a clickable element, and a
+  middle click across a repaint.
+- **The editor's document takes a left press only**, the one `on_pointer` handler the sweep found
+  acting on any button. F.5 builds its right press on that.
+- **The reason first given for the guard was wrong.** The compositor does dismiss a menu opened
+  mid-gesture, on the next press.
 
 ### F.2 The compositor places a menu
 

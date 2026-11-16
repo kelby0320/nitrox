@@ -279,14 +279,21 @@ pub struct Element<Msg> {
     pub flex: u16,
     /// What this element is.
     pub node: Node<Msg>,
-    /// The message a click on this element produces.
+    /// The message a **left** click on this element produces.
     pub on_press: Option<Msg>,
-    /// A press going **down** on this element, before it is known whether it becomes a click.
+    /// A left press going **down** on this element, before it is known whether it becomes a click.
     ///
     /// **For gestures that begin at the press** (dragging a window by its title bar); **a nearer
     /// [`on_press`](Self::on_press) shadows it**, so pressing the close button does not also start
     /// a move.
     pub on_press_down: Option<Msg>,
+    /// A **right** press on this element: the menu it asks for, sent at the press.
+    ///
+    /// **It carries no point**, like every press handler; a widget that needs where the press
+    /// landed reads it through its own [`on_pointer`](Self::on_pointer).
+    pub on_context: Option<Msg>,
+    /// A **middle** click on this element, pressed and released inside it as a left click is.
+    pub on_middle: Option<Msg>,
     /// A drag-and-drop payload released over this element — `Surface::Dropped`.
     ///
     /// **Routed by position, exactly like a press**, so where on a window a drop is allowed is
@@ -316,6 +323,8 @@ impl<Msg> Element<Msg> {
             node,
             on_press: None,
             on_press_down: None,
+            on_context: None,
+            on_middle: None,
             on_drop: None,
             on_key: None,
             on_pointer: None,
@@ -342,15 +351,27 @@ impl<Msg> Element<Msg> {
         self
     }
 
-    /// Send `msg` when a press goes **down** on this element.
+    /// Send `msg` when a left press goes **down** on this element.
     pub fn on_press_down(mut self, msg: Msg) -> Self {
         self.on_press_down = Some(msg);
         self
     }
 
-    /// The message a click produces.
+    /// The message a left click produces.
     pub fn on_press(mut self, msg: Msg) -> Self {
         self.on_press = Some(msg);
+        self
+    }
+
+    /// Send `msg` when a right press lands on this element.
+    pub fn on_context(mut self, msg: Msg) -> Self {
+        self.on_context = Some(msg);
+        self
+    }
+
+    /// The message a middle click produces.
+    pub fn on_middle(mut self, msg: Msg) -> Self {
+        self.on_middle = Some(msg);
         self
     }
 
