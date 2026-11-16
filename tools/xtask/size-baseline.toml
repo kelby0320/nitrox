@@ -10,7 +10,7 @@
 "userspace/compositor/src/input.rs" = 2636
 "userspace/compositor/src/lib.rs" = 2643
 "userspace/compositor/src/main.rs" = 1926
-"userspace/desktop-shell/src/main.rs" = 1392
+"userspace/desktop-shell/src/main.rs" = 1388
 "userspace/fs-server-ext4/src/ext4.rs" = 1846
 "userspace/fs-server-ext4/src/lib.rs" = 1764
 "userspace/libdraw/src/compose.rs" = 1500
@@ -28,7 +28,7 @@
 "userspace/nxsh/src/lex.rs" = 1089
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
-"userspace/nxterm/src/lib.rs" = 2339
+"userspace/nxterm/src/lib.rs" = 2323
 "userspace/service-mgr/src/main.rs" = 1855
 "userspace/storage-service/src/main.rs" = 1161
 "userspace/test-harness/src/harness.rs" = 3058

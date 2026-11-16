@@ -1205,22 +1205,19 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 let view =
                     bottom_view(&entries, &desktops, current_desktop, lit, bb.hovered_key(), &theme, &font, screen);
                 bb.present(&mut session, &view, &font, &panel_theme);
-                // The middle button closes; a message cannot say which button made it, so the
-                // event is asked.
-                let middle = matches!(
-                    event,
-                    libsurface::WindowEvent::Pointer(p) if p.button == libkern::abi::BTN_MIDDLE
-                );
                 for msg in bb.route(&view, &font, &panel_theme, &event) {
                     let Some(m) = manager.as_mut() else { continue };
                     match msg {
+                        BottomMsg::Close(wid) => {
+                            if !entries.iter().any(|e| e.id == wid) {
+                                continue;
+                            }
+                            sent_request = true;
+                            ask_to_close(m, wid, &mut asked_to_close);
+                        }
                         BottomMsg::Task(wid) => {
                             let Some(e) = entries.iter_mut().find(|e| e.id == wid) else { continue };
                             sent_request = true;
-                            if middle {
-                                ask_to_close(m, wid, &mut asked_to_close);
-                                continue;
-                            }
                             if e.focused && !e.minimized {
                                 if minimize_window(m, e) {
                                     Line::new().s(b"desktop-shell: minimized window ").u(wid as u64).end();
@@ -1232,7 +1229,6 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                             }
                             list_dirty = true;
                         }
-                        _ if middle => {}
                         BottomMsg::ShowDesktop => {
                             sent_request = true;
                             let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);

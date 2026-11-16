@@ -1258,15 +1258,8 @@ mod tests {
         let (t, l, mut r) = window(&a);
         let e = a.view(&UiTheme::default(), None);
         let g = locate(&e, &l, GRIP_KEY).expect("the grip is keyed");
-        let p = PointerEvent {
-            window: 1,
-            kind: librsproto::surface::POINTER_BUTTON,
-            x: g.origin.x + g.size.w as i32 / 2,
-            y: g.origin.y + g.size.h as i32 / 2,
-            buttons: 1,
-            flags: librsproto::surface::POINTER_PRESSED,
-            ..Default::default()
-        };
+        let (x, y) = (g.origin.x + g.size.w as i32 / 2, g.origin.y + g.size.h as i32 / 2);
+        let p = ptr(librsproto::surface::POINTER_BUTTON, 1, librsproto::surface::POINTER_PRESSED, x, y);
         for m in r.pointer(&t, &e, &l, p).0 {
             a.update(m);
         }
@@ -2036,16 +2029,7 @@ mod tests {
         let (x, y) = libui::widget::title_button_centre(a.window_size().w, 1);
         let mut msgs = alloc::vec::Vec::new();
         for (flags, held) in [(librsproto::surface::POINTER_PRESSED, 1), (0, 0)] {
-            let p = PointerEvent {
-                window: 1,
-                kind: librsproto::surface::POINTER_BUTTON,
-                x,
-                y,
-                buttons: held,
-                flags,
-                ..Default::default()
-            };
-            msgs.extend(r.pointer(&t, &e, &l, p).0);
+            msgs.extend(r.pointer(&t, &e, &l, ptr(librsproto::surface::POINTER_BUTTON, held, flags, x, y)).0);
         }
         assert!(!msgs.is_empty(), "nothing under the maximise button at ({x}, {y})");
         for m in msgs {

@@ -586,3 +586,39 @@ fn the_arrows_exist_in_the_shipped_face() {
     let f = font();
     assert!(f.has_glyph('\u{2039}') && f.has_glyph('\u{203A}'));
 }
+
+/// The middle button closes a task, and only a task: no message can say which button made it, so
+/// the bar's task carries one for each (`check-login` middle-clicks the bar).
+#[test]
+fn a_middle_click_closes_a_task_and_does_nothing_elsewhere() {
+    let f = font();
+    let theme = Theme::default();
+    let m = FontMetrics::new(&f, theme.font_px);
+    let (bounds, y) = (Rect::new(0, 0, 1280, BAR_H), BAR_H as i32 / 2);
+    let occupied = [true, false];
+    let d = Desktops { occupied: &occupied, current: 0, label: "work" };
+    let bar = bottom_bar(&tasks(2), false, &d, None, &theme);
+    let middle = |x: i32| {
+        let l = layout(&bar, bounds, &m);
+        let mut tree = Tree::new();
+        tree.update(&bar, &l).expect("the tree diffs");
+        let mut r = Router::new();
+        let at = |buttons, flags| PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x112,
+            buttons,
+            flags,
+            x,
+            y,
+            ..Default::default()
+        };
+        let mut out = r.pointer(&tree, &bar, &l, at(4, POINTER_PRESSED)).0;
+        out.extend(r.pointer(&tree, &bar, &l, at(0, 0)).0);
+        out
+    };
+    assert_eq!(middle(141), [BottomMsg::Close(10)]);
+    assert_eq!(middle(331), [BottomMsg::Close(11)]);
+    assert_eq!(click(&bar, bounds, &m, 141, y), [BottomMsg::Task(10)], "the left button still raises");
+    assert_eq!(middle(20), [], "show-desktop has no middle click");
+    assert_eq!(middle(1280 - 30), [], "nor has the overview");
+}

@@ -1,6 +1,7 @@
 //! Scroll state, the scrollbar and its grab.
 
 use super::*;
+use libkern::abi::BTN_LEFT;
 
 /// Where a scrollbar is and how much of its content is visible.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,15 +82,12 @@ impl ScrollState {
 pub struct ScrollGrab {
     /// Pixels between the thumb's top and where the press landed, while a drag is running.
     within: Option<i32>,
-    /// Which button took the grab, the only one whose events this drag answers: the router
-    /// hands a captured widget every button's events until all are up.
-    button: u16,
 }
 
 impl ScrollGrab {
     /// A tracker holding nothing.
     pub const fn new() -> Self {
-        Self { within: None, button: 0 }
+        Self { within: None }
     }
 
     /// Whether a drag is in progress.
@@ -103,9 +101,9 @@ impl ScrollGrab {
     /// to [`scrollbar`].
     pub fn apply(&mut self, state: ScrollState, track: u32, ev: PointerEvent) -> Option<u32> {
         let is_button = ev.kind == POINTER_BUTTON;
-        // Only the button that took the grab is answered: a second button's press would re-take
-        // the grab, and its release end a gesture the person is still making.
-        if is_button && self.within.is_some() && ev.button != self.button {
+        // Only the left button scrolls, as only it clicks. The router hands a captured widget every
+        // button's events until all are up, and another's would re-take or end this grab.
+        if is_button && ev.button != BTN_LEFT {
             return None;
         }
         if is_button && ev.flags & POINTER_PRESSED == 0 {
@@ -119,11 +117,9 @@ impl ScrollGrab {
                 // On the thumb: nothing moves. Returning the offset unchanged keeps a grab exact
                 // where the position arithmetic truncates.
                 self.within = Some(ev.y - top);
-                self.button = ev.button;
                 return Some(state.offset);
             }
             self.within = Some(len as i32 / 2);
-            self.button = ev.button;
             return Some(state.offset_at(track, ev.y));
         }
         let within = self.within?;
@@ -160,3 +156,28 @@ pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, theme: &Theme
 
 /// How wide a list's scrollbar is, in pixels.
 pub(super) const SCROLLBAR_W: u32 = 12;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_left_button_takes_a_scrollbar() {
+        let state = ScrollState { offset: 0, visible: 20, total: 1000 };
+        let on_track = |button| PointerEvent {
+            kind: POINTER_BUTTON,
+            button,
+            buttons: 1,
+            flags: POINTER_PRESSED,
+            y: 150,
+            ..Default::default()
+        };
+        for button in [libkern::abi::BTN_RIGHT, libkern::abi::BTN_MIDDLE] {
+            let mut g = ScrollGrab::new();
+            assert_eq!(g.apply(state, 200, on_track(button)), None, "button {button:#x} scrolled the track");
+            assert!(!g.dragging());
+        }
+        let mut g = ScrollGrab::new();
+        assert_eq!(g.apply(state, 200, on_track(BTN_LEFT)), Some(state.offset_at(200, 150)), "the left button jumps");
+    }
+}

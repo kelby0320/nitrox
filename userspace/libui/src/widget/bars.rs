@@ -75,7 +75,8 @@ pub const fn title_button_centre(window_w: u32, nth: u32) -> (i32, i32) {
 ///
 /// `drag` is sent when a press goes **down** on the bar; the application asks the compositor for
 /// an interactive move, as only it knows where the window is. A press on a button does not drag:
-/// a nearer `on_press` shadows the bar's `on_press_down`.
+/// a nearer `on_press` shadows the bar's `on_press_down`. A right press opens no window menu:
+/// `TODO(window-menu)`.
 pub fn title_bar<Msg: Clone>(
     title: impl Into<String>,
     subtitle: Option<&str>,

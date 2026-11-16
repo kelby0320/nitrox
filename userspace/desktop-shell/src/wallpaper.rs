@@ -4,7 +4,7 @@ use super::*;
 
 /// The wallpaper, once it is on screen. The composed picture is kept (four megabytes) so the
 /// overview, a full-screen window, can draw it as its ground instead of re-decoding on every
-/// open.
+/// open. A right press on it opens no menu yet: `TODO(desktop-menu)`.
 pub(super) struct Wallpaper {
     /// The window it lives in: named among the shell's own, and made sticky.
     pub(super) window: u32,

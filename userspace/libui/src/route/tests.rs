@@ -691,3 +691,128 @@ fn a_wheel_opens_no_gesture_and_moves_no_focus() {
     let (msgs, _) = r.pointer(&t, &e, &l, release(300, 10));
     assert!(!msgs.contains(&Msg::Pressed(9)), "a wheel became half a click: {msgs:?}");
 }
+
+fn button_event(button: u16, pressed: bool, x: i32, y: i32) -> PointerEvent {
+    let held = match button {
+        BTN_LEFT => 1,
+        BTN_RIGHT => 2,
+        _ => 4,
+    };
+    let (buttons, flags) = if pressed { (held, POINTER_PRESSED) } else { (0, 0) };
+    PointerEvent { kind: POINTER_BUTTON, button, buttons, flags, x, y, ..Default::default() }
+}
+
+/// A press and its release by `button` at the middle of `at`, on a fresh router.
+fn click_with<M: Clone>(ui: &Element<M>, at: Rect, button: u16) -> Vec<M> {
+    let l = layout(ui, SCREEN, &CELL);
+    let mut t = Tree::new();
+    t.update(ui, &l).expect("a clean frame");
+    let (x, y) = (at.origin.x + at.size.w as i32 / 2, at.origin.y + at.size.h as i32 / 2);
+    let mut r = Router::new();
+    let mut out = r.pointer(&t, ui, &l, button_event(button, true, x, y)).0;
+    out.extend(r.pointer(&t, ui, &l, button_event(button, false, x, y)).0);
+    out
+}
+
+#[test]
+fn only_the_left_button_clicks_a_button_a_close_box_a_tab_or_a_row() {
+    use crate::widget::{
+        ListRow, ListState, TITLE_CLOSE_KEY, Tab, TabExtras, Theme, TitleButtons, WidgetState, button, list_view,
+        tab_strip, title_bar,
+    };
+    #[derive(Clone, PartialEq, Debug)]
+    enum M {
+        Drag,
+        Close,
+        Button,
+        Tab(u64),
+        TabClose(u64),
+        Row(u64),
+    }
+    let theme = Theme::default();
+    let tabs = [Tab { key: 1, label: "one", marked: false }, Tab { key: 2, label: "two", marked: false }];
+    let rows =
+        [ListRow { key: 10, label: "a", ..Default::default() }, ListRow { key: 11, label: "b", ..Default::default() }];
+    let mut state = ListState::default();
+    let buttons = TitleButtons { minimise: None, maximise: None, close: Some(M::Close) };
+    let ui: Element<M> = column(vec![
+        sized(Size::new(640, 30), title_bar("a window", None, true, M::Drag, buttons, None, &theme)).key(100),
+        sized(Size::new(120, 30), button("Go", M::Button, WidgetState::default(), &theme)).key(200),
+        sized(Size::new(640, 30), tab_strip(&tabs, 1, None, M::Tab, M::TabClose, TabExtras::none(), &theme)).key(300),
+        list_view(&rows, &[], &mut state, 100, 20, M::Row, None, None, None, None, &theme).key(400),
+    ]);
+    let l = layout(&ui, SCREEN, &CELL);
+    let place = |key| crate::layout::locate(&ui, &l, key).expect("laid out");
+    let bar = place(100);
+    let targets = [
+        (Rect::new(bar.origin.x + 10, bar.origin.y, 20, bar.size.h), M::Drag),
+        (place(TITLE_CLOSE_KEY), M::Close),
+        (place(200), M::Button),
+        (place(2), M::Tab(2)),
+        (place(11), M::Row(11)),
+    ];
+    for (at, want) in targets {
+        // The left button reaching it is what makes the other two's silence mean something.
+        assert_eq!(click_with(&ui, at, BTN_LEFT), core::slice::from_ref(&want), "the left button, at {at:?}");
+        assert_eq!(click_with(&ui, at, BTN_RIGHT), [], "a right click on what sends {want:?}");
+        assert_eq!(click_with(&ui, at, BTN_MIDDLE), [], "a middle click on what sends {want:?}");
+    }
+}
+
+#[test]
+fn a_right_press_asks_the_nearest_for_its_menu_once_at_the_press() {
+    let ui: Element<Msg> = column(vec![
+        sized(Size::new(640, 100), stack(vec![text("bare")])).on_context(Msg::Pressed(1)).key(1),
+        sized(Size::new(640, 100), stack(vec![sized(Size::new(640, 100), text("inner")).on_context(Msg::Pressed(3))]))
+            .on_context(Msg::Pressed(2))
+            .key(2),
+    ]);
+    let (t, l) = build(&ui);
+    let mut r = Router::new();
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_RIGHT, true, 10, 50)).0, [Msg::Pressed(1)], "walked up");
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_RIGHT, false, 10, 50)).0, [], "not again on the release");
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_RIGHT, true, 10, 150)).0, [Msg::Pressed(3)], "the nearest");
+    r.pointer(&t, &ui, &l, button_event(BTN_RIGHT, false, 10, 150));
+    let left = [button_event(BTN_LEFT, true, 10, 50), button_event(BTN_LEFT, false, 10, 50)];
+    assert!(left.into_iter().all(|e| r.pointer(&t, &ui, &l, e).0.is_empty()), "the left button asks for no menu");
+}
+
+#[test]
+fn a_right_press_inside_a_left_gesture_asks_for_no_menu() {
+    let ui: Element<Msg> =
+        sized(Size::new(640, 100), text("x")).on_press(Msg::Pressed(1)).on_context(Msg::Pressed(2)).key(1);
+    let (t, l) = build(&ui);
+    let mut r = Router::new();
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_LEFT, true, 10, 50)).0, []);
+    let right_down = PointerEvent { buttons: 3, ..button_event(BTN_RIGHT, true, 10, 50) };
+    assert_eq!(r.pointer(&t, &ui, &l, right_down).0, [], "the compositor would never dismiss this menu");
+    let right_up = PointerEvent { buttons: 1, ..button_event(BTN_RIGHT, false, 10, 50) };
+    assert_eq!(r.pointer(&t, &ui, &l, right_up).0, []);
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_LEFT, false, 10, 50)).0, [Msg::Pressed(1)], "the click");
+}
+
+#[test]
+fn a_middle_click_reaches_on_middle_and_a_left_click_on_press() {
+    let ui: Element<Msg> =
+        sized(Size::new(640, 100), text("task")).on_press(Msg::Pressed(1)).on_middle(Msg::Pressed(2)).key(1);
+    let at = Rect::new(0, 0, 640, 100);
+    assert_eq!(click_with(&ui, at, BTN_MIDDLE), [Msg::Pressed(2)]);
+    assert_eq!(click_with(&ui, at, BTN_LEFT), [Msg::Pressed(1)]);
+    let (t, l) = build(&ui);
+    let mut r = Router::new();
+    r.pointer(&t, &ui, &l, button_event(BTN_MIDDLE, true, 10, 50));
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_MIDDLE, false, 10, 300)).0, [], "released outside: cancelled");
+}
+
+#[test]
+fn every_button_still_focuses_and_still_reaches_on_pointer() {
+    // A leaf, as a terminal's grid is: focus goes to the node hit, not to an ancestor.
+    let ui: Element<Msg> = custom(1, Size::new(640, 100)).on_key(|k| Some(Msg::Key(k))).on_pointer(Msg::Ptr).key(1);
+    for button in [BTN_LEFT, BTN_RIGHT, BTN_MIDDLE] {
+        let (t, l) = build(&ui);
+        let mut r = Router::new();
+        let press = button_event(button, true, 10, 50);
+        assert_eq!(r.pointer(&t, &ui, &l, press).0, [Msg::Ptr(press)], "button {button:#x}");
+        assert!(r.focused().is_some(), "button {button:#x} took the keyboard for what it pressed");
+    }
+}

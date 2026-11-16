@@ -11,6 +11,7 @@
 use alloc::vec::Vec;
 
 use libdraw::geom::{Point, Rect};
+use libkern::abi::{BTN_LEFT, BTN_MIDDLE, BTN_RIGHT};
 use librsproto::surface::{
     KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_PRESSED, POINTER_WHEEL, PointerEvent,
 };
@@ -305,6 +306,7 @@ impl Router {
             // press that opened the capture**: while one is held `target` is the captured widget,
             // and a second button would re-fire this (a right-click mid-drag sent a second `Drag`).
             if opens_capture
+                && event.button == BTN_LEFT
                 && let Some((n_down, e_down)) = nearest(&|e: &Element<Msg>| e.on_press_down.is_some())
                 && let Some(msg) = e_down.on_press_down.clone()
             {
@@ -314,19 +316,35 @@ impl Router {
                     out.push(msg);
                 }
             }
+            // **A right press asks for a menu, at the press**, and only one that opens the gesture: a
+            // right press while another button is held is part of that gesture, and the compositor,
+            // which dismisses a menu only on a press that takes its grab, would never close it.
+            if opens_capture
+                && event.button == BTN_RIGHT
+                && let Some((_, e)) = nearest(&|e: &Element<Msg>| e.on_context.is_some())
+                && let Some(msg) = e.on_context.clone()
+            {
+                out.push(msg);
+            }
             // **The captured element must still exist**: an unresolvable path means the tree
             // changed under the gesture.
             if element_at(element, &path).is_none() {
                 return (out, target);
             }
-            // A **click** is a release inside the widget that took the press; releasing outside is
-            // a cancel. **Compared in window coordinates, with nothing added to either side**:
-            // adding `l.rect.origin` agrees with `hit_test` only at the window's top-left, and
-            // clicks in a second column or inside a `padding` were lost.
+            // A **click** is a release inside the widget that took the press, **the left button's**,
+            // or the middle's for `on_middle` (a right click on a close button closed the window);
+            // releasing outside is a cancel. **Compared in window coordinates, with nothing added to
+            // either side**: adding `l.rect.origin` agrees with `hit_test` only at the window's
+            // top-left, and clicks in a second column or inside a `padding` were lost.
+            let click = |e: &Element<Msg>| match event.button {
+                BTN_LEFT => e.on_press.clone(),
+                BTN_MIDDLE => e.on_middle.clone(),
+                _ => None,
+            };
             if released
                 && self.capture_button == Some(event.button)
-                && let Some((n, pe)) = nearest(&|e: &Element<Msg>| e.on_press.is_some())
-                && let Some(msg) = pe.on_press.clone()
+                && let Some((n, pe)) = nearest(&|e: &Element<Msg>| click(e).is_some())
+                && let Some(msg) = click(pe)
                 && let Some(l) = layout_at(layout, &path[..n])
                 && l.rect.contains(event.x, event.y)
             {
@@ -450,7 +468,11 @@ fn handling_ancestor<Msg>(tree: &Tree, element: &Element<Msg>, hit: u64) -> Opti
     let path = path_to_id(tree.root(), hit)?;
     (0..=path.len()).rev().find_map(|n| {
         let e = element_at(element, &path[..n])?;
-        let handles = e.on_press.is_some() || e.on_press_down.is_some() || e.on_pointer.is_some();
+        let handles = e.on_press.is_some()
+            || e.on_press_down.is_some()
+            || e.on_pointer.is_some()
+            || e.on_context.is_some()
+            || e.on_middle.is_some();
         if handles { widget_at(tree.root(), &path[..n]) } else { None }
     })
 }

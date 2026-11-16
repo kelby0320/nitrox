@@ -367,9 +367,10 @@ pub struct Desktops<'a> {
 pub enum BottomMsg {
     /// Minimise everything on this desktop, or bring back what the last press put away.
     ShowDesktop,
-    /// The window with this id: raise it, or put it away if it holds the keyboard. A middle click
-    /// closes it instead, which the shell reads off the event.
+    /// The window with this id: raise it, or put it away if it holds the keyboard.
     Task(u32),
+    /// A middle click on that window's button: ask it to close.
+    Close(u32),
     /// Go to the desktop at this index.
     Desktop(usize),
     /// Go to the previous desktop.
@@ -539,9 +540,8 @@ pub fn bottom_bar(
                 TASK_GAP,
             ),
         ));
-        items.push(
-            center_v(sized(Size::new(TASK_W, CONTROL_H), stack(layers))).on_press(BottomMsg::Task(t.id)).key(key),
-        );
+        let task = center_v(sized(Size::new(TASK_W, CONTROL_H), stack(layers))).on_press(BottomMsg::Task(t.id));
+        items.push(task.on_middle(BottomMsg::Close(t.id)).key(key));
     }
     items.push(sized(Size::new(0, 0), text("")).flex(1).key(SPREAD_KEY));
     items.push(switcher(desktops, hovered, theme).key(SWITCHER_KEY));
