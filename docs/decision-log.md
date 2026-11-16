@@ -38368,3 +38368,49 @@ E.10 merged, #443. E.11, `syscall-surface.md` § E.11, built on `pre-phase-7/par
   below `SYSCALLS` is tested to reach a call, and every vacant one to answer `Unsupported` to each
   call's arguments.
 
+
+## 2026-11-16 — Before Phase 7: Part E done, and Part F detailed
+
+**Part E is done**, #444 merged: the surface at twenty-eight calls, every crate on libos, and the
+whole suite under Miri at its end. Part F's detail pass, [`context-menus.md`](planning/context-menus.md),
+on `pre-phase-7/part-f-detail`, measured on `main` at `11a08e2d`.
+
+- **A right click is a left click today.** The router fires a widget's `on_press` on the release of
+  whichever button took the capture, and its `on_press_down` on that press, so a right click on a
+  close button closes the window and a right press on a title bar moves it. A probe test showed it.
+  The shell's middle-click-to-close relies on the same rule. F.1 gives `on_press` and
+  `on_press_down` the left button only, a right press `on_context` and a middle click `on_middle`.
+- **The compositor places a menu when it asks** (the maintainer's call). A popup's role aux16 word,
+  reserved for a future field, says how: `0` as asked, as every popup today; `1` moved inside the
+  work area; `2` flipped about its anchor, then moved inside. A client cannot do this itself: it
+  does not know the bars' reservations. The graphical prompt's step 1 will make `1` required of
+  applications, and will call the same function.
+- **A menu opens on the right press** (the maintainer's call). The compositor's grab sends the
+  release to the window that took the press, so the release cannot choose a row.
+- **One menu window in the toolkit.** `nxterm`, `nxedit` and `nxfiles` each carry 80 to 125 lines
+  that open, switch, close and route their drop-down's popup, and most files Part F would grow are
+  at their size entries: Files' `main.rs` and `app.rs`, the editor's and the terminal's `lib.rs`.
+  `libui::menu::Host` takes over that work, for drop-downs and context menus alike. A `Dismissed`
+  closes only the menu its window showed: the wire carries it before the press that caused it,
+  and `libsurface` hands the press out first.
+- **No desktop menu and no window menu yet** (the maintainer's calls). A desktop menu would hold
+  wallpaper settings and the desktop's own context, a new file or folder or a terminal opened
+  there, none of which exists yet. `TODO(desktop-menu)` and `TODO(window-menu)` are written with
+  F.1.
+- **Every row of a context menu sends a message its window already sends**, and a row that is
+  also on the bar is built by the bar row's definition, so label, chord and availability cannot
+  drift. Files' Open and a drive's Open and Eject have no bar row. Part F adds no action.
+- **Miri runs at Part F's end**, without the kernel, which Part F does not change: the job's
+  targets Part F changes, and `libui` by name, as the job leaves it out. The three applications
+  stay out, as the job has them, so their menus never run under Miri.
+- **After review**, the plan says where each piece lands and what moves first.
+  - **The screen reaches the compositor's `create`** through `WindowStack::new().on_screen(..)`,
+    after its tests and cursor code leave `lib.rs`.
+  - **The editor's menu opens from `take_area_pointer`**, the one place with both the press and
+    the font.
+  - **A right press in Files is not `Msg::Press`.** A probe showed that path open a file after a
+    double click, which a right click on `main` does today.
+  - **`on_context` fires only on a press that opens a capture.**
+  - **`ScrollGrab` takes a left press only.**
+  - **A failed open is answered once.**
+  - **`libsurface`'s mock is exported for `libui`'s tests.**
