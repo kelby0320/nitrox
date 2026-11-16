@@ -21,6 +21,9 @@ struct AbiFamily {
     /// unexplained one-sided name is a finding; a listed one is a documented asymmetry.
     /// Keeping this explicit is what stops the check from being noisy enough to disable.
     one_sided: &'static [(&'static str, &'static str)],
+    /// The prefix of the user-side names that must be the kernel's too, where a name the kernel
+    /// dropped would reach whatever takes its value next; `None` where the user side keeps more.
+    closed: Option<&'static str>,
 }
 
 #[derive(Copy, Clone, PartialEq)]
@@ -53,6 +56,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/syscall.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[("SYS_TEST_EXIT", "kernel test-harness builds only; userspace mirrors it for the harness")],
+        closed: Some("SYS_"),
     },
     AbiFamily {
         what: "KError discriminants",
@@ -60,6 +64,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/error.rs"],
         shape: AbiShape::EnumVariant,
         one_sided: &[],
+        closed: Some(""),
     },
     AbiFamily {
         what: "Rights bits",
@@ -67,6 +72,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/handle.rs"],
         shape: AbiShape::RightsBit,
         one_sided: &[],
+        closed: Some(""),
     },
     AbiFamily {
         what: "SysCaps bits",
@@ -74,6 +80,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/syscaps.rs"],
         shape: AbiShape::SysCapsBit,
         one_sided: &[],
+        closed: Some(""),
     },
     AbiFamily {
         what: "input event classes and codes",
@@ -81,6 +88,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U16Const,
         one_sided: &[],
+        closed: Some(""),
     },
     AbiFamily {
         what: "KObjectType discriminants",
@@ -88,6 +96,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/handle.rs"],
         shape: AbiShape::EnumVariant,
         one_sided: &[],
+        closed: Some(""),
     },
     // The device registry: its own file on each side, so the
     // enum-variant sweep sees `DeviceKind` and nothing else.
@@ -97,6 +106,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/device.rs"],
         shape: AbiShape::EnumVariant,
         one_sided: &[],
+        closed: Some(""),
     },
     AbiFamily {
         what: "device registry constants",
@@ -104,6 +114,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/device.rs"],
         shape: AbiShape::U32Const,
         one_sided: &[],
+        closed: Some(""),
     },
     // The `sys_io_submit` opcodes. The kernel
     // states each value once as an `IO_OPCODE_*` const and builds `IoOpcode` from them, so the
@@ -114,6 +125,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U32Const,
         one_sided: &[],
+        closed: Some("IO_"),
     },
     AbiFamily {
         what: "the binding listing's batch",
@@ -121,6 +133,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
+        closed: None,
     },
     AbiFamily {
         what: "the spawn image limit",
@@ -128,6 +141,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
+        closed: None,
     },
     AbiFamily {
         what: "the I/O window",
@@ -135,6 +149,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
+        closed: None,
     },
     AbiFamily {
         what: "resolve operations",
@@ -142,6 +157,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U32Const,
         one_sided: &[],
+        closed: Some("RESOLVE_OP_"),
     },
     // The power node's bytes. The kernel states them in a file of their own, so the sweep there
     // finds nothing else; `libkern` keeps them in `syscall.rs`.
@@ -151,6 +167,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/syscall.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
+        closed: Some("POWER_"),
     },
     // What a write to the clock node says: the clock set and kept by the RTC, or
     // set for this boot only. The kernel's `u64` consts in `clock.rs` are these alone; `libkern`
@@ -161,6 +178,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         user_files: &["userspace/libkern/src/abi.rs"],
         shape: AbiShape::U64Const,
         one_sided: &[],
+        closed: Some("CLOCK_SET_"),
     },
     // TODO(rsproto-offsets): the reply bodies' field offsets are literals on both sides, which a
     // family cannot compare.
@@ -186,6 +204,7 @@ const ABI_FAMILIES: &[AbiFamily] = &[
             ("FORGET_LEN", "librsproto names it FORGET_REQUEST_LEN; paired in ABI_PAIRS"),
             ("TOUCH_BY_ID_LEN", "librsproto names it TOUCH_REQUEST_LEN; paired in ABI_PAIRS"),
         ],
+        closed: None,
     },
 ];
 
@@ -362,6 +381,17 @@ fn compare_family(fam: &AbiFamily, kernel_text: &str, user_texts: &[&str], probl
         ));
         return 0;
     }
+    if let Some(prefix) = fam.closed {
+        for (name, (_, file)) in u.iter().filter(|(n, _)| n.starts_with(prefix) && !k.contains_key(*n)) {
+            if !fam.one_sided.iter().any(|(n, _)| n == name) {
+                problems.push(format!(
+                    "{}: {} exists in {} but not in {} — a name the kernel dropped reaches whatever \
+                     takes its value next: remove it, or record it in `one_sided` with a reason",
+                    fam.what, name, file, fam.kernel_file
+                ));
+            }
+        }
+    }
     let mut compared = 0;
     for (name, kv) in &k {
         match u.get(name) {
@@ -387,8 +417,8 @@ fn compare_family(fam: &AbiFamily, kernel_text: &str, user_texts: &[&str], probl
 ///
 /// `libkern` is a **hand-maintained** copy of the kernel's syscall numbers, error and object
 /// discriminants, rights bits, and shared limits, and nothing in the build ties the two. This
-/// fails on a mismatch, a name the kernel has and userspace lacks, or an undocumented one-sided
-/// name.
+/// fails on a mismatch, a name the kernel has and userspace lacks, a name userspace has under a
+/// family's closed prefix and the kernel lacks, or an undocumented one-sided name.
 pub(crate) fn cmd_abi_sync_check() -> R<()> {
     let root = repo_root();
     let mut problems: Vec<String> = Vec::new();
@@ -525,6 +555,7 @@ mod tests {
             user_files: &["a.rs", "b.rs"],
             shape: AbiShape::WireConst,
             one_sided,
+            closed: None,
         }
     }
 
@@ -615,6 +646,19 @@ mod tests {
             &["pub const A: u16 = 1;\npub const EXTRA: u16 = 9;\n", ""],
             &mut problems,
         );
+        assert!(problems.is_empty(), "{problems:?}");
+    }
+
+    #[test]
+    fn a_user_only_name_under_a_closed_prefix_is_a_finding_and_a_listed_one_is_not() {
+        let user = ["pub const K_A: u16 = 1;\npub const K_OLD: u16 = 9;\npub const OTHER: u16 = 3;\n", ""];
+        let mut problems = Vec::new();
+        compare_family(&AbiFamily { closed: Some("K_"), ..family(&[]) }, "const K_A: u16 = 1;\n", &user, &mut problems);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("K_OLD"));
+        let mut problems = Vec::new();
+        let listed = AbiFamily { closed: Some("K_"), ..family(&[("K_OLD", "reason")]) };
+        compare_family(&listed, "const K_A: u16 = 1;\n", &user, &mut problems);
         assert!(problems.is_empty(), "{problems:?}");
     }
 

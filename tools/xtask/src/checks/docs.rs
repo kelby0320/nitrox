@@ -6,6 +6,8 @@ use std::process::Command;
 
 use crate::{R, read_text, repo_root};
 
+mod numbers;
+
 /// `cargo xtask check-docs` — the documentation cannot point at things that do not exist.
 ///
 /// Three cheap, mechanical checks; none can tell whether a doc's *prose* is true. A reader who
@@ -222,6 +224,7 @@ pub(crate) fn cmd_check_docs() -> R<()> {
     // `abi-sync-check` ties the kernel to `libkern`; nothing tied either to the docs, so
     // `syscall-abi.md` and `error-codes.md` could drift from both and no gate would notice.
     let mut table_stats: Vec<String> = Vec::new();
+    let mut syscall_numbers = std::collections::BTreeMap::new();
     for (what, src_rel, doc_rel) in [
         ("syscall", "kernel/src/syscall/table.rs", "docs/spec/syscall-abi.md"),
         ("error code", "kernel/src/syscall/error.rs", "docs/reference/error-codes.md"),
@@ -317,6 +320,9 @@ pub(crate) fn cmd_check_docs() -> R<()> {
 
         from_src.sort();
         from_doc.sort();
+        if what == "syscall" {
+            syscall_numbers = from_src.iter().map(|(n, name)| (name.clone(), *n)).collect();
+        }
 
         // A checker that parses nothing passes silently; refuse to be vacuous.
         if from_src.is_empty() || from_doc.is_empty() {
@@ -351,6 +357,23 @@ pub(crate) fn cmd_check_docs() -> R<()> {
         }
         table_stats.push(format!("{} {what}s", from_src.len()));
     }
+
+    // 5. The syscall numbers the docs that describe today state in prose, beside the table.
+    let mut in_prose = 0usize;
+    for path in md_files.iter().filter(|p| describes_current(p)) {
+        let text = read_text(path)?;
+        let rel = path.strip_prefix(&root).unwrap_or(path).to_string_lossy().replace('\\', "/");
+        in_prose += numbers::stated(&text).len() + numbers::per_call(&text).len();
+        violations.extend(numbers::check(&rel, &text, &syscall_numbers));
+    }
+    if numbers::per_call(&read_text(&root.join("docs/spec/syscall-abi.md"))?).is_empty() {
+        violations.push(
+            "docs/spec/syscall-abi.md: no `(Syscall number `N`.)` sentence read — the format changed, \
+             so the check proves nothing; teach `numbers::per_call` it"
+                .into(),
+        );
+    }
+    table_stats.push(format!("{in_prose} syscall numbers in prose"));
 
     let claude_mds: Vec<String> = md_files
         .iter()

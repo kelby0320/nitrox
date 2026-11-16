@@ -417,7 +417,7 @@ batching) does not change.
 - No per-process quota enforcement. The spec's "soft cap" of 65,536
   handles per process is unenforced until `Process` exists.
 - `sys_handle_close`, `sys_handle_duplicate`, `sys_handle_restrict`,
-  `sys_handle_stat` **are** now exposed (stable syscall numbers 0–3),
+  `sys_handle_stat` **are** now exposed as syscalls,
   backed by a single global `HandleTable` instance
   (`kernel/src/handle/global.rs`); the dispatcher resolves the caller's
   pid via `sched::current_owner_pid`. They are first exercised from ring 3

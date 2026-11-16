@@ -676,7 +676,7 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
   `path`, requesting at most `rights`; the PO completes with the resolved handle
   (`IoResult.result`) or an error (`IoResult.status`). Needs `LOOKUP`.
 
-Numbers `22`–`25` and `30` (`sys_ns_enumerate`); pre-stabilization.
+Their numbers are in [`syscall-abi.md`](../spec/syscall-abi.md#syscall-numbering); pre-stabilization.
 
 ## Scope summary
 

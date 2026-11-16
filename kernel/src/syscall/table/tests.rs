@@ -8,6 +8,7 @@ use crate::object::Process;
 
 mod acting;
 mod installs;
+mod numbers;
 mod object_casts;
 
 /// **A block map the page cache cannot use is refused**, each bound at the values either
@@ -73,54 +74,6 @@ fn a_block_map_the_page_cache_cannot_use_is_refused() {
     let mut claims_more = body(512, &[(0, 2048, 8)]);
     claims_more[12..16].copy_from_slice(&200_000u32.to_le_bytes());
     assert_eq!(block_map(&claims_more).err(), Some(KError::KernelError), "a count past the body");
-}
-
-#[test]
-fn unknown_number_is_unsupported() {
-    assert_eq!(dispatch(0xDEAD, 0, 0, 0, 0, 0, 0), KError::Unsupported.as_isize());
-}
-
-#[test]
-fn a_number_past_the_last_is_unsupported_before_it_reads_an_argument() {
-    for vacant in (SYSCALLS..=64).chain([SYS_DEBUG_KPRINT - 1, SYS_DEBUG_KPRINT + 1, SYS_DEBUG_KPRINT + 3]) {
-        let refused = dispatch(vacant, 0xDEAD, USER_VIRT_END, 0, 0, 0, 0);
-        assert_eq!(refused, KError::Unsupported.as_isize(), "number {vacant}");
-    }
-}
-
-#[test]
-fn the_numbers_are_dense_and_in_family_order() {
-    let family_order = [
-        SYS_HANDLE_CLOSE,
-        SYS_HANDLE_DUPLICATE,
-        SYS_HANDLE_RESTRICT,
-        SYS_HANDLE_STAT,
-        SYS_MEMORY_CREATE,
-        SYS_MEMORY_MAP,
-        SYS_MEMORY_UNMAP,
-        SYS_CLOCK_READ,
-        SYS_TIMER_CREATE,
-        SYS_TIMER_SET,
-        SYS_WAIT,
-        SYS_NOTIF_RECV,
-        SYS_CHANNEL_CREATE,
-        SYS_CHANNEL_SEND,
-        SYS_CHANNEL_RECV,
-        SYS_PROCESS_SPAWN,
-        SYS_PROCESS_EXIT,
-        SYS_PROCESS_TERMINATE,
-        SYS_THREAD_EXIT,
-        SYS_THREAD_CREATE,
-        SYS_THREAD_GET_REGISTERS,
-        SYS_EXCEPTION_RESUME,
-        SYS_NS_CREATE,
-        SYS_NS_LOOKUP,
-        SYS_NS_BIND,
-        SYS_NS_UNBIND,
-        SYS_NS_ENUMERATE,
-        SYS_IO_SUBMIT,
-    ];
-    assert!(family_order.iter().copied().eq(0..SYSCALLS));
 }
 
 #[test]

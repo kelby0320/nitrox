@@ -165,7 +165,7 @@ pub const SYS_NS_UNBIND: u64 = 25;
 pub const SYS_NS_ENUMERATE: u64 = 26;
 /// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
 pub const SYS_IO_SUBMIT: u64 = 27;
-/// How many syscalls are numbered: each of `0` to `SYSCALLS - 1` names one, and no other does.
+/// How many calls are numbered, `0` to `SYSCALLS - 1`; past them only the debug calls answer.
 pub const SYSCALLS: u64 = 28;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.

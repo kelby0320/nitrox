@@ -1574,8 +1574,8 @@ often pauses execution at a moment the user didn't actually intend or expect any
 §11g settled job control and excluded `Ctrl-Z` with a structural argument: suspend rests on
 `SIGTSTP`, and this system has no signals. **`Ctrl-C` is not mentioned anywhere in v1.1** — and it
 is the one every user reaches for. Everywhere else it is `SIGINT`; here there is no `SIGINT` and
-nothing was put in its place. The consequences are live today: an accidental `while true { }` at a
-prompt is unrecoverable short of a reboot, and a runaway external stage cannot be stopped at all.
+nothing was put in its place. Without one, an accidental `while true { }` at a prompt was
+unrecoverable short of a reboot, and a runaway external stage could not be stopped at all.
 
 **The answer is the one the system already gives for every asynchronous event — a notification, not
 a signal** (`docs/rationale/why-no-signals.md`). An interrupt here is *data on a channel* plus *a
@@ -1597,21 +1597,17 @@ capability the shell already holds*, in four steps:
    it did not spawn — **does not arise**, because the shell *did* spawn them and is already holding
    a `Process` handle with `Rights::TERMINATE` for each.
 
-**Three things have to be built, and one is a kernel gap:**
+**Each piece is built:**
 
-- **`sys_process_terminate` does not exist.** `Rights::TERMINATE` is defined, is granted on every
-  spawned `Process` handle, and is enforced by the type/rights table — and no syscall consumes it.
-  The right was reserved and the operation never built. Nothing in the 36-syscall surface today can
-  terminate another process.
-- **The tty protocol has no out-of-band event.** Input is request/response — a line, or raw bytes —
-  with no way for the server to say something the client did not ask for.
-- **The evaluator needs an interrupt checkpoint**, which belongs on the `Host` trait so it stays
-  host-testable like the rest of the library half.
+- **`sys_process_terminate`** consumes `Rights::TERMINATE` on a `Process` handle: it *asks* the
+  process to exit, by a notification on its own channel ([`syscall-abi.md`](syscall-abi.md)).
+- **The tty protocol's interrupt event**, `OP_TTY_INTERRUPT`, which the server sends unasked
+  ([`rsproto-tty-ops.md`](rsproto-tty-ops.md#interrupt-0x0b05)).
+- **The evaluator's checkpoint**, `interrupted` on the `Host` trait, so it stays host-testable like
+  the rest of the library half.
 
-**A side effect worth naming: this is also what makes `strict` real.** §1 says a failed stage under
-`strict` *terminates* the stages after it. The implementation waits for every child to exit and
-then labels the later ones "cancelled" — accurate bookkeeping and no termination, because there was
-no syscall to terminate with. The same `sys_process_terminate` closes both.
+**It is also what makes `strict` real.** §1 says a failed stage under `strict` *terminates* the
+stages after it: the shell asks them to stop with the same call, and labels them "cancelled".
 
 ## 12. Open questions carried forward
 

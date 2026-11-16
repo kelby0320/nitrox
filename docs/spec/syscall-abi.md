@@ -72,8 +72,8 @@ held equal by `cargo xtask abi-sync-check`.
 
 **The numbers are `0` to `27`, dense and in family order**: the handles, memory, the clock and
 timers, waits and notifications, the channels, processes and threads, namespaces, and I/O.
-`SYSCALLS` (`28`) is how many there are, and **every other number answers `Unsupported`**, as
-one past the last does:
+`SYSCALLS` (`28`) is how many there are, and **every other number below the debug calls'
+(§ *Debug syscalls*) answers `Unsupported`**, as one past the last does:
 
 | Number | Syscall |
 |---|---|
@@ -176,8 +176,8 @@ layout assertions, which is why the drift was invisible.
 ### I/O Core
 
 The system's single generic asynchronous-I/O entry point; full descriptor and
-semantics in [`io-operation.md`](io-operation.md). Syscall numbers:
-`sys_io_submit = 28` (introduced with the storage slice, Phase 2 slice 5).
+semantics in [`io-operation.md`](io-operation.md). Syscall number:
+`sys_io_submit = 27` (introduced with the storage slice, Phase 2 slice 5).
 
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
@@ -455,7 +455,8 @@ nothing changes them after (`TODO(thread-affinity)`).
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize
 ```
-Sets the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
+Would set the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
+**Not built, and no number**: deferred with the `std` port (`deferred-decisions.md`).
 
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize
@@ -608,6 +609,9 @@ length or byte is refused `InvalidArgument`, synchronously, with no `PendingOper
 
 ### High-Throughput Ring (additive optimization)
 
+**Not built, and neither call has a number**: every operation goes through `sys_io_submit` today.
+The ring is designed as an addition beside it ([`why-async-syscalls.md`](../rationale/why-async-syscalls.md)).
+
 ```rust
 fn sys_ring_create(sq_depth: u32, cq_depth: u32, flags: RingFlags) -> isize
 ```
@@ -634,7 +638,7 @@ Argument types referenced above are defined in `libkern`:
 - `IoOp`, `IoOpcode`: `#[repr(C)]` / `#[repr(u32)]`, see [io-operation.md](io-operation.md); an ABI-version-hash input.
 - `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents ([ThreadArgs](thread-args.md))
 - `ClockId`: `#[repr(u32)]` enum, `Monotonic = 0`, `Realtime = 1`, `ProcessCpu = 2`, `ThreadCpu = 3`; defined in `kernel/src/libkern/clock.rs`
-- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
+- `Disposition`, `SendMode`, `MemFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. `MmioFlags` and `RingFlags` come with their calls, which are not built. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
 
 <a id="registervalues"></a>
 - `RegisterValues`: `#[repr(C)]` snapshot a faulted thread's registers are read into by `sys_thread_get_registers`. On x86_64: 18 `u64`s = the 16 GPRs in the order `rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8..r15` (offsets 0–120), then `rip` (offset 128) and `rflags` (offset 136); 144 bytes, 8-aligned. aarch64 will define its own ordering when that arch lands. **This is a per-architecture type** — it lives behind the arch boundary in `kernel/src/arch/<arch>/registers.rs` (exposed neutrally as `crate::arch::RegisterValues`, decoded by the arch's fault path and copied into the `Thread` as it suspends), not in `libkern`, because the register set itself is arch-specific. **An ABI-version-hash input** (a cross-boundary layout, like `SpawnArgs` / `ThreadArgs`); its hashed layout is the active architecture's.
