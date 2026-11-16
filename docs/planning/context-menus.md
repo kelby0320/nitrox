@@ -131,9 +131,9 @@ Part F is done when F.5 has merged and what Miri reports is triaged.
 **The router gives each button its own meaning.**
 - `on_press` and `on_press_down` answer `BTN_LEFT` only.
 - A right press goes to a new `on_context: Option<Msg>`, the nearest one on the hit's path. It fires
-  on the press, once, and **only on a press that opens the capture**, as `on_press_down` does. A
-  right press made while another button is held is part of that gesture: it opens no menu, and the
-  compositor, which dismisses only on a press that takes its grab, would not close one.
+  on the press, once, and **only on a press that opens a gesture**, as `on_press_down` does: one
+  with no other button held. A right press made while another button is held is part of that
+  gesture, and opens no menu.
 - **`on_context` carries no point**: like every press handler, it is a fixed message. A widget that
   needs the press, to place a caret or pick a cell, reads it through its own `on_pointer`. Files
   takes the point from the press its loop sees before routing, as it takes a left press for its

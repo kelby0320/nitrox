@@ -441,9 +441,13 @@ that begins them (M9 Part A).
 left button only. Until then they answered whichever button took the capture, so a right click on a
 close button closed the window, and one on a file in Files could open it.
 - **A right press goes to `on_context`**, the nearest on the hit's path, at the press: a menu opens
-  on the press. It fires only on a press that opens the capture. One made while another button is
-  held is part of that gesture, and the compositor dismisses a menu only on a press that takes its
-  grab, so it would never close one opened then.
+  on the press.
+- **A press opens a gesture only with no other button held**, by the event's own `buttons`. One that
+  joins a held button belongs to that gesture, even where nothing captured the first, so it fires no
+  `on_press_down`, no `on_context` and no click: a menu asked for mid-drag would be asked of what
+  holds the capture, not of what is under the pointer. A press made alone ends any capture left
+  over, as a grab the compositor loses with buttons down closes with a release that still reports
+  them.
 - **`on_context` carries no point**, like every press handler. A widget that needs where the press
   landed reads it through its own `on_pointer`, which still sees every button.
 - **A middle click goes to `on_middle`**, pressed and released inside as a left click is. The shell's
@@ -762,9 +766,10 @@ otherwise.
 
 **It captures the node carrying a pointer handler** (`on_press`, `on_press_down`, `on_pointer`,
 `on_context` or `on_middle`), searched from the hit outwards, so a widget that handles its own
-events (`nxterm`'s grid is a `custom` node with `on_pointer`) captures exactly itself. That node keeps its id across a hover change because `reconcile` keeps an id
-whenever the *kind* matches, and a `menu_item` is a `Stack` lit or resting — **not** because
-applications key it, which they do and which the regression test passes without.
+events (`nxterm`'s grid is a `custom` node with `on_pointer`) captures exactly itself. That node
+keeps its id across a hover change because `reconcile` keeps an id whenever the *kind* matches, and
+a `menu_item` is a `Stack` lit or resting — **not** because applications key it, which they do and
+which the regression test passes without.
 
 **It used to capture whatever `hit_test` returned, which is the deepest node** — a button's
 label, not the button — and that lost clicks. A press is also what establishes hover, so the next

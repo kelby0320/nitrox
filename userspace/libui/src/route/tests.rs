@@ -816,3 +816,96 @@ fn every_button_still_focuses_and_still_reaches_on_pointer() {
         assert!(r.focused().is_some(), "button {button:#x} took the keyboard for what it pressed");
     }
 }
+
+#[test]
+fn a_press_joining_a_held_button_starts_nothing_even_with_no_capture() {
+    let ui: Element<Msg> = column(vec![
+        sized(Size::new(640, 100), text("x"))
+            .on_press_down(Msg::Pressed(1))
+            .on_press(Msg::Pressed(2))
+            .on_context(Msg::Pressed(3))
+            .key(1),
+    ]);
+    let (t, l) = build(&ui);
+    let outside = |button, buttons| PointerEvent { buttons, ..button_event(button, true, 10, 600) };
+    // The left button went down outside the root, so nothing captured it, and it is still held.
+    let mut r = Router::new();
+    assert_eq!(r.pointer(&t, &ui, &l, outside(BTN_LEFT, 1)).0, []);
+    let right = PointerEvent { buttons: 3, ..button_event(BTN_RIGHT, true, 10, 50) };
+    assert_eq!(r.pointer(&t, &ui, &l, right).0, [], "a menu asked for mid-gesture");
+    // And the other way round: the right held, the left pressed and released over the element.
+    let mut r = Router::new();
+    assert_eq!(r.pointer(&t, &ui, &l, outside(BTN_RIGHT, 2)).0, []);
+    let left_down = PointerEvent { buttons: 3, ..button_event(BTN_LEFT, true, 10, 50) };
+    let left_up = PointerEvent { buttons: 2, ..button_event(BTN_LEFT, false, 10, 50) };
+    let mut msgs = r.pointer(&t, &ui, &l, left_down).0;
+    msgs.extend(r.pointer(&t, &ui, &l, left_up).0);
+    assert_eq!(msgs, [], "a press-down and a click inside another button's gesture");
+}
+
+#[test]
+fn a_press_joining_a_gesture_whose_widget_went_starts_nothing() {
+    let first: Element<Msg> = stack(vec![text("row")]).on_press(Msg::Pressed(1)).key(1);
+    let (mut t, l) = build(&first);
+    let mut r = Router::new();
+    r.pointer(&t, &first, &l, button_event(BTN_LEFT, true, 10, 50));
+    assert!(r.grabbed(), "precondition: the left press captured the row");
+    // The tree changes under the held button: another kind of node, so the row's widget is gone.
+    let second: Element<Msg> =
+        sized(Size::new(640, 100), custom(9, Size::new(640, 100))).on_context(Msg::Pressed(3)).key(2);
+    let l2 = layout(&second, SCREEN, &CELL);
+    t.update(&second, &l2).expect("a clean frame");
+    let right = PointerEvent { buttons: 3, ..button_event(BTN_RIGHT, true, 10, 50) };
+    assert_eq!(r.pointer(&t, &second, &l2, right).0, [], "the left button is still down");
+}
+
+#[test]
+fn a_press_with_nothing_else_held_ends_a_gesture_whose_release_never_came() {
+    let ui: Element<Msg> = column(vec![
+        sized(Size::new(640, 100), text("a")).on_press(Msg::Pressed(1)).key(1),
+        sized(Size::new(640, 100), text("b")).on_context(Msg::Pressed(3)).key(2),
+    ]);
+    let (t, l) = build(&ui);
+    let mut r = Router::new();
+    r.pointer(&t, &ui, &l, button_event(BTN_LEFT, true, 10, 50));
+    // A release that still reports the button held, as a grab lost with buttons down is closed.
+    r.pointer(&t, &ui, &l, PointerEvent { buttons: 1, ..button_event(BTN_LEFT, false, 10, 50) });
+    assert!(r.grabbed(), "precondition: the capture outlived its gesture");
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_RIGHT, true, 10, 150)).0, [Msg::Pressed(3)]);
+}
+
+/// The capture is the nearest node with **any** pointer handler: counting only clicks would hand a
+/// right press inside a clickable element to the outer one, which asks for no menu.
+#[test]
+fn a_menu_handler_inside_a_clickable_element_takes_its_own_right_press() {
+    let ui: Element<Msg> = stack(vec![sized(Size::new(640, 100), text("inner")).on_context(Msg::Pressed(2))])
+        .on_press(Msg::Pressed(1))
+        .key(1);
+    let (t, l) = build(&ui);
+    let mut r = Router::new();
+    assert_eq!(r.pointer(&t, &ui, &l, button_event(BTN_RIGHT, true, 10, 50)).0, [Msg::Pressed(2)]);
+}
+
+/// A middle click survives a repaint that re-identifies the part pressed, as a left click does
+/// (`a_gesture_survives_the_widget_under_it_being_re_identified`).
+#[test]
+fn a_middle_click_survives_the_widget_under_it_being_re_identified() {
+    fn task(lit: bool) -> Element<Msg> {
+        let mut layers = vec![];
+        if lit {
+            layers.push(text("wash"));
+        }
+        layers.push(sized(Size::new(200, 40), text("task")));
+        column(vec![stack(layers).on_middle(Msg::Pressed(1)).key(7)])
+    }
+    let rest = task(false);
+    let (mut t, l) = build(&rest);
+    let before = ids(&t);
+    let mut r = Router::new();
+    assert_eq!(r.pointer(&t, &rest, &l, button_event(BTN_MIDDLE, true, 10, 10)).0, []);
+    let lit = task(true);
+    let l2 = layout(&lit, SCREEN, &CELL);
+    t.update(&lit, &l2).expect("a clean frame");
+    assert_ne!(ids(&t), before, "nothing was re-identified, so this proves nothing");
+    assert_eq!(r.pointer(&t, &lit, &l2, button_event(BTN_MIDDLE, false, 10, 10)).0, [Msg::Pressed(1)]);
+}

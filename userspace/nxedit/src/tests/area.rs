@@ -51,6 +51,14 @@ fn a_press_in_the_buffer_lands_where_the_mono_face_draws() {
 }
 
 fn area_event(a: &mut App, kind: u16, flags: u16, buttons: u16, x: i32, y: i32) {
+    area_route(
+        a,
+        librsproto::surface::PointerEvent { kind, button: 0x110, buttons, flags, x, y, ..Default::default() },
+    );
+}
+
+/// `p` through the window's router and into the document, as the binary hands it on.
+fn area_route(a: &mut App, p: librsproto::surface::PointerEvent) {
     let theme = UiTheme::default();
     let size = a.window_size();
     let e = a.view(&theme, None);
@@ -58,7 +66,6 @@ fn area_event(a: &mut App, kind: u16, flags: u16, buttons: u16, x: i32, y: i32) 
     let mut tree = libui::diff::Tree::new();
     tree.update(&e, &l).expect("diffable");
     let mut r = libui::route::Router::new();
-    let p = librsproto::surface::PointerEvent { kind, button: 0x110, buttons, flags, x, y, ..Default::default() };
     for m in r.pointer(&tree, &e, &l, p).0 {
         a.update(m);
     }
@@ -207,4 +214,29 @@ fn a_document_scroll_survives_the_next_repaint() {
 
     frame(&mut a, &mut tree);
     assert_eq!(a.buf().text.offset(), scrolled, "the repaint put the document back where its caret is");
+}
+
+/// Only the left button places the caret: a right press inside a selection leaves it for a menu to
+/// act on, and a middle press moves nothing.
+#[test]
+fn only_a_left_press_moves_the_caret_or_drops_the_selection() {
+    use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
+    let mut a = App::new("/home/notes.txt", "/home");
+    a.loaded("hello world", b"hello world\n");
+    let (ox, oy) = area_origin(&mut a);
+    let y = oy + 4;
+    area_event(&mut a, POINTER_BUTTON, POINTER_PRESSED, 1, ox + 6, y);
+    area_event(&mut a, POINTER_MOTION, 0, 1, ox + 6 + 5 * 8, y);
+    area_event(&mut a, POINTER_BUTTON, 0, 0, ox + 6 + 5 * 8, y);
+    assert_eq!(a.buf().text.selected_text().as_deref(), Some("hello"), "precondition: a selection");
+    let caret = a.buf().text.cursor();
+    for (button, held) in [(libkern::abi::BTN_RIGHT, 2), (libkern::abi::BTN_MIDDLE, 4)] {
+        let x = ox + 6 + 2 * 8;
+        let at =
+            |flags, buttons| PointerEvent { kind: POINTER_BUTTON, button, buttons, flags, x, y, ..Default::default() };
+        area_route(&mut a, at(POINTER_PRESSED, held));
+        area_route(&mut a, at(0, 0));
+        assert_eq!(a.buf().text.selected_text().as_deref(), Some("hello"), "button {button:#x} dropped it");
+        assert_eq!(a.buf().text.cursor(), caret, "button {button:#x} moved the caret");
+    }
 }

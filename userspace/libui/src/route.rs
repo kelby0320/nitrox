@@ -229,7 +229,10 @@ impl Router {
         // The innermost node under the cursor: **click-to-focus is decided by it directly**, not by
         // `target`, the handler-bearing ancestor.
         let hit_now = hit_test(tree.root(), layout, at);
-        let opens_capture = pressed && self.capture.is_none();
+        // **A press opens a gesture only with no other button held**, by the event's own mask: one
+        // joining a held button belongs to that gesture, even if nothing captured it. A press alone
+        // ends any capture left over, as a grab lost with buttons down never sends their release.
+        let opens_capture = pressed && event.buttons & !button_bit(event.button) == 0;
         if opens_capture {
             // **The widget that handles the gesture, not the deepest one under the cursor.** A
             // press establishes **hover**: the next frame draws the control lit with more layers,
@@ -316,9 +319,7 @@ impl Router {
                     out.push(msg);
                 }
             }
-            // **A right press asks for a menu, at the press**, and only one that opens the gesture: a
-            // right press while another button is held is part of that gesture, and the compositor,
-            // which dismisses a menu only on a press that takes its grab, would never close it.
+            // **A right press asks for a menu, at the press**, and only one that opens the gesture.
             if opens_capture
                 && event.button == BTN_RIGHT
                 && let Some((_, e)) = nearest(&|e: &Element<Msg>| e.on_context.is_some())
@@ -332,8 +333,7 @@ impl Router {
                 return (out, target);
             }
             // A **click** is a release inside the widget that took the press, **the left button's**,
-            // or the middle's for `on_middle` (a right click on a close button closed the window);
-            // releasing outside is a cancel. **Compared in window coordinates, with nothing added to
+            // or the middle's for `on_middle`; releasing outside is a cancel. **Compared in window coordinates, with nothing added to
             // either side**: adding `l.rect.origin` agrees with `hit_test` only at the window's
             // top-left, and clicks in a second column or inside a `padding` were lost.
             let click = |e: &Element<Msg>| match event.button {
@@ -461,7 +461,7 @@ fn find_by_id(w: Option<&Widget>, id: u64) -> Option<&Widget> {
 
 /// The nearest node at or above `hit` that carries a pointer handler, as a widget id.
 ///
-/// `None` when nothing on the path handles anything; the caller falls back to `hit`. **All three
+/// `None` when nothing on the path handles anything; the caller falls back to `hit`. **All five
 /// handlers count**, or the gesture would move to different nodes depending on which handler was
 /// nearer.
 fn handling_ancestor<Msg>(tree: &Tree, element: &Element<Msg>, hit: u64) -> Option<u64> {
@@ -475,6 +475,16 @@ fn handling_ancestor<Msg>(tree: &Tree, element: &Element<Msg>, hit: u64) -> Opti
             || e.on_middle.is_some();
         if handles { widget_at(tree.root(), &path[..n]) } else { None }
     })
+}
+
+/// The bit `button` sets in an event's `buttons`, or none for a button the mask does not carry.
+fn button_bit(button: u16) -> u16 {
+    match button {
+        BTN_LEFT => 1,
+        BTN_RIGHT => 1 << 1,
+        BTN_MIDDLE => 1 << 2,
+        _ => 0,
+    }
 }
 
 /// The id of the widget at `path`, for the ancestor a handler was actually found on.

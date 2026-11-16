@@ -38424,9 +38424,11 @@ Part F's detail pass merged, #445. F.1, `context-menus.md` § F.1, built on
   whichever button took the capture, so a right click on a close box closed the window, a right
   press on a title bar moved it, and in Files a right click after a double click opened a file.
 - **A right press goes to `on_context`**, the nearest on the hit's path, at the press, and only on a
-  press that opens the capture: the compositor dismisses a menu only on a press that takes its grab,
-  so a menu opened mid-gesture would never close. It carries no point; a widget that needs one reads
-  its own `on_pointer`, which still sees every button.
+  press that opens a gesture. It carries no point; a widget that needs one reads its own
+  `on_pointer`, which still sees every button.
+- **A press opens a gesture only with no other button held**, by the event's own `buttons`, so one
+  joining a held button starts nothing even where nothing captured the first; and a press made alone
+  ends a capture whose release never came (after review).
 - **A middle click goes to `on_middle`**, and the shell's task buttons close their window on it; the
   shell no longer asks the event which button made a message. `ScrollGrab` answers the left button
   only.

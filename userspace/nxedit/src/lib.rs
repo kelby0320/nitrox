@@ -1298,13 +1298,13 @@ impl App {
 
     /// Resolve a pointer event over the document, given a way to measure text as drawn.
     ///
-    /// A press places the caret and drops the selection; a motion with a button held extends
-    /// it; anything else is ignored. Answers whether anything changed.
+    /// A left press places the caret and drops the selection; a motion with the left button held
+    /// extends it; anything else, another button's press too, is ignored. Answers whether it changed.
     pub fn take_area_pointer(&mut self, width: impl Fn(&str) -> u32) -> bool {
+        use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED};
         let Some(p) = self.area_pointer.take() else { return false };
-        let pressed =
-            p.kind == librsproto::surface::POINTER_BUTTON && p.flags & librsproto::surface::POINTER_PRESSED != 0;
-        let dragging = p.kind == librsproto::surface::POINTER_MOTION && p.buttons & 1 != 0;
+        let pressed = p.kind == POINTER_BUTTON && p.flags & POINTER_PRESSED != 0 && p.button == libkern::abi::BTN_LEFT;
+        let dragging = p.kind == POINTER_MOTION && p.buttons & 1 != 0;
         if !pressed && !dragging {
             return false;
         }
