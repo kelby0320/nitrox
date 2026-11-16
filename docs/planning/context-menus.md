@@ -213,6 +213,18 @@ Five mutations each failed the test meant to catch them:
 So did removing the task's `on_middle`. 4,510 host tests pass, and all nineteen gates under KVM.
 `check-login` middle-clicks the editor's task and waits for the close it asks for.
 
+**After review** (`af2d4cd7`, after the editor's document tests moved to a module of their own,
+`e85e9368`):
+- **A press opens a gesture only with no other button held**, by the event's own `buttons`. One
+  joining a held button fires nothing, even where nothing captured the first. A press made alone
+  ends a capture whose release never came.
+- **The capture's two new terms have tests**: a menu handler inside a clickable element, and a
+  middle click across a repaint.
+- **The editor's document takes a left press only**, the one `on_pointer` handler the sweep found
+  acting on any button. F.5 builds its right press on that.
+- **The reason first given for the guard was wrong.** The compositor does dismiss a menu opened
+  mid-gesture, on the next press.
+
 ### F.2 The compositor places a menu
 
 **A popup's role aux16 word says how to place it.** The spec reserves that word for exactly this:
