@@ -20,7 +20,7 @@
 "userspace/libterm/src/grid.rs" = 1600
 "userspace/libui/src/widget/list_view_tests.rs" = 1042
 "userspace/libui/src/widget/tests.rs" = 2231
-"userspace/nxedit/src/lib.rs" = 3601
+"userspace/nxedit/src/lib.rs" = 3512
 "userspace/nxfiles/src/app.rs" = 1636
 "userspace/nxfiles/src/main.rs" = 1015
 "userspace/nxfiles/src/tests.rs" = 2275
@@ -28,7 +28,7 @@
 "userspace/nxsh/src/lex.rs" = 1089
 "userspace/nxsh/src/ops.rs" = 1079
 "userspace/nxsh/src/parse.rs" = 1867
-"userspace/nxterm/src/lib.rs" = 2318
+"userspace/nxterm/src/lib.rs" = 2210
 "userspace/service-mgr/src/main.rs" = 1855
 "userspace/storage-service/src/main.rs" = 1161
 "userspace/test-harness/src/harness.rs" = 3058
