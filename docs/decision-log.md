@@ -38491,12 +38491,11 @@ F.3 merged, #448. F.4, `context-menus.md` § F.4, built on `pre-phase-7/part-f4-
 
 - **A list's menus are `libui::widget::list_view_with_menus`'s** (`c6fb94d6`, `1adbcba0`). A row's menu hangs
   on the row, and the space below the rows has its own on the rows' column, never on the element
-  that also holds the scrollbar. `list_view` keeps its signature for the chooser and the reference
-  picture.
+  that also holds the scrollbar. `list_view` keeps its signature for its callers without menus.
 - **Files has a row's, the folder's and a drive's menu.** A right press on a row outside the
   selection selects it alone, but reads no click run and no modifiers, so it opens nothing and moves
-  no range. On a row inside the selection it keeps the selection and the marks, which the menu acts
-  on. The Menu key and `Shift+F10` open the selected row's menu at its bottom-left once the list has
+  no range. On a row inside the selection it keeps the set, which Cut and Copy act on, and makes the
+  row the one Rename, Delete, Duplicate and Properties act on. The Menu key and `Shift+F10` open the selected row's menu at its bottom-left once the list has
   followed the row back into view, or the folder's with nothing selected.
 - **A context row the bar has is the bar's row**, taken from its table by its message, so the two
   cannot differ in label, chord or availability. The plan drew a definition the two share.
@@ -38505,3 +38504,8 @@ F.3 merged, #448. F.4, `context-menus.md` § F.4, built on `pre-phase-7/part-f4-
 - `check-login` right-clicks a file and chooses Properties, opens the same menu with the Menu key,
   and maximizes Files to show the folder's menu flipped inside the work area, its bottom-right at
   the click.
+- After review, **a right press on a marked row makes it the primary**, the old primary joining the
+  marks: a marked row is drawn as the primary is, and Delete on it had asked about another file.
+  The Menu key's menu is the selection's when the frame opens it, not when the key arrived. A right
+  or middle press ends the click run, a prompt closes the search, and an older context menu's popup
+  draws none of a newer one's rows.

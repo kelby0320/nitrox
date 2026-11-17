@@ -597,6 +597,26 @@ And the gate's receipt parser.
 - Two of `check-login`'s: a context menu placed inside rather than about its point fails the
   maximized step, and Files without the Menu key fails the keyboard step.
 
+**After review** (`766a466e`):
+- **A right press on a marked row makes it the primary**, the old primary joining the marks, so the
+  set is the same. A marked row is drawn as the primary is, and Rename, Delete, Duplicate and
+  Properties act on the primary: a right press on a mark asked Delete about another file, and on
+  the only mark left every row but Open disabled. The plan's "acts on all of them" holds for Cut and
+  Copy.
+- **The Menu key's menu is the selection's as the frame finds it**, not as the key found it: a
+  Down typed in the same batch hung a menu from one row whose rows acted on the next.
+- **A right or middle press ends the click run.** The plan had a right press neither read nor
+  change it, and a left click dismissing the menu became a double click's second and opened the
+  file.
+- **A prompt chosen from a menu closes the search**, as it already closed the location bar, which
+  took its keys.
+- **An older context menu's popup draws nothing of a newer one**, whose rows its last events would
+  have routed against.
+- Eleven tests, one for each of these, and for the row index checked against a listing that shrank,
+  the anchor and the strip a right press sets, a key request taken once, a bar menu outliving the
+  frame that closes a drive's, and a right press's point taken once. The six surviving mutants the
+  review ran fail them.
+
 ### F.5 The editor's and the terminal's menus
 
 **The editor**: Undo · Redo · — · Cut · Copy · Paste · — · Select All. These are the Edit menu's
