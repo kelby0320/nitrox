@@ -443,6 +443,35 @@ fn step<Msg>(items: &[Item<Msg>], from: Option<usize>, d: isize) -> Option<usize
     None
 }
 
+/// Whether `k` is the keyboard's way to a context menu: the Menu key, or `Shift+F10` with no other
+/// modifier.
+pub fn is_menu_key(k: &KeyEvent) -> bool {
+    let mods = k.modifiers & (MOD_SHIFT | MOD_CTRL | MOD_ALT | librsproto::surface::MOD_META);
+    k.keycode == libkern::abi::KEY_COMPOSE || (k.keycode == libkern::abi::KEY_F10 && mods == MOD_SHIFT)
+}
+
+/// Whether a row of `menus` sends `msg`: choosing one closes the menu showing it, whichever row.
+pub fn sends<Msg: PartialEq>(menus: &[Menu<Msg>], msg: &Msg) -> bool {
+    menus.iter().flat_map(|m| m.items.iter()).any(|it| matches!(it, Item::Action { msg: m, .. } if m == msg))
+}
+
+/// The rows of `bar` that send `want`'s messages, in `want`'s order, each `None` a separator.
+///
+/// **A context menu's rows are its window's bar's own**, so that a label, a chord or whether a row
+/// is enabled cannot differ between the two. `None` if the bar has no row for one of them.
+pub fn bar_rows<Msg: PartialEq>(bar: Vec<Menu<Msg>>, want: &[Option<Msg>]) -> Option<Vec<Item<Msg>>> {
+    let mut rows: Vec<Item<Msg>> = bar.into_iter().flat_map(|m| m.items).collect();
+    want.iter()
+        .map(|w| match w {
+            None => Some(Item::Separator),
+            Some(msg) => {
+                let at = rows.iter().position(|it| matches!(it, Item::Action { msg: m, .. } if m == msg))?;
+                Some(rows.swap_remove(at))
+            }
+        })
+        .collect()
+}
+
 /// The message whose menu item claims this key, if any.
 ///
 /// **Disabled items do not match**; a menu need not be open, as accelerators work when it is shut.

@@ -24,11 +24,6 @@ pub(crate) struct ContextMenus {
     keyed: bool,
 }
 
-/// The Menu key, or `Shift+F10`: the keyboard's ways to a context menu.
-pub(crate) fn is_menu_key(k: &KeyEvent) -> bool {
-    k.keycode == libkern::abi::KEY_COMPOSE || (k.keycode == libkern::abi::KEY_F10 && k.modifiers & MOD_SHIFT != 0)
-}
-
 /// The listing's menus: a row's, and the folder's below the rows.
 pub(crate) fn listing_menus() -> ListMenus<Msg> {
     ListMenus { row: |k| Msg::ContextMenu(Context::Row(k)), empty: Some(Msg::ContextMenu(Context::Folder)) }
@@ -151,11 +146,8 @@ impl App {
     /// Asked of the tables, not repeated in the arms, so a row added later cannot forget. A message
     /// that is not a row leaves the menu alone, which keeps `MenuBar` able to open one.
     pub(super) fn is_menu_row(&self, msg: &Msg) -> bool {
-        self.menu_table()
-            .into_iter()
-            .chain(self.context_menu())
-            .flat_map(|m| m.items)
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if m == *msg))
+        libui::menu::sends(&self.menu_table(), msg)
+            || self.context_menu().is_some_and(|m| libui::menu::sends(&[m], msg))
     }
 
     /// A key the menu's popup received: arrows, `Esc` and `Enter` drive the menu it shows.
@@ -194,32 +186,33 @@ impl App {
     /// `on`'s menu. **A row the bar has is the bar's row**, taken from its table, so its label, its
     /// chord and whether it is enabled cannot differ from it.
     pub fn context_menu_for(&self, on: Context) -> Option<Menu<Msg>> {
-        let mut bar: Vec<Item<Msg>> = self.menu_table().into_iter().flat_map(|m| m.items).collect();
-        let mut take = |msg: Msg| {
-            let at = bar.iter().position(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))?;
-            Some(bar.swap_remove(at))
-        };
+        let bar = self.menu_table();
         let items = match on {
-            Context::Row(key) => vec![
-                Item::plain("Open", Msg::Activate(list_row_of(key)? as u64)),
-                Item::Separator,
-                take(Msg::CutFiles)?,
-                take(Msg::CopyFiles)?,
-                take(Msg::Choose(Action::Duplicate))?,
-                Item::Separator,
-                take(Msg::Choose(Action::Rename))?,
-                take(Msg::Choose(Action::Delete))?,
-                Item::Separator,
-                take(Msg::Choose(Action::Properties))?,
-            ],
-            Context::Folder => vec![
-                take(Msg::Choose(Action::NewFile))?,
-                take(Msg::Choose(Action::NewFolder))?,
-                Item::Separator,
-                take(Msg::PasteFiles)?,
-                Item::Separator,
-                take(Msg::ToggleHidden)?,
-            ],
+            Context::Row(key) => {
+                let open = Item::plain("Open", Msg::Activate(list_row_of(key)? as u64));
+                let rows = [
+                    Some(Msg::CutFiles),
+                    Some(Msg::CopyFiles),
+                    Some(Msg::Choose(Action::Duplicate)),
+                    None,
+                    Some(Msg::Choose(Action::Rename)),
+                    Some(Msg::Choose(Action::Delete)),
+                    None,
+                    Some(Msg::Choose(Action::Properties)),
+                ];
+                [open, Item::Separator].into_iter().chain(libui::menu::bar_rows(bar, &rows)?).collect()
+            }
+            Context::Folder => {
+                let rows = [
+                    Some(Msg::Choose(Action::NewFile)),
+                    Some(Msg::Choose(Action::NewFolder)),
+                    None,
+                    Some(Msg::PasteFiles),
+                    None,
+                    Some(Msg::ToggleHidden),
+                ];
+                libui::menu::bar_rows(bar, &rows)?
+            }
             // What a press on the row and on its eject button send.
             Context::Drive(key) => {
                 let block = key.checked_sub(DRIVE_ROW_KEY)?;

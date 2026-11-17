@@ -572,6 +572,28 @@ impl TextAreaState {
         l[..self.col].chars().next_back().map(|c| self.col - c.len_utf8()).unwrap_or(0)
     }
 
+    /// Follow the caret again at the next build, though nothing moved it: for a caller about to
+    /// hang something from it, which may have been scrolled away, as [`ListState::follow`].
+    pub fn follow(&mut self) {
+        self.followed = None;
+    }
+
+    /// Widget-local, the bottom-left of the cell before column `col` of `line`: where a menu asked
+    /// for there hangs. `None` while the line is outside the `visible` rows shown. The inverse of
+    /// [`at_point`](Self::at_point), measuring as it does.
+    pub fn point_below(
+        &self,
+        (line, col): (usize, usize),
+        row_height: u32,
+        visible: usize,
+        width: impl Fn(&str) -> u32,
+    ) -> Option<(i32, i32)> {
+        let row = line.checked_sub(self.offset).filter(|&r| r < visible)?;
+        let x = FIELD_PAD.left + width(self.lines.get(line)?.get(..col)?);
+        let y = FIELD_PAD.top + (row as u32 + 1) * row_height;
+        Some((x as i32, y as i32))
+    }
+
     /// Scroll so the cursor's line is among the `visible` shown, as [`ListState::ensure_visible`].
     pub fn ensure_visible(&mut self, visible: usize) {
         if visible == 0 {
