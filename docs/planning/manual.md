@@ -240,6 +240,32 @@ Part G is done when G.7 has merged and what Miri reports is triaged.
 
 **The gate**: `test-interactive` prints `man(1)` and `manual-page(5)`, and counts the 33 pages.
 
+**After review** (#451, fifteen findings, every one fixed):
+- **The pages were writable by every session**: the root filesystem's `/system/manual`, bound as a
+  subtree of its one writable mount, took a `touch` from the serial session. **The maintainer
+  chose the profile server**: the pages are the coreutils package's `manual/`, which its store
+  hash covers, projected at `/system/manual` with base `/manual`, flat, as
+  `<name>.<section>.md`. A session's `touch` and `remove` there are refused, from the serial <!-- check-docs: allow-missing -->
+  session (the gate) and from a terminal window in a graphical one (a probe of `check-login`).
+  **The fonts, bound the old way, are writable from a terminal window**, shown by the same probe,
+  and left under `TODO(writable-fonts)`.
+- **A page cannot drive the terminal**: control characters are dropped, a tab is spaces.
+- **A spec's summary is its whole heading**, so `man --keyword protocol` finds the `rsproto-*`
+  pages; **a page that cannot be read says so**, listed and asked for; **the listing's failure is
+  said**; **a page goes out as `text_out` does, and a write failure is one**, a reader gone first
+  being none.
+- **Markdown it does not model is drawn as it is**, not dropped: asterisks that open nothing,
+  `[text][ref]`, `![` with no link, text after a comment, `# Using C#`, extra cells, a code span
+  of two backticks holding `|`, a fence of four. **A line breaks between words only**, never
+  between a word's runs, as `(`a/b.rs`)` once did on the spec's first line.
+- **`man`'s operands are the library's `request`**, its answer `answer`, both tested; the width
+  is `TODO(tty-size)`'s.
+- **Tests**: seven in the renderer, one in the stage, two in the staging; the namespace's
+  extended, a failed fonts or manual bind non-fatal by a mock refusing a bind at one path; the
+  section order pinned a pair at a time. **Controls**: a mutation for each fix fails its test.
+- **The gate** tries `touch` and `remove` under `/system/manual`, recounts the pages, and finds
+  one by keyword.
+
 ### G.2 The terminal's size
 
 - **The tty protocol carries a size**:

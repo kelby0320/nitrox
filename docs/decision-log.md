@@ -38549,10 +38549,19 @@ built on `pre-phase-7/part-g1-man`.
   - the written pages in `docs/manual`;
   - **`--help` not the page**, a short overview as Unix's is;
   - no `libman`: the renderer has one user and the pager two, both coreutils.
-- **`man` reads `/system/manual/<section>/<name>.md`** (`76e795ad`, `89a1853f`). The pages are `docs/manual`'s and
-  31 specs; the format is `docs/spec/manual-page.md`, a spec staged as `manual-page(5)`. `man`
-  alone lists the pages as a table, so the shell's operators narrow it.
+- **`man` reads `/system/manual/<name>.<section>.md`** (`76e795ad`, `89a1853f`). The pages are
+  `docs/manual`'s and 31 specs; the format is `docs/spec/manual-page.md`, a spec staged as
+  `manual-page(5)`. `man` alone lists the pages as a table, so the shell's operators narrow it.
 - **`/system/manual` is a namespace member**, `bind_manual`, in both columns and every application:
-  read-only public pages, and a terminal window's shell runs in its application's namespace.
+  public pages, and a terminal window's shell runs in its application's namespace.
+- **The pages are a store package's, projected by `profile-server`**, the review of #451 having
+  found them writable: bound first as the root filesystem's `/system/manual`, a subtree of its one
+  writable mount, any session could add, change or remove a page, the kernel not narrowing a
+  forwarded resolve's rights (`TODO(mount-write-authority)`). **The maintainer chose the profile
+  server** over a read-only mount of their own or saying the pages are writable: it already
+  strips the rights that write a file and refuses a change to a directory, as it does for `/bin`,
+  and fits packages that carry their own pages later. They are in the coreutils package beside
+  `man`, which its store hash covers, and **a projection is flat**, so a page is
+  `<name>.<section>.md`. **The fonts stay bound as they were**, the same route, under
+  `TODO(writable-fonts)`.
 - **`docs/manual/` describes current behaviour**, as `spec/` does.
-
