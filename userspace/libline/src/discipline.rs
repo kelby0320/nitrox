@@ -3,6 +3,8 @@
 
 use alloc::vec::Vec;
 
+use crate::keys::{Key, Keys, Typed};
+
 /// What the caller should do after feeding one byte; the discipline *says* what to write and
 /// never writes, which keeps it free of syscalls.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -23,44 +25,6 @@ pub enum Step {
     Eof,
 }
 
-/// A key the discipline reports rather than acts on: canonical mode drops every one, as Linux's
-/// does, and `nxsh` recalls history with Up and Down and edits through [`Discipline::edit`].
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum Key {
-    /// Cursor up (`ESC [ A`).
-    Up,
-    /// Cursor down (`ESC [ B`).
-    Down,
-    /// Cursor left (`ESC [ D`).
-    Left,
-    /// Cursor right (`ESC [ C`).
-    Right,
-    /// To the line's start (`ESC [ H`, or `ESC [ 1 ~` and `ESC [ 7 ~` as other terminals send it).
-    Home,
-    /// To the line's end (`ESC [ F`, `ESC [ 4 ~`, `ESC [ 8 ~`).
-    End,
-    /// Delete the character under the cursor (`ESC [ 3 ~`).
-    Delete,
-    /// A page back (`ESC [ 5 ~`): the line takes no page, so it is for whoever reads keys.
-    PageUp,
-    /// A page on (`ESC [ 6 ~`).
-    PageDown,
-}
-
-/// Where the escape-sequence parser is; a sequence naming no key is discarded, not accumulated.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum EscState {
-    Ground,
-    Esc,
-    /// In a CSI (`ESC [`): its first numeric parameter so far, and whether a `;` has ended it.
-    Csi {
-        param: u32,
-        done: bool,
-    },
-    /// After `ESC O` (SS3): one final byte follows.
-    Ss3,
-}
-
 mod screen;
 
 use screen::Geometry;
@@ -73,7 +37,7 @@ pub struct Discipline {
     cursor: usize,
     echo: bool,
     max: usize,
-    esc: EscState,
+    keys: Keys,
     width: Option<usize>,
     prompt: usize,
 }
@@ -110,34 +74,10 @@ fn whole_chars(bytes: &[u8], max: usize) -> usize {
     i
 }
 
-/// The key a CSI's final byte and first parameter name, if it is one this discipline reports.
-fn csi_key(fin: u8, param: u32) -> Option<Key> {
-    match (fin, param) {
-        (b'A', _) => Some(Key::Up),
-        (b'B', _) => Some(Key::Down),
-        (b'C', _) => Some(Key::Right),
-        (b'D', _) => Some(Key::Left),
-        (b'H', _) | (b'~', 1 | 7) => Some(Key::Home),
-        (b'F', _) | (b'~', 4 | 8) => Some(Key::End),
-        (b'~', 3) => Some(Key::Delete),
-        (b'~', 5) => Some(Key::PageUp),
-        (b'~', 6) => Some(Key::PageDown),
-        _ => None,
-    }
-}
-
 impl Discipline {
     /// An empty line with echo on.
     pub fn new() -> Self {
-        Discipline {
-            line: Vec::new(),
-            cursor: 0,
-            echo: true,
-            max: LINE_MAX,
-            esc: EscState::Ground,
-            width: None,
-            prompt: 0,
-        }
+        Discipline { line: Vec::new(), cursor: 0, echo: true, max: LINE_MAX, keys: Keys::new(), width: None, prompt: 0 }
     }
 
     /// The terminal is `width` columns wide, or cannot say (`None`, or 0); set again whenever it
@@ -170,7 +110,7 @@ impl Discipline {
     pub fn reset(&mut self) {
         self.line.clear();
         self.cursor = 0;
-        self.esc = EscState::Ground;
+        self.keys.reset();
     }
 
     /// The line as typed so far.
@@ -185,7 +125,7 @@ impl Discipline {
 
     /// Whether an escape sequence is half-read, so the next byte belongs to it.
     pub fn in_escape(&self) -> bool {
-        self.esc != EscState::Ground
+        self.keys.in_escape()
     }
 
     /// Replace the line, the cursor at its end, returning what to write: the old line passed over
@@ -202,7 +142,7 @@ impl Discipline {
             return Vec::new();
         }
         // A sequence half-read when the line is replaced is abandoned with it.
-        self.esc = EscState::Ground;
+        self.keys.reset();
         if let Some(g) = self.geometry() {
             let at = self.cell(g, self.cursor);
             let mut new = [before, after].concat();
@@ -368,74 +308,12 @@ impl Discipline {
 
     /// Feed one byte from the device.
     pub fn feed(&mut self, b: u8) -> Step {
-        // Mid-escape bytes are never text: a `[` after ESC is not a bracket the user typed.
-        match self.esc {
-            EscState::Ground => {}
-            // `ESC` is the meta prefix, so the byte after a bare one is consumed, as readline
-            // does: `ESC d` is M-d, and an unbound pair is discarded rather than inserted.
-            EscState::Esc => {
-                self.esc = match b {
-                    b'[' => EscState::Csi { param: 0, done: false },
-                    b'O' => EscState::Ss3,
-                    _ => EscState::Ground,
-                };
-                return Step::None;
-            }
-            // `ESC O` ends at its final byte, which is never typed. A byte that cannot end it,
-            // Enter say, ends the sequence and is itself acted on.
-            EscState::Ss3 => {
-                self.esc = EscState::Ground;
-                match b {
-                    0x40..=0x7E => {
-                        return csi_key(if matches!(b, b'A'..=b'D' | b'H' | b'F') { b } else { 0 }, 0)
-                            .map_or(Step::None, Step::Key);
-                    }
-                    0x1B => {
-                        self.esc = EscState::Esc;
-                        return Step::None;
-                    }
-                    _ => {}
-                }
-            }
-            EscState::Csi { param, done } => {
-                // A CSI ends at its *final* byte, not its first: ending `ESC [ 3 ~` (Delete) at
-                // the `3` would let the `~` land on the line as printable text and be echoed.
-                return match b {
-                    // The first parameter names the key (`ESC [ 3 ~`); a `;` ends it.
-                    b'0'..=b'9' if !done => {
-                        let param = param.saturating_mul(10).saturating_add(u32::from(b - b'0'));
-                        self.esc = EscState::Csi { param, done };
-                        Step::None
-                    }
-                    b';' => {
-                        self.esc = EscState::Csi { param, done: true };
-                        Step::None
-                    }
-                    // Other parameter and intermediate bytes belong to the sequence.
-                    0x20..=0x3F => Step::None,
-                    // `ESC` restarts, so an interrupted sequence cannot swallow the next one.
-                    0x1B => {
-                        self.esc = EscState::Esc;
-                        Step::None
-                    }
-                    // A final byte ends it; one that names no key leaks nothing into the line.
-                    0x40..=0x7E => {
-                        self.esc = EscState::Ground;
-                        csi_key(b, param).map_or(Step::None, Step::Key)
-                    }
-                    // Malformed: end it rather than swallow the rest of the stream.
-                    _ => {
-                        self.esc = EscState::Ground;
-                        Step::None
-                    }
-                };
-            }
-        }
+        let b = match self.keys.feed(b) {
+            Typed::Nothing => return Step::None,
+            Typed::Key(k) => return Step::Key(k),
+            Typed::Byte(b) => b,
+        };
         match b {
-            0x1b => {
-                self.esc = EscState::Esc;
-                Step::None
-            }
             // CR and LF both end a line, wherever the cursor is; which one a serial line sends is
             // an accident.
             b'\r' | b'\n' => {

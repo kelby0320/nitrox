@@ -7,5 +7,7 @@
 extern crate alloc;
 
 mod discipline;
+mod keys;
 
-pub use discipline::{Discipline, Key, LINE_MAX, Step};
+pub use discipline::{Discipline, LINE_MAX, Step};
+pub use keys::{Key, Keys, Typed};
