@@ -172,6 +172,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
                         user: &user[..ul],
                         // A serial session renders no text, so it takes no fonts.
                         bind_fonts: false,
+                        bind_manual: true,
                         // The console is this column's terminal, so the serial session binds it.
                         bind_console: true,
                         views_endpoint: if views.is_some() { borrowed(&views_endpoint) } else { None },

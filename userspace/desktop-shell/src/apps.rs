@@ -63,7 +63,8 @@ pub(super) fn read_applications(ns: Root<'_>) -> alloc::vec::Vec<Application> {
 ///   applications projection.
 /// - No `/applications`: an application holds no authority to spawn from a menu (`Desktop::Open`
 ///   exists for that).
-/// - `/dev/tty`, minting a fresh terminal per resolve; `/system/fonts`, read-only.
+/// - `/dev/tty`, minting a fresh terminal per resolve; `/system/fonts`, which an application can
+///   write (`TODO(writable-fonts)`); `/system/manual`, the profile's pages, which it cannot.
 /// - `/dev/desktop` and `/dev/clipboard`, granted deliberately: every application in the session
 ///   can create, switch and name desktops and read what anything else copied. Bound here, not
 ///   into the session.
@@ -85,6 +86,8 @@ pub(super) fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Constr
         home: l.home,
         user: l.user.as_bytes(),
         bind_fonts: true,
+        // An application's shell, as the terminal's, runs in this namespace.
+        bind_manual: true,
         bind_console: false,
         views_endpoint: l.views,
         views_base: l.views_base,

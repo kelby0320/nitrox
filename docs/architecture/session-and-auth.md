@@ -28,8 +28,8 @@ assumed, and a sandbox is a namespace you were handed, not a set of permissions 
 were denied.**
 
 The user-visible outcome: log in, and get a shell whose namespace names exactly the
-resources of that session — the user's home is writable, the system profile and
-store are readable, and nothing else (no block devices, no other home, no raw
+resources of that session — the user's home is writable, the system profile's
+programs and the manual are readable, and nothing else (no block devices, no other home, no raw
 filesystem root) is even *nameable*.
 
 ## No user model in the kernel
@@ -215,13 +215,18 @@ session should have (`sys_ns_bind`, each with attenuated rights):
 | `/dev/console` | the console device node | READ (the shell's I/O) |
 | `/home` | the fs-server endpoint, **scoped to the user's home subtree** | LOOKUP · READ · WRITE · MAP_READ · MAP_WRITE |
 | `/bin` | the system profile endpoint | read-only (program names resolve) |
-| `/store` | the store | read-only (shared artifacts) |
+| `/system/manual` | the system profile endpoint, **scoped to `/manual`** | read-only: the pages `man` reads, each package's `manual/` |
+| `/system/fonts` | the fs-server endpoint, scoped to `/system/fonts`, **a graphical session only** | writable, as the root's one mount is (`TODO(writable-fonts)`) |
 | `/dev/views` | the view broker's forwarding endpoint, **scoped to `/s/<session>`** | the session's identity to the broker — see below |
 | `/dev/devices` | an **info-only** endpoint of the device manager's, scoped to `/info` | the machine's devices as typed tables, and nothing to take one with — see below |
 | `/storage` | the storage service's **session** endpoint, scoped to `/fs` | every mounted filesystem, `/storage/<label>/…`, and nothing to mount with — see below |
 | `/dev/storage` | the same endpoint, scoped to `/info` | the table of what each disk holds; since Phase 6 Part F a media session that ejects a removable disk's mount, and a watch pinged when the mounts change ([`storage.md`](storage.md) §8a) |
 | `/dev/services` | `service-mgr`'s **session** endpoint for its services | the table of services, `all.tsm`, and nothing to start or stop one with — [`rsproto-services-ops.md`](../spec/rsproto-services-ops.md) |
 | `/dev/entropy` | the kernel generator's char node, resolved from the supervisor's root | READ: random bytes, in **every** namespace `libsession` builds, an application's too, and nothing else ([`entropy.md`](entropy.md)) |
+
+The rest — `/applications`, `/dev/tty`, `/dev/clipboard`, `/dev/desktop`, `/dev/draw/new` and
+`/session/user` — and which column binds each are in `libsession::build_namespace`'s `Members`
+and [`session-mgr/CLAUDE.md`](../../userspace/session-mgr/CLAUDE.md).
 
 Deliberately **absent**: other users' homes, admin resources, the raw filesystem root — and
 `/dev/blk`, on every boot. *Absence is the sandbox* — this is Nitrox's "sandboxing by

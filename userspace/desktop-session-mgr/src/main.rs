@@ -106,6 +106,7 @@ fn run_session(
             home,
             user,
             bind_fonts: true,
+            bind_manual: true,
             bind_console: false,
             views_endpoint: views,
             views_base,

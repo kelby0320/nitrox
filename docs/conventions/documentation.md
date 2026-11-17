@@ -7,9 +7,10 @@ rules given, in the root `CLAUDE.md`, *Repository layout*.
 than it looks, because reading the wrong class as current is how you end up confidently
 wrong about how something works:
 
-- **`spec/`, `reference/`, `architecture/`, `conventions/` describe current behaviour.**
-  If one disagrees with the source, the source wins and the doc is a bug — fix it in the
-  same change.
+- **`spec/`, `reference/`, `architecture/`, `conventions/`, `manual/` describe current
+  behaviour.** If one disagrees with the source, the source wins and the doc is a bug — fix it in
+  the same change. `manual/` is the manual's pages, written for the person using the system and
+  staged at `/system/manual`; its format is [`manual-page.md`](../spec/manual-page.md).
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
   is what a subsystem *will* be. Today it holds `fault-survival.md`

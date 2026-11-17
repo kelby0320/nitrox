@@ -50,6 +50,7 @@ fn full<'a>(e: &'a Eps, root: Option<Ref<'a, Namespace, NsReadOnly>>) -> Members
         home: "/home/alice",
         user: b"alice",
         bind_fonts: true,
+        bind_manual: true,
         bind_console: true,
         views_endpoint: Some(e.views.as_ref()),
         views_base: "/s/3",
@@ -73,6 +74,7 @@ fn bare<'a>() -> Members<'a> {
         home: "",
         user: b"",
         bind_fonts: false,
+        bind_manual: false,
         bind_console: false,
         views_endpoint: None,
         views_base: "",
@@ -129,6 +131,7 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
             "/dev/storage",
             "/dev/services",
             "/system/fonts",
+            "/system/manual",
             "/dev/console",
             "/dev/entropy",
             "/dev/desktop",
@@ -138,6 +141,7 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
         ("/dev/draw/new", 40, "/new"),
         ("/home", 41, "/home/alice"),
         ("/system/fonts", 41, "/system/fonts"),
+        ("/system/manual", 42, "/manual"),
         ("/bin", 42, "/bin"),
         ("/applications", 42, "/applications"),
         ("/dev/tty", 43, ""),
@@ -178,12 +182,21 @@ fn a_member_not_asked_for_is_not_bound() {
     mock::reset();
     let e = eps();
     let root = root_with_console();
+    let profile = |bind_manual| Members { profile_endpoint: Some(e.profile.as_ref()), bind_manual, ..bare() };
+    let unasked = build_namespace(&profile(false)).unwrap();
+    assert_eq!(paths(&entries(unasked.ns.as_ref())), ["/bin"], "the manual, unasked, beside the server it is on");
+    let asked = build_namespace(&profile(true)).unwrap();
+    assert_eq!(paths(&entries(asked.ns.as_ref())), ["/bin", "/system/manual"]);
     let only_home = Members { home: "/home/alice", fs_endpoint: Some(e.fs.as_ref()), ..bare() };
     let built = build_namespace(&only_home).unwrap();
     assert_eq!(paths(&entries(built.ns.as_ref())), ["/home"]);
     assert_eq!(built.bound, Bound::default());
-    let none = build_namespace(&Members { bind_fonts: true, bind_applications: true, ..bare() }).unwrap();
-    assert!(entries(none.ns.as_ref()).is_empty(), "fonts need the fs endpoint, applications the profile's");
+    let none =
+        build_namespace(&Members { bind_fonts: true, bind_manual: true, bind_applications: true, ..bare() }).unwrap();
+    assert!(
+        entries(none.ns.as_ref()).is_empty(),
+        "fonts need the fs endpoint, the manual and applications the profile's"
+    );
     let no_console = Members { bind_console: false, ..full(&e, Some(lookup_only(&root))) };
     let built = build_namespace(&no_console).unwrap();
     assert!(!paths(&entries(built.ns.as_ref())).contains(&"/dev/console") && !built.bound.console);
@@ -242,6 +255,18 @@ fn an_optional_member_that_will_not_bind_is_skipped() {
     let storage = Members { storage_endpoint: Some(e.storage.as_ref()), ..bare() };
     let built = build_namespace(&storage).unwrap();
     assert!(!built.bound.storage && entries(built.ns.as_ref()).is_empty(), "both or neither is reported");
+    for (path, said) in [
+        ("/system/fonts", &b"libsession: /system/fonts bind FAIL (clients cannot render text)\n"[..]),
+        ("/system/manual", &b"libsession: /system/manual bind FAIL (man finds no pages)\n"[..]),
+    ] {
+        mock::reset();
+        let e = eps();
+        mock::fail_bind_at(path, KError::NoAccess as i32);
+        let built = build_namespace(&full(&e, None)).expect("a refused optional bind fails nothing");
+        let bound = paths(&entries(built.ns.as_ref())).into_iter().map(String::from).collect::<Vec<_>>();
+        assert!(!bound.iter().any(|p| p == path) && bound.iter().any(|p| p == "/home"), "{path}: {bound:?}");
+        assert!(mock::logged().windows(said.len()).any(|w| w == said), "{path} said nothing");
+    }
 }
 
 /// The user is published at `/session/user` as a NUL-ended name, cut at 255 bytes.

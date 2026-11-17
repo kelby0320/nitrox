@@ -12,8 +12,10 @@ it composes with per-process namespaces and rights.
 
 Status: **implemented, slice 1** (Phase 3), and **projecting a second directory since
 2026-09-04** (M14 Part H): the same server also projects each package's `applications/` at
-`/applications`, which is where [desktop entries](../spec/desktop-entry.md) live. Its manifest has
-been read from the root since administration Part E.1c (2026-09-28; § *Manifest schema*).
+`/applications`, which is where [desktop entries](../spec/desktop-entry.md) live, and **a third
+since 2026-11-17** (pre-Phase-7 Part G.1): each package's `manual/` at `/system/manual`, the pages
+`man` reads ([`manual-page.md`](../spec/manual-page.md)), bound with base `/manual`. Its manifest
+has been read from the root since administration Part E.1c (2026-09-28; § *Manifest schema*).
 
 **Every bind of the endpoint is scoped, and the first component of the suffix names the
 projection.** `/bin` bound with base `/bin` forwards `bin` and `bin/list`; `/applications` bound
@@ -28,7 +30,12 @@ including the application namespaces documented as not having it (PR #279 review
 removes the bare form that made two different things look alike.
 
 The projected set is a fixed list in the server, not "whatever a package happens to contain": a
-package is data, and what appears in a namespace is policy.
+package is data, and what appears in a namespace is policy. **A projection is flat**, one
+directory of names, so the manual's pages are named `<name>.<section>.md` rather than filed by <!-- check-docs: allow-missing -->
+section. **The manual is here rather than on the root filesystem** because a subtree of that
+filesystem's one writable mount, bound into a session, is writable by it: the kernel does not
+narrow a forwarded resolve's rights (`TODO(mount-write-authority)`). The fonts are still bound
+that way, and a session can write them (`TODO(writable-fonts)`).
 
 The **system profile** is projected at `/bin`
 from a manifest over the store by `userspace/profile-server`, which `init`

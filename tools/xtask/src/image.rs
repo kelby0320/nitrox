@@ -427,6 +427,13 @@ fn store_hash(bytes: &[u8]) -> String {
 /// A store path for a package containing several programs. The hash covers **every** ELF, in the
 /// given order, so changing any one moves the whole package.
 pub(crate) fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
+    let elf = |b: &str| fs::read(userspace_bin_path(b)).map_err(|e| format!("read {b} ELF for store hash: {e}").into());
+    Ok(format!("/store/{}-{}-{}", store_hash(&package_bytes(bins, &elf)?), name, version))
+}
+
+/// What a package holding `bins` is hashed over, each ELF read by `elf`: what the package carries
+/// beside its programs too, or a changed file would sit at an unchanged store path.
+pub(crate) fn package_bytes(bins: &[&str], elf: &dyn Fn(&str) -> R<Vec<u8>>) -> R<Vec<u8>> {
     let mut bytes = Vec::new();
     // **The desktop entries are part of the package's contents**, so part of its hash: otherwise a
     // changed display name yields different contents at an identical store path.
@@ -436,12 +443,14 @@ pub(crate) fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<
             bytes.extend_from_slice(display.as_bytes());
         }
     }
-    for b in bins {
-        bytes.extend_from_slice(
-            &fs::read(userspace_bin_path(b)).map_err(|e| format!("read {b} ELF for store hash: {e}"))?,
-        );
+    // The manual travels with `man`.
+    if bins.contains(&"man") {
+        bytes.extend(manual_bytes()?);
     }
-    Ok(format!("/store/{}-{}-{}", store_hash(&bytes), name, version))
+    for b in bins {
+        bytes.extend(elf(b)?);
+    }
+    Ok(bytes)
 }
 
 /// The policy the build seeds at `/system/views.toml`: `view_broker::policy::seed(DEMO_USER)`, as

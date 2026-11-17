@@ -110,6 +110,7 @@ docs/
   design/          subsystems DESIGNED BUT NOT BUILT
   spec/            exact contracts (ABIs, wire formats, schemas, the shell language)
   reference/       catalogues (today: error codes only — see deferred-decisions.md)
+  manual/          the manual's pages, `man`'s: for the person using the system
   rationale/       why decisions were made (read here when puzzled)
   conventions/     how to write code in this project
   planning/        phase and subproject plans, with checkboxes
@@ -120,8 +121,8 @@ docs/
 **Which describe the system as it is today** — reading the wrong class as current is how you end
 up confidently wrong:
 
-- **`spec/`, `reference/`, `architecture/`, `conventions/` describe current behaviour.** When one
-  disagrees with the source, the source wins and the doc is a bug: fix it in the same change.
+- **`spec/`, `reference/`, `architecture/`, `conventions/`, `manual/` describe current behaviour.**
+  When one disagrees with the source, the source wins and the doc is a bug: fix it in the same change.
 - **`rationale/` explains why. `design/`, `planning/` and `archive/` do not describe current
   behaviour**: never conclude "the system does X" from them.
 - **`decision-log.md` is append-only**, each entry true as of its date. **Every `architecture/`
@@ -194,7 +195,6 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phases 0–6 are **complete**, the last (USB) on 2026-10-13. Now comes the work planned in
-`docs/planning/pre-phase-7.md` — the review harness, hygiene, a bug bash, the syscall surface —
+Phases 0–6 are **complete**, the last (USB) on 2026-10-13; now the work in `docs/planning/pre-phase-7.md`,
 then 7–9: the portable runtime, networking, the browser. Phases are **not renumbered**. The
 current phase is in `docs/decision-log.md`, the slices in `docs/planning/implementation-plan.md`.

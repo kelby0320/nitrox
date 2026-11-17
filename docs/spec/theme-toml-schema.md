@@ -15,8 +15,8 @@ protocol" below.
 `/home/theme.toml`, in the user's own subtree.
 
 **Not `/etc`, and that is a namespace decision rather than a filing preference.** A session
-namespace binds `/home`, `/bin`, `/dev/tty` and — for a graphical session — `/system/fonts`. It
-has no `/etc`, and `session-mgr/CLAUDE.md` requires that adding a member be a design decision
+namespace binds `/home`, `/bin`, `/dev/tty`, `/system/manual` and — for a graphical session —
+`/system/fonts`, among the members `session-mgr/CLAUDE.md` lists. It has no `/etc`, and `session-mgr/CLAUDE.md` requires that adding a member be a design decision
 each time. A theme is *a user's*, so the subtree the user already owns is where it belongs: no
 new authority is needed to read it, and it is somewhere a person can actually edit and delete.
 

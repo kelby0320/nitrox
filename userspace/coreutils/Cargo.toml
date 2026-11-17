@@ -112,3 +112,7 @@ path = "src/bin/shutdown.rs"
 [[bin]]
 name = "log"
 path = "src/bin/log.rs"
+
+[[bin]]
+name = "man"
+path = "src/bin/man.rs"
