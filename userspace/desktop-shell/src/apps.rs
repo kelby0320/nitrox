@@ -85,6 +85,8 @@ pub(super) fn build_app_namespace(l: &Launcher<'_>) -> Option<libsession::Constr
         home: l.home,
         user: l.user.as_bytes(),
         bind_fonts: true,
+        // An application's shell, as the terminal's, runs in this namespace.
+        bind_manual: true,
         bind_console: false,
         views_endpoint: l.views,
         views_base: l.views_base,

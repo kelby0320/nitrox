@@ -158,6 +158,8 @@ pub(crate) fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         println!("xtask: seeded /system/fonts ({} files, {total} bytes)", faces.len());
     }
 
+    stage_manual(staging)?;
+
     // `/system/licenses`: each crates.io crate's licence texts, which ask that a copy of the
     // software carry them, and the project's own.
     {

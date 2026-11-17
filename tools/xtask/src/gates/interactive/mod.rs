@@ -279,6 +279,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     steps += interactive_shell_language(s, &open_at_5)?;
     steps += interactive_paths(s)?;
+    steps += interactive_manual(s)?;
     steps += interactive_editing(s)?;
     steps += interactive_clipboard_and_completion(s)?;
     steps += interactive_administration(s)?;
@@ -306,6 +307,20 @@ fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> 
     let txt = format!("{}.txt", path.trim_end_matches(".nx"));
     quietly(s, &format!("{body} | save {txt}"), prompt)?;
     quietly(s, &format!("rename {txt} {path}"), prompt)
+}
+
+/// The manual: a page, read through the session's bind of `/system/manual`, and every page counted.
+fn interactive_manual(s: &mut Session) -> R<usize> {
+    quietly(s, "man man", "prints the page named NAME")?;
+    s.expect("/home>")?;
+    // Wrapped, as the count alone would match a digit anywhere in the log.
+    let pages = manual::pages()?.len();
+    quietly(s, "format(\"pages={}\", man | count)", &format!("pages={pages}"))?;
+    s.expect("/home>")?;
+    quietly(s, "man 5 manual-page", "The contract between a page")?;
+    s.expect("/home>")?;
+    println!("  ok: man printed its own page and a staged spec, and listed all {pages}");
+    Ok(3)
 }
 
 /// `test-interactive`'s steps 19d-1 to 19d-5: editing the line being typed, with the keys a serial

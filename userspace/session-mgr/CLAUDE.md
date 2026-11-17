@@ -143,6 +143,9 @@ from the same `Members`, with `/applications` and the console off and `/dev/draw
 - `/dev/entropy` — the kernel's generator, in **every** namespace it builds, an application's too:
   random bytes and nothing else, which every process could read before the generator was a node;
 - `/system/fonts` — **the graphical column only** (`bind_fonts`);
+- `/system/manual` — the manual's pages, read-only, in **both columns and every application**
+  (`bind_manual`): `man` reads it, from any shell, a terminal window's included (pre-Phase-7 Part
+  G.1);
 - **never the machine's block devices.** From Phase 5 Part H.1 until administration Part G.3 an
   installer boot's session held every one; now a program reaches a disk only through the view
   broker's `disks` grant, as `with admin nxinstall` does.

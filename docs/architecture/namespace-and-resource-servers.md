@@ -335,7 +335,7 @@ one:
 No namespace built to confine depends on covering (checked 2026-09-23). A
 session's and an application's — both built by `libsession::build_namespace` since administration Part
 F.1, an application's from `desktop-shell` — bind subtrees — `/home`, `/bin`, `/applications`,
-`/system/fonts`, `/dev/…` — with nothing narrower beneath any of them that hides
+`/system/fonts`, `/system/manual`, `/dev/…` — with nothing narrower beneath any of them that hides
 part of it, and a view adds only `/dev/blk/<n>` and its `info`, the same server's
 two names for one disk. Services share `init`'s root, which binds the whole root
 filesystem at `/` and so confines nothing to begin with. The kernel test

@@ -50,6 +50,7 @@ fn full<'a>(e: &'a Eps, root: Option<Ref<'a, Namespace, NsReadOnly>>) -> Members
         home: "/home/alice",
         user: b"alice",
         bind_fonts: true,
+        bind_manual: true,
         bind_console: true,
         views_endpoint: Some(e.views.as_ref()),
         views_base: "/s/3",
@@ -73,6 +74,7 @@ fn bare<'a>() -> Members<'a> {
         home: "",
         user: b"",
         bind_fonts: false,
+        bind_manual: false,
         bind_console: false,
         views_endpoint: None,
         views_base: "",
@@ -129,6 +131,7 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
             "/dev/storage",
             "/dev/services",
             "/system/fonts",
+            "/system/manual",
             "/dev/console",
             "/dev/entropy",
             "/dev/desktop",
@@ -138,6 +141,7 @@ fn a_session_binds_each_member_to_its_own_endpoint() {
         ("/dev/draw/new", 40, "/new"),
         ("/home", 41, "/home/alice"),
         ("/system/fonts", 41, "/system/fonts"),
+        ("/system/manual", 41, "/system/manual"),
         ("/bin", 42, "/bin"),
         ("/applications", 42, "/applications"),
         ("/dev/tty", 43, ""),
@@ -182,8 +186,12 @@ fn a_member_not_asked_for_is_not_bound() {
     let built = build_namespace(&only_home).unwrap();
     assert_eq!(paths(&entries(built.ns.as_ref())), ["/home"]);
     assert_eq!(built.bound, Bound::default());
-    let none = build_namespace(&Members { bind_fonts: true, bind_applications: true, ..bare() }).unwrap();
-    assert!(entries(none.ns.as_ref()).is_empty(), "fonts need the fs endpoint, applications the profile's");
+    let none =
+        build_namespace(&Members { bind_fonts: true, bind_manual: true, bind_applications: true, ..bare() }).unwrap();
+    assert!(
+        entries(none.ns.as_ref()).is_empty(),
+        "fonts and the manual need the fs endpoint, applications the profile's"
+    );
     let no_console = Members { bind_console: false, ..full(&e, Some(lookup_only(&root))) };
     let built = build_namespace(&no_console).unwrap();
     assert!(!paths(&entries(built.ns.as_ref())).contains(&"/dev/console") && !built.bound.console);

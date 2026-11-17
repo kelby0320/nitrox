@@ -34,6 +34,8 @@ pub struct Members<'a> {
     /// Bind `/system/fonts` read-only; **a flag** because a member bound for nothing is still
     /// authority held (`session-mgr/CLAUDE.md`).
     pub bind_fonts: bool,
+    /// Bind `/system/manual` read-only, the pages `man` shows: for whoever has a shell to run it.
+    pub bind_manual: bool,
     /// Bind `/dev/console`. **False for a graphical session** (`graphical-session.md`, governing
     /// decision 3); the serial column binds it as its terminal.
     pub bind_console: bool,
@@ -112,6 +114,7 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
         home,
         user,
         bind_fonts,
+        bind_manual,
         bind_console,
         views_endpoint,
         views_base,
@@ -233,6 +236,14 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
         && ns.bind_server("/system/fonts", fs, "/system/fonts").is_err()
     {
         log::write(b"libsession: /system/fonts bind FAIL (clients cannot render text)\n");
+    }
+
+    // `/system/manual` → the same, scoped to the manual's subtree.
+    if bind_manual
+        && let Some(fs) = fs_endpoint
+        && ns.bind_server("/system/manual", fs, "/system/manual").is_err()
+    {
+        log::write(b"libsession: /system/manual bind FAIL (man finds no pages)\n");
     }
 
     // `/dev/console` → a direct-handle bind, resolved from our own namespace. **Skipped for a
