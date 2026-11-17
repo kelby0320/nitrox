@@ -321,6 +321,33 @@ long to short, of several rows, over a long line and replaced, Enter mid-line, a
 - **`check-login`**: after the drag, `terminal` in the session's window answers the new width;
 - **`test-interactive`**: on serial, `terminal` reports the size null.
 
+**After review** (#452, thirteen findings: nine fixed, three deferred, one declined; `8f1dc751`,
+`f979fe85`):
+- **A refit moved the cursor off the line**: `libterm`'s reflow dropped every trailing blank and
+  held the cursor to its line's text, so a space typed at the prompt, or a line the refit filled
+  exactly, left the cursor a cell or a row from where the shell counted it, and what ran was not
+  what was shown. **A row now keeps what was printed in it, blanks too, and the cursor its
+  offset**, its line given the row to reach it. The discipline counts a recalled statement's
+  earlier rows as their text fills them, ends a row its text fills exactly with a line feed rather
+  than leave it wrapped into the next, and reaches the end of a row a refit filled by writing its
+  last character again, as typing reached it.
+- **Tab's listing goes below the line's end** (`Discipline::leave`, Enter's move), not from the
+  cursor's row over a wrapped line's later rows; **`Ctrl-C` passes the line at the width the
+  terminal has now**, the shell asking then too.
+- **A size is read from a body's first four bytes**, any after them a later version's, as the wire
+  format's schema evolution has it; `Size::decode` had wanted exactly four where `nxsh` read the
+  first four. `OP_TTY_ATTACH_BACKEND`'s doc says its body is the grid.
+- **Deferred**: a line taller than its window (`TODO(tall-line)`), a `Ctrl-C` lost between a size
+  asked and a prompt (`TODO(size-then-prompt)`), and a key reaching the server before a refit's
+  size (`TODO(resize-unsent)`). **Declined**: pinning `\r` as the move to column 0, which no
+  terminal here tells from `CSI D`.
+- **Tests**: nine screens in `libterm` and three in its grid, one each in `libline` and the size,
+  two in the editor, and **a randomized one**: edits, recalls, refits of width and height, at the
+  screen's top and its foot, 240 runs checked after every step against the text laid out afresh.
+  The boot probe sends `AttachBackend` a body too short to be a size. **Controls**: 21 mutations,
+  each failing a test; the randomized check at 20,000 runs found 533 failures and then 21 before
+  the last two pieces, and none after; `test-qemu` fails with the size's refusal removed.
+
 ### G.3 The pager
 
 **Moves first**: the shell's table display into `libstream`, if call 3 says so. Then the shell

@@ -38604,3 +38604,15 @@ G.1 merged, #451. G.2, `manual.md` § G.2, built on `pre-phase-7/part-g2-tty-siz
   `disk --mount` is an option: a stage's terminal is a sibling of the shell's with its own echo and
   line, so `stty`'s model, one device every process shares, does not carry over.
 - **Page Up and Page Down** are decoded for whoever reads keys: the pager, G.3.
+- **On review, a refit keeps the line where the shell counts it.** `libterm`'s reflow dropped every
+  trailing blank and held the cursor to its line's text, so a space typed at the prompt, or a line
+  a refit filled exactly, put the cursor a cell or a row from the discipline's count. **A row keeps
+  what was printed in it, blanks too**, and not cells never written or since erased, so an idle
+  screen's empty columns still do not wrap into rows; **the cursor keeps its offset**, its line
+  given the row to reach it. The discipline meets it halfway: it counts rows as the terminal lays
+  the text out, so ends a row its text fills exactly with a line feed rather than leave it wrapped
+  into what follows, and reaches the end of a row a refit filled by writing, as typing did.
+  Redrawing from a fresh row at every refit was the other way, and would have left the old line
+  above as debris.
+- **A size is read from a body's first four bytes**, any after them a later version's, as a field
+  added to a body's end is; the decoder wanted exactly four where `nxsh` read the first four.
