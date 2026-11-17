@@ -45,7 +45,9 @@ fn tty(term: Ref<'_, Channel, Only>, op: u16, body: &[u8], interrupted: &mut boo
 }
 
 /// `term`'s size, as its window last said; `None` if it never has, as the serial console cannot,
-/// or the terminal did not answer. An `Interrupt` meanwhile is stepped over: the shell has it too.
+/// or the terminal did not answer. An `Interrupt` meanwhile is stepped over and not kept, the shell
+/// having its own; a program that asked and then prompted would take a `Ctrl-C` typed between for
+/// an empty answer, and none does (`TODO(size-then-prompt)`).
 pub fn size_on<'a>(term: impl Into<Ref<'a, Channel, Only>>) -> Option<Size> {
     match tty(term.into(), OP_TTY_SIZE, &[], &mut false) {
         Some((false, body)) => Size::decode(&body).filter(|s| s.is_known()),

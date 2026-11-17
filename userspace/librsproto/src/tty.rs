@@ -34,9 +34,10 @@ impl Size {
         [c0, c1, r0, r1]
     }
 
-    /// A size from `body`, which must be exactly [`LEN`](Self::LEN) bytes.
+    /// A size from `body`'s first [`LEN`](Self::LEN) bytes; any after them are a later version's,
+    /// as a field added to the end of a body is (`rsproto-wire-format.md` § Schema evolution).
     pub fn decode(body: &[u8]) -> Option<Size> {
-        let &[c0, c1, r0, r1] = body else { return None };
+        let &[c0, c1, r0, r1, ..] = body else { return None };
         Some(Size { cols: u16::from_le_bytes([c0, c1]), rows: u16::from_le_bytes([r0, r1]) })
     }
 }
@@ -53,10 +54,11 @@ mod tests {
     }
 
     #[test]
-    fn a_body_of_any_other_length_is_no_size() {
-        for body in [&[][..], &[1, 0, 2][..], &[1, 0, 2, 0, 0][..]] {
+    fn a_shorter_body_is_no_size_and_a_longer_one_is_its_first_four_bytes() {
+        for body in [&[][..], &[1, 0, 2][..]] {
             assert_eq!(Size::decode(body), None, "{body:?}");
         }
+        assert_eq!(Size::decode(&[1, 0, 2, 0, 9]), Some(Size { cols: 1, rows: 2 }), "a later version's field");
     }
 
     #[test]

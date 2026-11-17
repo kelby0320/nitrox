@@ -30,11 +30,23 @@ impl Screen {
 
     /// A grid whose discipline knows the width, as `nxsh`'s does in a window.
     fn wide(cols: usize, rows: usize) -> Screen {
+        Screen::under("", cols, rows)
+    }
+
+    /// [`wide`](Self::wide), the prompt after `above`, earlier output a misplaced edit would draw on.
+    fn under(above: &str, cols: usize, rows: usize) -> Screen {
         let mut s = Screen { grid: Grid::new(cols, rows), parser: Parser::new(), disc: Discipline::new() };
+        s.draw(above.as_bytes());
         s.disc.set_width(Some(cols));
         s.disc.set_prompt(2);
         s.draw(b"> ");
         s
+    }
+
+    /// The window refitted to `cols`, and the shell told at its next read.
+    fn refit(&mut self, cols: usize) {
+        let _ = self.grid.resize(cols, self.grid.rows());
+        self.disc.set_width(Some(cols));
     }
 
     fn rows(&self) -> Vec<String> {
@@ -252,4 +264,243 @@ fn a_statement_of_several_rows_replaced_starts_again_on_the_prompts_row() {
     let shown = s.disc.replace_line(b"ok");
     s.draw(&shown);
     assert_eq!((s.rows()[..2].to_vec(), s.grid.cursor()), (alloc::vec![String::from("> ok"), String::new()], (0, 4)));
+}
+
+#[test]
+fn a_refit_to_where_the_line_fills_its_row_leaves_the_cursor_after_it() {
+    let mut s = Screen::under("prev\r\n", W, 4);
+    s.type_in(&[Text("abcde")]);
+    s.refit(7);
+    assert_eq!(s.grid.cursor(), (2, 0), "after the line, as a space typed there would be");
+    s.type_in(&[Text("f")]);
+    assert_eq!(
+        (s.rows()[..3].to_vec(), s.grid.cursor()),
+        (alloc::vec!["prev".into(), "> abcde".into(), "f".into()], (2, 1))
+    );
+    s.type_in(&[Key(KEY_BACKSPACE), Key(KEY_BACKSPACE)]);
+    assert_eq!(
+        (s.rows()[..3].to_vec(), s.grid.cursor()),
+        (alloc::vec!["prev".into(), "> abcd".into(), "".into()], (1, 6))
+    );
+}
+
+#[test]
+fn a_space_typed_before_a_refit_keeps_its_cell() {
+    let mut s = Screen::wide(W, 4);
+    s.type_in(&[Text("cat ")]);
+    s.refit(5);
+    s.type_in(&[Text("x")]);
+    assert_eq!((s.rows()[..2].to_vec(), s.grid.cursor()), (alloc::vec!["> cat".into(), " x".into()], (1, 2)));
+}
+
+#[test]
+fn a_recalled_statement_refitted_is_replaced_from_its_prompt() {
+    let mut s = Screen::under("prev\r\n", W, 4);
+    let shown = s.disc.replace_line(b"if x {\n1 }");
+    s.draw(&shown);
+    s.refit(8);
+    assert_eq!(s.rows()[..3].to_vec(), alloc::vec![String::from("prev"), "> if x {".into(), "1 }".into()]);
+    let shown = s.disc.replace_line(b"ok");
+    s.draw(&shown);
+    assert_eq!(
+        (s.rows()[..3].to_vec(), s.grid.cursor()),
+        (alloc::vec!["prev".into(), "> ok".into(), "".into()], (1, 4))
+    );
+}
+
+/// Moved to, the row a refit filled would be held apart from the next by the terminal, and at the
+/// screen's foot there would be no next.
+#[test]
+fn the_end_of_a_row_a_refit_filled_is_reached_as_typing_reaches_it() {
+    let mut s = Screen::wide(W, 4);
+    s.type_in(&[Text("abcde"), Key(KEY_HOME)]);
+    s.refit(7);
+    s.type_in(&[Key(KEY_END)]);
+    assert_eq!(s.grid.cursor(), (1, 0));
+    s.refit(W);
+    assert_eq!((s.rows()[..2].to_vec(), s.grid.cursor()), (alloc::vec!["> abcde".into(), "".into()], (0, 7)));
+
+    let mut s = Screen::under("1\r\n2\r\n3\r\n", W, 4);
+    s.type_in(&[Text("abcde"), Key(KEY_HOME)]);
+    s.refit(7);
+    s.type_in(&[Key(KEY_END), Text("f")]);
+    assert_eq!((s.rows()[2..].to_vec(), s.grid.cursor()), (alloc::vec!["> abcde".into(), "f".into()], (3, 1)));
+}
+
+#[test]
+fn output_after_a_line_that_fills_its_row_is_a_line_of_its_own() {
+    let mut s = Screen::wide(W, 4);
+    s.type_in(&[Text("abcdefgh"), Key(KEY_ENTER)]);
+    s.draw(b"out\r\n");
+    s.refit(12);
+    assert_eq!(s.rows()[..2].to_vec(), alloc::vec![String::from("> abcdefgh"), "out".into()]);
+}
+
+/// Wrapped, empty and filled exactly, each as a terminal lays it out, so the cursor's row is right.
+#[test]
+fn a_recalled_statements_earlier_rows_take_the_rows_their_text_fills() {
+    let mut s = Screen::under("prev\r\n", W, 7);
+    let shown = s.disc.replace_line(b"abcdefghijkl\n\nabcdefghij\nxy");
+    s.draw(&shown);
+    let rows = ["prev", "> abcdefgh", "ijkl", "", "abcdefghij", "xy"].map(String::from);
+    assert_eq!((s.rows()[..6].to_vec(), s.grid.cursor()), (rows.to_vec(), (5, 2)));
+    let shown = s.disc.replace_line(b"ok");
+    s.draw(&shown);
+    assert_eq!(
+        (s.rows()[..3].to_vec(), s.grid.cursor()),
+        (alloc::vec!["prev".into(), "> ok".into(), "".into()], (1, 4))
+    );
+}
+
+/// Only the first row follows the prompt; one filled exactly stays apart from the next on a refit.
+#[test]
+fn a_recalled_statements_later_rows_start_at_the_margin() {
+    let mut s = Screen::wide(W, 5);
+    let shown = s.disc.replace_line(b"if {\n12345678\n1234567890\nx");
+    s.draw(&shown);
+    let rows = ["> if {", "12345678", "1234567890", "x"].map(String::from);
+    assert_eq!((s.rows()[..4].to_vec(), s.grid.cursor()), (rows.to_vec(), (3, 1)));
+    s.refit(12);
+    assert_eq!((s.rows()[..4].to_vec(), s.grid.cursor()), (rows.to_vec(), (3, 1)));
+}
+
+/// A completion's listing goes below the line's end, wherever the cursor is in it.
+#[test]
+fn a_listing_leaves_the_line_whole_above_it() {
+    for (typed, line) in [("abcdefghijkl", alloc::vec!["> abcdefgh", "ijkl"]), ("abcdefgh", alloc::vec!["> abcdefgh"])]
+    {
+        let mut s = Screen::wide(W, 8);
+        s.type_in(&[Text(typed), Key(KEY_HOME), Key(KEY_RIGHT)]);
+        let left = s.disc.leave();
+        s.draw(&left);
+        s.draw(b"x  y\r\n> ");
+        let shown = s.disc.redraw();
+        s.draw(&shown);
+        let want: Vec<String> = line.iter().chain(&["x  y"]).chain(&line).map(|r| String::from(*r)).collect();
+        assert_eq!((s.rows()[..want.len()].to_vec(), s.grid.cursor()), (want, (line.len() + 1, 3)), "{typed}");
+    }
+}
+
+/// Nothing typed under a prompt as wide as the terminal: the wrap the prompt left pending is its own,
+/// and what follows the line starts on the next row, not over the prompt.
+#[test]
+fn enter_under_a_prompt_that_fills_its_row_leaves_the_prompts_wrap() {
+    let mut s = Screen { grid: Grid::new(W, 4), parser: Parser::new(), disc: Discipline::new() };
+    s.draw(b"prev\r\n0123456789");
+    s.disc.set_width(Some(W));
+    s.disc.set_prompt(W);
+    s.type_in(&[Key(KEY_ENTER)]);
+    s.draw(b"out");
+    assert_eq!(s.rows()[..3].to_vec(), alloc::vec![String::from("prev"), "0123456789".into(), "out".into()]);
+}
+
+/// Every row there is, history first, to the last that holds text or the cursor; and the cursor.
+fn every_row(s: &Screen) -> (Vec<String>, (usize, usize)) {
+    let text = |cells: &[crate::cell::Cell]| String::from(cells.iter().map(|c| c.ch).collect::<String>().trim_end());
+    let mut rows: Vec<String> = s.grid.scrollback().map(|l| text(&l.cells)).collect();
+    let (history, (row, col)) = (rows.len(), s.grid.cursor());
+    let screen = s.rows();
+    let last = screen.iter().rposition(|r| !r.is_empty()).unwrap_or(0).max(row);
+    rows.extend_from_slice(&screen[..=last]);
+    (rows, (history + row, col))
+}
+
+/// What `every_row` should be, laid out afresh: `above`, the prompt and the line at width `w`, each
+/// row of a statement as many as its text fills, the cursor at its offset into the last.
+fn laid_out(above: &[&str], prompt: &str, line: &[u8], cursor: usize, w: usize) -> (Vec<String>, (usize, usize)) {
+    let mut rows = Vec::new();
+    let put = |text: &[char], least: usize, rows: &mut Vec<String>| {
+        let n = text.len().div_ceil(w).max(least).max(1);
+        rows.extend((0..n).map(|r| {
+            text[(r * w).min(text.len())..((r + 1) * w).min(text.len())].iter().collect::<String>().trim_end().into()
+        }));
+    };
+    for a in above {
+        put(&a.chars().collect::<Vec<_>>(), 1, &mut rows);
+    }
+    let (mut start, mut at) = (0, (0, 0));
+    let parts: Vec<&[u8]> = line.split(|&b| b == b'\n').collect();
+    for (k, part) in parts.iter().enumerate() {
+        let lead = if k == 0 { prompt } else { "" };
+        let text: Vec<char> = lead.chars().chain(String::from_utf8_lossy(part).chars()).collect();
+        let mut least = 1;
+        if k + 1 == parts.len() {
+            let off = lead.chars().count() + String::from_utf8_lossy(&line[start..cursor]).chars().count();
+            (least, at) = (off / w + 1, (rows.len() + off / w, off % w));
+        }
+        put(&text, least, &mut rows);
+        start += part.len() + 1;
+    }
+    while rows.len() > at.0 + 1 && rows.last().is_some_and(|r| r.is_empty()) {
+        rows.pop();
+    }
+    (rows, at)
+}
+
+/// The next of a fixed sequence (xorshift), below `n`.
+fn below(seed: &mut u64, n: u64) -> u64 {
+    *seed ^= *seed << 13;
+    *seed ^= *seed >> 7;
+    *seed ^= *seed << 17;
+    *seed % n
+}
+
+fn word(seed: &mut u64) -> String {
+    (0..below(seed, 8)).map(|_| ['a', ' ', 'b', '\u{e9}'][below(seed, 4) as usize]).collect()
+}
+
+/// Typing, editing, recalling and refitting at random, the screen always shows the line where the
+/// discipline puts it: at the screen's top and its foot, where a move down cannot go.
+#[test]
+fn random_edits_and_refits_keep_the_screen_and_the_line_in_step() {
+    use libkern::abi::KEY_DELETE;
+    let seed = &mut 0x9E37_79B9_7F4A_7C15_u64;
+    for case in 0..240 {
+        let p = 1 + below(seed, 3) as usize;
+        let prompt = "$".repeat(p - 1) + " ";
+        let (mut w, mut height) = (p + 1 + below(seed, 10) as usize, 16 + below(seed, 4) as usize);
+        let above: Vec<&str> = if case % 2 == 0 { alloc::vec!["output"] } else { alloc::vec!["output"; 20] };
+        let mut s = Screen { grid: Grid::new(w, height), parser: Parser::new(), disc: Discipline::new() };
+        for a in &above {
+            s.draw(a.as_bytes());
+            s.draw(b"\r\n");
+        }
+        s.disc.set_width(Some(w));
+        s.disc.set_prompt(p);
+        s.draw(prompt.as_bytes());
+        let mut done = Vec::new();
+        for _ in 0..30 {
+            match below(seed, 14) {
+                0..=3 if s.disc.line().len() < 20 => {
+                    let t = word(seed);
+                    s.type_in(&[Text(&t)]);
+                    done.push(alloc::format!("type {t:?}"));
+                }
+                4 => s.type_in(&[Key(KEY_BACKSPACE)]),
+                5 => s.type_in(&[Key(KEY_DELETE)]),
+                6 => s.type_in(&[Key(KEY_LEFT)]),
+                7 => s.type_in(&[Key(KEY_RIGHT)]),
+                8 => s.type_in(&[Key(KEY_HOME)]),
+                9 => s.type_in(&[Key(KEY_END)]),
+                10 => s.type_in(&[Text(["\x15", "\x17"][below(seed, 2) as usize])]),
+                11 => {
+                    let t = alloc::format!("{}\n{}", word(seed), word(seed));
+                    let shown = s.disc.replace_line(t.as_bytes());
+                    s.draw(&shown);
+                    done.push(alloc::format!("recall {t:?}"));
+                }
+                12 => {
+                    height = 16 + below(seed, 4) as usize;
+                    let _ = s.grid.resize(w, height);
+                }
+                _ => {
+                    w = p + 1 + below(seed, 10) as usize;
+                    s.refit(w);
+                }
+            }
+            done.push(alloc::format!("at {w}x{height}"));
+            let want = laid_out(&above, &prompt, s.disc.line(), s.disc.cursor(), w);
+            assert_eq!(every_row(&s), want, "case {case}: {done:?}");
+        }
+    }
 }

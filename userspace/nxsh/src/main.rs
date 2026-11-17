@@ -634,7 +634,9 @@ fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Han
         // `Ctrl-C` at a prompt discards the line (§11h): the byte became an event, so the read came
         // back empty. The tty only reports it; what it means is the caller's decision.
         if notices.take_interrupt() {
-            tty.write(&editor.interrupt());
+            // The width as it is now: a second interrupt the exchange steps over answers the next
+            // read at once.
+            tty.write(&editor.interrupt(tty.size().map(|s| usize::from(s.cols))));
             prompt(&mut editor, &interp);
             continue;
         }

@@ -1504,7 +1504,9 @@ The line being typed has a cursor (v1.3), as readline's does. Each key acts at i
   only Backspace, `Ctrl-U` and `Ctrl-W`, as Linux's does.
 - **Where the terminal says its width**, as a window does, the redraw moves the cursor by row and
   column, so a line wider than its row is edited across the wrap. The shell asks the width after
-  every read, so a window refitted mid-line is drawn to its new width from the next key.
+  every read and at `Ctrl-C`, so a window refitted mid-line is drawn to its new width from the next
+  key. Tab's listing goes below the line's end, wherever the cursor is in it. A line taller than
+  the window is edited short of its rows (`TODO(tall-line)`).
 - **Where it cannot**, as a serial line cannot, the redraw is Backspace and text, which works on
   any terminal, the framebuffer console's included, and draws a line that fills its row wrong
   (`TODO(serial-size)`).

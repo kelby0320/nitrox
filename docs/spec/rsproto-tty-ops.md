@@ -116,11 +116,12 @@ grouping, and `Ctrl-C` typed in one window has no business interrupting a progra
 Request: **one moved handle** — a channel whose far end the sender keeps, with `SEND`, `RECV`,
 `WAIT` and `INSPECT` — and a body that is empty or **the emulator's grid**, a size as `Size`
 answers one. Reply: empty on success; `InvalidArgument` if no handle was moved, it is not a channel
-end, or the body is neither empty nor a size, `NoAccess` if it lacks one of the four rights, and
-`NotFound` if the terminal is gone. The handle is checked first, so a gone terminal sent a bad one answers for
-the handle. A refused handle is closed. The server sends output on the channel, receives input
-from it, and waits on it beside every terminal it serves, so one it could not wait on would fail
-every wait of its loop; it learns what it was given by a stat, which needs `INSPECT`.
+end, or the body is too short to be a size but not empty, `NoAccess` if it lacks one of the four
+rights, and `NotFound` if the terminal is gone. The handle is checked first, so a gone terminal
+sent a bad one answers for the handle. A refused handle is closed. The server sends output on the
+channel, receives input from it, and waits on it beside every terminal it serves, so one it could
+not wait on would fail every wait of its loop; it learns what it was given by a stat, which needs
+`INSPECT`.
 
 From then on the terminal's output arrives on that channel as `Output`, and its input is whatever
 comes back as `Input`, instead of the serial console.
@@ -157,8 +158,8 @@ as over console input, which is what keeps one implementation of `Ctrl-C`, erase
 
 **Emulator → server on a backend channel. Unsolicited, `request_id` 0, no reply.** Body: the
 grid's new size, as `Size` answers one. Sent at every refit — a window's resize, or a font change
-that fits a different grid — and only then: the size persists until the next. A body that is not
-a size is ignored, as anything else on this channel is, there being no request to refuse.
+that fits a different grid — and only then: the size persists until the next. A body too short to
+be a size is ignored, as anything else on this channel is, there being no request to refuse.
 
 The server tells nobody: a program asks when it is about to draw to the width. **There is no
 `SIGWINCH`**, since a message pushed to every terminal on a window would queue, during a drag,
@@ -206,7 +207,9 @@ tokens at most; past that the oldest goes, which costs its holder a password pro
 ### `Size` (`0x0B0C`)
 
 Request: empty. Reply: **4 bytes**, columns then rows, each a little-endian `u16`
-(`librsproto::tty::Size`).
+(`librsproto::tty::Size`). A size is read from a body's first four bytes, here and in
+`AttachBackend` and `Resize`; any after them are a later version's, as a field added to a body's
+end is ([`rsproto-wire-format.md`](rsproto-wire-format.md) § Schema evolution).
 
 **A terminal's size is its backend's**: every sibling in a window answers the window's grid, as the
 emulator last said it in `AttachBackend` or `Resize`. **`0×0` means unknown**, a side of 0 as much

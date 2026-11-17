@@ -588,3 +588,11 @@ fn a_page_key_edits_nothing() {
         assert_eq!((d.line(), d.cursor()), (&b"hello"[..], 4), "{k:?}");
     }
 }
+
+/// With no prompt an empty line ends at the margin, not a full row's end, so Enter starts a row.
+#[test]
+fn enter_at_an_empty_line_under_no_prompt_starts_a_row() {
+    let mut d = Discipline::new();
+    d.set_width(Some(10));
+    assert_eq!(drive(&mut d, "\r"), (alloc::vec![alloc::string::String::new()], "\r\n".into()));
+}

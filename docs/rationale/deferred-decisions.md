@@ -1702,6 +1702,29 @@ the login and the prompts `with`, `account` and `nxinstall` put, whose passwords
 whose other answers are short. Trigger: a prompt whose answer, echoed, can be wider than a row: a
 path, say.
 
+**A line taller than its window is edited short of its rows — `TODO(tall-line)`.** The discipline
+moves the cursor by relative steps, and `CSI A` stops at the screen's top, so once a line's first
+rows have scrolled away an edit lands on a row too low and the redraw shifts what is shown. At
+`nxterm`'s first size, 80 by 20, no line reaches it: 1,600 cells hold the 1,024 bytes of
+`LINE_MAX`. A window refitted below that, 60 by 16 say, and a long paste do. `Tty::Size` carries
+the rows, so the discipline could see it coming and draw the line afresh below. Trigger: a person
+who edits a line longer than their window.
+
+**A size asked, then a prompt, loses a `Ctrl-C` between — `TODO(size-then-prompt)`.**
+`libprompt::size_on` steps over an `Interrupt` and does not keep it, as the shell has its own. A
+program that asked the size and then prompted would take a `Ctrl-C` typed between for an empty
+answer: the server answers the next `ReadLine` empty, and the `Interrupt` that marks it was the
+size's. `man` and `terminal` ask and never prompt. Trigger: a program that does both; then
+`libprompt` keeps the flag per terminal, or its prompts take one.
+
+**A refit's size can trail a key typed after it — `TODO(resize-unsent)`.** `nxterm` sends a
+`Resize` each frame the grid has changed and its input after it, on one backend channel. A send
+refused by a full ring is tried next frame, but the frame's input goes regardless, so if the server
+drained a slot between the two, a key reaches the shell before the size it was typed at, and its
+echo is drawn to the old width. Not seen: it needs the ring full at one send and not the next. A
+fix holds the input back while the size is unsent. Trigger: a probe that fills the ring shows it,
+or a line drawn to the wrong width after a refit.
+
 **A shell reading a file through a mapping is suspended when the fill fails — `TODO(mapped-read-faults)`.**
 `nxsh` reads a file by mapping it: `read_file` for a script, a `use` and `open`, and `read_head`
 for the first bytes of every program it runs (`userspace/nxsh/src/stage.rs`). A fill that fails —

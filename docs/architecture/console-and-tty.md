@@ -294,8 +294,9 @@ Two things changed shape and are worth naming, because both were assumptions rat
 
 **A terminal's size is its backend's** (pre-Phase-7 Part G.2). `nxterm` sends its grid with the
 attach and again at every refit (`Tty::Resize`), and every terminal on the window — the shell's and
-each stage's sibling — answers it to `Tty::Size`. Nothing is pushed: `nxsh` asks after every read,
-so its completion listing fits a window refitted mid-line, and `man` asks before it renders. The
+each stage's sibling — answers it to `Tty::Size`. Nothing is pushed: `nxsh` asks after every read
+and at `Ctrl-C`, so its line and its completion listing fit a window refitted mid-line, and `man`
+asks before it renders. The
 console's size is unknown, as a serial line cannot say, and a program draws to 80 columns there.
 
 ## Stage 3 — line editing, history, and where they belong
@@ -376,7 +377,12 @@ other. The discipline's host tests cover it either way.
   with `CSI A`/`B`/`C`/`D`, and erases with `CSI K` and `CSI J`. **No cursor is left with a wrap
   pending**: a write that fills a row exactly is followed by a space and a carriage return, which
   leaves the cursor at the next row's start on a terminal that holds the wrap, as xterm and
-  `libterm` do, and on one that does not, as `fbcon`. **Where it cannot**, it draws as a dumb
+  `libterm` do, and on one that does not, as `fbcon`. **Nor is that row left joined to the next**
+  where the line's text ends on it, at a recalled statement's `\n` or at Enter: up a row and a line
+  feed end it. Rows are counted as the terminal lays the text out, and `libterm`'s reflow keeps the
+  blanks printed and the cursor's offset, so a line refitted mid-edit is edited at the new width
+  from the next key; the end of a row a refit filled is reached by writing its last character, as
+  typing reached it. **Where it cannot**, it draws as a dumb
   terminal does, with Backspace and text, and a line that fills its row is drawn wrong there:
   `TODO(serial-size)`, and in canonical mode, whose server does not know where its client's
   prompt ended, `TODO(canonical-wrap)`.

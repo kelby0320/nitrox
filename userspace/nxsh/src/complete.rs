@@ -222,7 +222,8 @@ impl Completion {
     }
 }
 
-/// The bytes that show `candidates` beneath the line being edited.
+/// The bytes that show `candidates` beneath the line being edited, from the new row the editor
+/// leaves it for.
 ///
 /// A decision, not byte plumbing: how many fit on a row, what gets cut and how the cut is
 /// reported are host-testable, and the loop's share is one `write`.
@@ -234,7 +235,7 @@ pub fn listing(candidates: &[String], width: usize) -> Vec<u8> {
     const GAP: usize = 2;
 
     let shown = candidates.len().min(MAX_LISTED);
-    let mut out = Vec::from(&b"\r\n"[..]);
+    let mut out = Vec::new();
     if shown == 0 {
         return out;
     }
@@ -461,7 +462,6 @@ mod tests {
     #[test]
     fn a_listing_puts_each_candidate_on_the_screen() {
         let out = listed(&["copy", "count", "continue"]);
-        assert!(out.starts_with("\r\n"), "the listing must leave the line being edited alone");
         for want in ["copy", "count", "continue"] {
             assert!(out.contains(want), "{want} is missing from {out:?}");
         }
@@ -471,15 +471,15 @@ mod tests {
     #[test]
     fn a_listing_fills_a_row_before_starting_another() {
         let names: Vec<&str> = alloc::vec!["abcd"; 13];
-        assert_eq!(listed(&names).matches("\r\n").count(), 2, "13 six-wide names are one row");
+        assert_eq!(listed(&names).matches("\r\n").count(), 1, "13 six-wide names are one row");
         let names: Vec<&str> = alloc::vec!["abcd"; 14];
-        assert_eq!(listed(&names).matches("\r\n").count(), 3, "the 14th starts a second row");
+        assert_eq!(listed(&names).matches("\r\n").count(), 2, "the 14th starts a second row");
     }
 
     #[test]
     fn a_listing_fills_the_width_it_is_given() {
         let names: Vec<String> = alloc::vec![String::from("abcd"); 13];
-        let rows = |width| String::from_utf8(listing(&names, width)).expect("text").matches("\r\n").count() - 1;
+        let rows = |width| String::from_utf8(listing(&names, width)).expect("text").matches("\r\n").count();
         assert_eq!((rows(80), rows(40), rows(5)), (1, 3, 13));
         assert_eq!((rows(42), rows(41)), (2, 3), "seven to a row at 42, six at 41");
         assert_eq!((rows(12), rows(11)), (7, 13), "two at 12, one at 11");
@@ -489,7 +489,7 @@ mod tests {
     fn a_name_wider_than_the_screen_does_not_divide_by_zero() {
         let long = "a".repeat(200);
         let out = listed(&[&long, &long]);
-        assert_eq!(out.matches("\r\n").count(), 3, "one row each, plus the leading break");
+        assert_eq!(out.matches("\r\n").count(), 2, "one row each");
     }
 
     #[test]
@@ -502,7 +502,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_listing_is_just_a_newline() {
-        assert_eq!(listed(&[]), "\r\n");
+    fn an_empty_listing_is_nothing() {
+        assert_eq!(listed(&[]), "");
     }
 }

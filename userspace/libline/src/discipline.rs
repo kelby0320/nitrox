@@ -63,7 +63,7 @@ enum EscState {
 
 mod screen;
 
-use screen::{Geometry, move_cursor};
+use screen::Geometry;
 
 /// One terminal's editing state. With a width it redraws by row and column; without, as on a serial
 /// line, by Backspace and text, which draws a wrapped line wrong (`TODO(serial-size)`).
@@ -241,6 +241,16 @@ impl Discipline {
         out
     }
 
+    /// What to write to leave the line as it stands, the cursor on a new row below it: a
+    /// completion's listing goes there, and the line is drawn again under it.
+    pub fn leave(&self) -> Vec<u8> {
+        match self.geometry() {
+            Some(g) if self.echo => self.finish(g),
+            None if self.echo => [&self.line[self.cursor..], b"\r\n"].concat(),
+            _ => b"\r\n".to_vec(),
+        }
+    }
+
     /// Act on an editing key and return what to write; Up and Down are not edits, and do nothing.
     pub fn edit(&mut self, key: Key) -> Vec<u8> {
         if let Some(g) = self.geometry() {
@@ -292,7 +302,7 @@ impl Discipline {
         }
         let mut out = Vec::new();
         if self.echo {
-            move_cursor(&mut out, at, self.cell(g, self.cursor));
+            self.reach(g, &mut out, at, self.cursor);
         }
         out
     }

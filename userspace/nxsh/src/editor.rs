@@ -64,9 +64,11 @@ impl Editor {
         self.disc.line()
     }
 
-    /// `Ctrl-C` at the prompt (§11h): the line, a search and a statement in progress are dropped.
-    /// What to write comes back, the rest of the line passed first so `^C` lands after it.
-    pub fn interrupt(&mut self) -> Vec<u8> {
+    /// `Ctrl-C` at the prompt (§11h), the terminal now `cols` wide: the line, a search and a
+    /// statement in progress are dropped. What to write comes back, the rest of the line passed
+    /// first so `^C` lands after it, which takes the width as it is: a refit has rewrapped the line.
+    pub fn interrupt(&mut self, cols: Option<usize>) -> Vec<u8> {
+        self.set_width(cols);
         self.search = None;
         self.pending.clear();
         let mut out = self.disc.edit(Key::End);
@@ -194,9 +196,9 @@ impl Editor {
                 Some(new_line) => alloc::vec![Out::Write(self.disc.replace_around(new_line.as_bytes(), &after))],
                 None => Vec::new(),
             },
-            // The list goes on its own lines, with no cursor addressing, for the serial console.
+            // The list goes on its own lines below the line's end, which the line stays above.
             Action::List => alloc::vec![
-                Out::Write(listing(&c.candidates, self.width)),
+                Out::Write([self.disc.leave(), listing(&c.candidates, self.width)].concat()),
                 if self.pending.is_empty() { Out::Prompt } else { Out::Continuation },
                 Out::Write(self.disc.redraw()),
             ],
@@ -331,7 +333,48 @@ mod tests {
         h.push("whoami");
         let mut e = Editor::new();
         feed_reads(&mut e, &mut h, &[b"if true {\r", b"\x12who"]);
-        e.interrupt();
+        e.interrupt(None);
         assert_eq!(feed_reads(&mut e, &mut h, &[b"1\r"]), ["1"]);
+    }
+
+    /// `Ctrl-C` passes the rest of the line at the width the terminal has now, not the one it was
+    /// typed at: a refit has rewrapped it.
+    #[test]
+    fn an_interrupt_passes_the_line_at_the_width_it_is_given() {
+        let ended = |typed_at: usize| {
+            let (mut e, mut h) = (Editor::new(), History::new());
+            e.set_prompt(2);
+            e.set_width(Some(typed_at));
+            feed_reads(&mut e, &mut h, &[b"abcdefghijklmnopqrstuvwxyz\x1b[H"]);
+            e.interrupt(Some(10))
+        };
+        assert!(ended(10).len() > b"^C\r\n".len(), "a move to the line's end, then the ^C");
+        assert_eq!(ended(20), ended(10));
+    }
+
+    /// Tab's listing starts on a row below the line's end, not on the row the cursor is on, which
+    /// would write over a wrapped line's later rows.
+    #[test]
+    fn a_listing_starts_below_the_lines_end() {
+        let typed = b"l aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\x1b[H\x1b[C";
+        let mut d = Discipline::new();
+        d.set_width(Some(20));
+        d.set_prompt(3);
+        for &b in typed {
+            if let Step::Key(k) = d.feed(b) {
+                let _ = d.edit(k);
+            }
+        }
+        let (mut e, mut h) = (Editor::new(), History::new());
+        e.set_width(Some(20));
+        e.set_prompt(3);
+        let names = ["list", "ls", "log"].map(String::from).to_vec();
+        let mut complete = |_: &str| Completion { start: 0, candidates: names.clone() };
+        for (i, &b) in typed.iter().enumerate() {
+            let _ = e.feed(b, typed.get(i + 1).copied(), &mut h, &mut complete);
+        }
+        let out = e.feed(b'\t', None, &mut h, &mut complete);
+        assert_ne!(d.leave(), b"\r\n", "the line's end is not where the cursor is");
+        assert_eq!(out.first(), Some(&Out::Write([d.leave(), listing(&names, 20)].concat())));
     }
 }

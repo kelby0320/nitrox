@@ -80,6 +80,8 @@ impl Backend {
     }
 
     /// Tell the server the grid is now `size`, if that is news; a failed send is tried next frame.
+    /// The frame's input goes regardless, so a ring full for the one and not the other would let a
+    /// key reach the server before the size it was typed at (`TODO(resize-unsent)`).
     pub fn resize(&mut self, size: Size) {
         if size != self.told && send(&self.channel, OP_TTY_RESIZE, 0, 0, &size.encode(), &mut Carried::new()).is_ok() {
             self.told = size;

@@ -147,8 +147,9 @@ pub const OP_TTY_INTERRUPT: u16 = 0x0B05;
 ///
 /// Sent by a terminal emulator, moving **one handle**: a channel whose far end it keeps. That
 /// terminal's output then arrives on it as [`OP_TTY_OUTPUT`] and its input is whatever the
-/// emulator sends back as [`OP_TTY_INPUT`]. Empty body; empty reply on success
-/// (`rsproto-tty-ops.md` § AttachBackend).
+/// emulator sends back as [`OP_TTY_INPUT`]. The body is the emulator's grid, a [`tty::Size`], or
+/// empty, which leaves the size unknown; empty reply on success (`rsproto-tty-ops.md` §
+/// AttachBackend).
 pub const OP_TTY_ATTACH_BACKEND: u16 = 0x0B06;
 
 /// Server → emulator on a backend channel: **render these bytes.**

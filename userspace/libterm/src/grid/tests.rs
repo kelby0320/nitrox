@@ -267,6 +267,46 @@ fn the_cursor_follows_the_character_it_was_on() {
     assert_eq!(g.cursor(), (0, 11), "still just after the text it was after");
 }
 
+/// A space printed is text, so a narrower grid wraps it with the rest; one erased is gone.
+#[test]
+fn a_reflow_keeps_spaces_printed_and_drops_those_erased() {
+    let mut g = Grid::new(8, 4);
+    feed(&mut g, "ab   \r\nx");
+    g.resize(3, 4);
+    assert_eq!((line(&g, 2), g.cursor()), ("x".into(), (2, 1)), "the spaces took a row");
+    let mut g = Grid::new(8, 4);
+    feed(&mut g, "ab   \x1b[2D\x1b[K\r\nx");
+    g.resize(2, 4);
+    assert_eq!((line(&g, 2), g.cursor()), ("x".into(), (2, 1)), "of three spaces, the two erased took none");
+    let mut g = Grid::new(8, 4);
+    feed(&mut g, "ab  \x1b[1K\r\nx");
+    g.resize(2, 4);
+    assert_eq!(line(&g, 1), "x", "nor a row erased to the cursor from its start");
+}
+
+/// What was printed in a row goes with it when it scrolls.
+#[test]
+fn a_rows_printed_extent_scrolls_with_it() {
+    let mut g = Grid::new(8, 2);
+    feed(&mut g, "x\r\nab  \r\nc");
+    g.resize(2, 4);
+    assert_eq!((line(&g, 1), line(&g, 3), g.cursor()), ("ab".into(), "c".into(), (3, 1)), "its spaces took a row");
+}
+
+/// Its offset kept exactly, a row made for it where its line ends one exactly.
+#[test]
+fn the_cursor_past_its_lines_text_stays_where_the_next_character_goes() {
+    let mut g = Grid::new(10, 4);
+    feed(&mut g, "abcd");
+    g.resize(4, 4);
+    assert_eq!(g.cursor(), (1, 0));
+    assert!(g.row_wrapped(0), "the cursor's row continues the line");
+    let mut g = Grid::new(10, 4);
+    feed(&mut g, "ab\x1b[3C");
+    g.resize(4, 4);
+    assert_eq!(g.cursor(), (1, 1), "three cells past its text, as it was");
+}
+
 #[test]
 fn resizing_an_idle_screen_pushes_nothing_into_the_scrollback() {
     let mut g = Grid::new(20, 10);

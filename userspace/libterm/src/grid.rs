@@ -34,6 +34,9 @@ pub struct Line {
     pub cells: Vec<Cell>,
     /// A soft wrap: text ran past the right margin and continues on the next line.
     pub wrapped: bool,
+    /// The cells up to the last one printed to, which a reflow keeps though blank: a space typed
+    /// at a prompt is text, and dropping it moves what follows.
+    pub printed: usize,
 }
 
 /// How a [`resize`](Grid::resize) moved the lines, so an anchor into them can follow.
@@ -127,6 +130,8 @@ pub struct Grid {
     scrollback: VecDeque<Line>,
     /// Per screen row: its text continues on the row below. See [`Line::wrapped`].
     wrapped: Vec<bool>,
+    /// Per screen row: [`Line::printed`].
+    printed: Vec<usize>,
     /// Cursor row, always `< rows`.
     row: usize,
     /// Cursor column, always `< cols`.
@@ -149,9 +154,9 @@ pub struct Grid {
     selection: Option<Selection>,
 }
 
-/// Only exactly-blank cells: a space written with a background colour is content.
-fn trim_trailing_blanks(cells: &mut Vec<Cell>) {
-    while cells.last() == Some(&Cell::BLANK) {
+/// Only exactly-blank cells past `keep`: a space written with a background colour is content.
+fn trim_trailing_blanks(cells: &mut Vec<Cell>, keep: usize) {
+    while cells.len() > keep && cells.last() == Some(&Cell::BLANK) {
         cells.pop();
     }
 }
@@ -173,6 +178,7 @@ impl Grid {
             cells: vec![Cell::BLANK; cols * rows],
             scrollback: VecDeque::new(),
             wrapped: vec![false; rows],
+            printed: vec![0; rows],
             row: 0,
             col: 0,
             pending_wrap: false,
@@ -481,50 +487,64 @@ impl Grid {
         let keep = self.content_rows();
         for r in 0..keep {
             let cells = self.cells[r * self.cols..(r + 1) * self.cols].to_vec();
-            old.push(Line { cells, wrapped: self.wrapped[r] });
+            old.push(Line { cells, wrapped: self.wrapped[r], printed: self.printed[r] });
         }
         let cursor_row = sb_len + self.row;
 
         // 2. Join. `pos[i]` is where old line `i` starts: which logical line, and how far in.
+        // `kept[li]` is how much of logical line `li` was printed.
         let mut logical: Vec<Vec<Cell>> = Vec::new();
+        let mut kept: Vec<usize> = Vec::new();
         let mut pos: Vec<(usize, usize)> = Vec::with_capacity(old.len());
         let mut cur: Vec<Cell> = Vec::new();
+        let mut printed = 0;
         let mut open = false;
         for l in &old {
             pos.push((logical.len(), cur.len()));
+            printed = printed.max(cur.len() + l.printed);
             cur.extend_from_slice(&l.cells);
             open = true;
             if !l.wrapped {
-                trim_trailing_blanks(&mut cur);
+                trim_trailing_blanks(&mut cur, printed);
+                kept.push(cur.len());
                 logical.push(core::mem::take(&mut cur));
+                printed = 0;
                 open = false;
             }
         }
         if open {
             // The last row wrapped with nothing after it: a line still being written.
-            trim_trailing_blanks(&mut cur);
+            trim_trailing_blanks(&mut cur, printed);
+            kept.push(cur.len());
             logical.push(cur);
         }
+        // The cursor keeps its offset into its line, where the next character goes.
+        let (cursor_li, into) = pos[cursor_row];
+        let cursor_off = into + self.col;
 
         // 3. Re-break at the new width. `start[li]` is where logical line `li` begins.
         let blank = Cell::BLANK;
         let mut lines: Vec<Line> = Vec::with_capacity(logical.len());
         let mut start: Vec<usize> = Vec::with_capacity(logical.len());
         let mut height: Vec<usize> = Vec::with_capacity(logical.len());
-        for lg in &logical {
+        for (li, lg) in logical.iter().enumerate() {
             start.push(lines.len());
+            // Rows to the cursor's, past its line's text or where that ends a row exactly.
+            let least = if li == cursor_li { cursor_off / cols + 1 } else { 1 };
             let mut i = 0;
             loop {
                 let end = (i + cols).min(lg.len());
                 let mut cells = lg[i..end].to_vec();
                 cells.resize(cols, blank);
-                lines.push(Line { cells, wrapped: end < lg.len() });
+                let printed = kept[li].saturating_sub(i).min(end - i);
+                let more = end < lg.len() || lines.len() + 1 - start[li] < least;
+                lines.push(Line { cells, wrapped: more, printed });
                 i = end;
-                if i >= lg.len() {
+                if !more {
                     break;
                 }
             }
-            height.push(lines.len() - start[start.len() - 1]);
+            height.push(lines.len() - start[li]);
         }
 
         // Kept as offsets: resolving loses the column. [`Reflow::map_position`] divides.
@@ -535,9 +555,11 @@ impl Grid {
         // 4. The bottom `rows` become the screen; the rest is history.
         self.cells = vec![blank; cols * rows];
         self.wrapped = vec![false; rows];
+        self.printed = vec![0; rows];
         for (r, l) in lines[screen_start..].iter().enumerate() {
             self.cells[r * cols..(r + 1) * cols].copy_from_slice(&l.cells);
             self.wrapped[r] = l.wrapped;
+            self.printed[r] = l.printed;
         }
         // No fix-up of the last row: the final `lines` element ends a logical line.
         lines.truncate(screen_start);
@@ -552,12 +574,11 @@ impl Grid {
             }
         }
 
-        // 5. The cursor follows its character through the same map a selection uses.
+        // 5. The cursor goes to its offset, which step 3 gave a row; a selection's end, mapped,
+        // stops at its line's text instead.
         let reflow = Reflow { base, at, lines: line_spans, cols, evicted: 0 };
-        let (cursor_line, cursor_col) = reflow.map_position(base + cursor_row as u64, self.col);
-        let line_index = (cursor_line - base) as usize;
-        self.row = line_index.saturating_sub(screen_start).min(rows - 1);
-        self.col = cursor_col;
+        self.row = (start[cursor_li] + cursor_off / cols).saturating_sub(screen_start).min(rows - 1);
+        self.col = cursor_off % cols;
 
         // 5b. The selection follows too; `map_position` clamps an evicted line, harmlessly.
         self.selection = self.selection.map(|sel| Selection {
@@ -587,7 +608,7 @@ impl Grid {
     fn content_rows(&self) -> usize {
         let mut last = self.row;
         for r in 0..self.rows {
-            if self.cells[r * self.cols..(r + 1) * self.cols].iter().any(|c| *c != Cell::BLANK) {
+            if self.printed[r] > 0 || self.cells[r * self.cols..(r + 1) * self.cols].iter().any(|c| *c != Cell::BLANK) {
                 last = last.max(r);
             }
         }
@@ -669,6 +690,7 @@ impl Grid {
         let (row, col) = (self.row, self.col);
         let cell = Cell::new(c, self.attrs);
         self.cells[row * self.cols + col] = cell;
+        self.printed[row] = self.printed[row].max(col + 1);
         self.touch(row);
         if self.col + 1 >= self.cols {
             self.pending_wrap = true;
@@ -703,11 +725,15 @@ impl Grid {
     /// Move the top line into scrollback and open a blank one at the bottom.
     fn scroll_up(&mut self) {
         let cells = self.cells[0..self.cols].to_vec();
-        self.scrollback.push_back(Line { cells, wrapped: self.wrapped[0] });
+        self.scrollback.push_back(Line { cells, wrapped: self.wrapped[0], printed: self.printed[0] });
         // The flags move with their rows.
         self.wrapped.rotate_left(1);
         if let Some(last) = self.wrapped.last_mut() {
             *last = false;
+        }
+        self.printed.rotate_left(1);
+        if let Some(last) = self.printed.last_mut() {
+            *last = 0;
         }
         // Counts lines produced; eviction below does not adjust it.
         self.scrolled += 1;
@@ -746,12 +772,23 @@ impl Grid {
         };
         let blank = self.blank();
         self.cells[row * self.cols + from..row * self.cols + to].fill(blank);
+        self.erased(row, from, to);
         if to == self.cols {
             self.set_wrapped(row, false);
         }
         self.touch(row);
         // Erasing ends a pending wrap: the character that set it is gone.
         self.pending_wrap = false;
+    }
+
+    /// Columns `from..to` of `row` are erased: what was printed there is gone.
+    fn erased(&mut self, row: usize, from: usize, to: usize) {
+        let printed = &mut self.printed[row];
+        if to == self.cols {
+            *printed = (*printed).min(from);
+        } else if *printed <= to {
+            *printed = 0;
+        }
     }
 
     fn erase_in_display(&mut self, e: Erase) {
@@ -761,17 +798,22 @@ impl Grid {
             Erase::ToEnd => {
                 self.cells[row * self.cols + col..(row + 1) * self.cols].fill(blank);
                 self.cells[(row + 1) * self.cols..].fill(blank);
+                self.erased(row, col, self.cols);
+                self.printed[row + 1..].fill(0);
                 // Erased text cannot be continued below, or a reflow would join rows.
                 self.wrapped[row..].fill(false);
             }
             Erase::ToStart => {
                 self.cells[..row * self.cols].fill(blank);
                 self.cells[row * self.cols..row * self.cols + col + 1].fill(blank);
+                self.printed[..row].fill(0);
+                self.erased(row, 0, col + 1);
                 self.wrapped[..row].fill(false);
             }
             // `ED 2` does not scroll: `Ctrl-L` must not fill the scrollback with blank lines.
             Erase::All => {
                 self.cells.fill(blank);
+                self.printed.fill(0);
                 self.wrapped.fill(false);
             }
         }
