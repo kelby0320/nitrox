@@ -15,7 +15,8 @@ fixed 2026-11-01, and its Miri job built the same day; Part E detailed 2026-11-0
 built by 2026-11-05; Part J detailed 2026-11-05, J.1 to J.5 built 2026-11-06, J.6 to J.8 2026-11-10,
 J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6 to E.9 built
 2026-11-13, E.10 and E.11 2026-11-15, and the whole suite under Miri the same day; Part E done
-2026-11-16, #444 merged; Part F detailed 2026-11-16, and F.1 to F.5 built the same day.** Each later
+2026-11-16, #444 merged; Part F detailed 2026-11-16, and F.1 to F.5 built the same day; Part G
+detailed 2026-11-17.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
 the syscall-surface consolidation, planned separately in
@@ -1068,9 +1069,16 @@ wallpaper settings and the desktop's own context, does not exist yet.
 
 ## Part G — a manual for a person
 
-The system's workings written down for the person using it — the shell language, each program,
-the desktop — read with a `man`-style program from pages on the root filesystem, whose source is
-in the repository so there is one copy.
+The system's workings written down for the person using it and the programmer writing for it —
+the shell language, each program, the desktop, the services that start at boot, the syscall
+interface — read in the terminal with `man` and a pager, from pages on the root filesystem whose
+source is in the repository so there is one copy. **Detailed 2026-11-17**, in
+[`manual.md`](manual.md): seven sub-parts, a PR each, measured on `main` at PR #450's merge. The
+page format and `man`; the terminal's size on the tty protocol; a pager; the shell's operators in
+one table, with `help`; a guide to the shell whose examples are run; a page for every command,
+`--help` staying a short overview; and pages for the system, the desktop and a programmer, the
+specs staged as they are. Terminal only, and the shell first (the maintainer's calls,
+2026-11-17).
 
 ## Part H — what the bash left
 
