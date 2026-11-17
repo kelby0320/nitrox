@@ -72,10 +72,10 @@ pub struct App {
     /// menu's rule.
     search: Option<TextFieldState>,
     /// Counts runs of pointer presses, fed by the binary (the only half that can read a clock).
-    clicks: libui::click::Clicks,
+    pub(super) clicks: libui::click::Clicks,
     /// Where within the thumb the scrollbar was taken hold of; one per window, as a grab is.
     scroll_grab: libui::widget::ScrollGrab,
-    click_run: u32,
+    pub(super) click_run: u32,
     click_mods: u16,
     /// The next tab key — monotonic, so a stale message cannot name a pane that took its place;
     /// numbered from [`TAB_KEY_BASE`] to stay clear of element keys and list-row indices.
@@ -589,10 +589,10 @@ impl App {
                 self.properties = selected.clone().map(|e| (self.pane().path.clone(), e));
             }
             // The field starts empty: pre-filling would need a selection and a caret to be useful.
-            // The location bar closes too: `key` checks it first and `view` draws the prompt
-            // first, so with both open the keyboard would feed the field nobody can see.
+            // The location bar and the search close too: `key` checks both first, so with either
+            // open the keyboard would feed it and not the prompt.
             _ => {
-                self.location = None;
+                (self.location, self.search) = (None, None);
                 self.prompt = Some((a, target, TextFieldState::new()));
             }
         }

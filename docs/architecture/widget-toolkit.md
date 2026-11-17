@@ -529,7 +529,7 @@ so they exist:
 | `status_bar` | A window's foot: a ground, a rule on the edge that faces the content, and readings a step below the body in `foreground_dim`. A left slot and a right one (Part H) |
 | `text_field` | The greeter's password box, the shell's Applications menu filter and its desktop-name prompt. Single-line, optionally masked. **Rounded, and edged at rest, since the desktop refresh's Part D** — it was a flat fill of `track`, which is the light scheme's own `--bg`, so a resting field on a window's ground was invisible; the greeter is where that showed, and today its field is the only one drawn at rest. Focused, the edge is the accent ring, rounded to the same curve |
 | `list_header` | The header over a list's columns, built from the same spec the rows are, with the rows' own insets — so a heading cannot drift off the column under it (desktop refresh, Part I) |
-| `list_view` | The window list and the launcher results — `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*". **The file chooser's rows are this widget** — see §8.3. `list_view_with_menus` is the same list with a menu on the right button (§8.1) |
+| `list_view` | Files' places, the file chooser's rows (§8.3) and the reference picture's list; `list_view_with_menus` is the same list with a menu on the right button (§8.1), Files' listing and drives. Written for the window list and the launcher results, `desktop-shell.md` §5's "explicit toolkit *plus one model-backed list widget*", which the shell's panel menus replaced in the desktop refresh's C.2 |
 
 **And the text area arrived in M10 Part C**, six milestones after this section first reserved a
 space for it:
@@ -599,8 +599,8 @@ list has one.
 - **That space's menu hangs on the rows' column**, which a row's own shadows as the nearer, and
   **not on the element `list_view` returns**, which holds the scrollbar too: a right press on the
   bar asks for nothing.
-- **`list_view` keeps its signature**: its other callers, the chooser and the reference picture,
-  have no menus.
+- **`list_view` keeps its signature** for the lists with no menus: the chooser's, the reference
+  picture's and Files' places.
 - **`ListState::follow`** has the next build follow the selection though it has not changed, for a
   caller about to hang a menu from the selected row. Only the rows that fit are built, so a row
   scrolled away has nothing to hang from until the list follows it back.
@@ -723,9 +723,10 @@ no scroll offset to maintain, so there is nothing for a caller to drop. The deci
 
 `list_view` builds **only the rows that fit**, which is the point of it rather than an
 optimisation: a hundred windows cost as many elements as fit on screen, and the diff walks
-that many. It is designed against two callers deliberately — a window list is reordered in
+that many. It was designed against two callers deliberately — a window list is reordered in
 place, a launcher's results are replaced wholesale — because a model API drawn for one
-consumer is the failure §5 was avoiding.
+consumer is the failure §5 was avoiding. Neither calls it since the desktop refresh's C.2, whose
+panel menus replaced both; Files and the file chooser do.
 
 **A row can carry a button at its trailing end** (`ListRow::button`, a `RowButton`; Phase 6 Part F):
 one glyph, dim and in full ink under the pointer with the tab close box's face behind it, as a tab

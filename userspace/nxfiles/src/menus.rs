@@ -20,8 +20,8 @@ pub(crate) struct ContextMenus {
     on: Option<Context>,
     /// Where the last right press landed, window-local: the menu it asks for opens there.
     press: Option<(i32, i32)>,
-    /// What the Menu key asked for a menu for, opened from where it is laid out next.
-    keyed: Option<Context>,
+    /// The Menu key asked for a menu: the selection's, as the next frame finds it.
+    keyed: bool,
 }
 
 /// The Menu key, or `Shift+F10`: the keyboard's ways to a context menu.
@@ -53,8 +53,15 @@ impl App {
             self.menus.close();
         }
         // A row's bottom-left, or the listing's top-left for the folder's. **This frame's**: the
-        // key had the list follow its selection, which this frame's build scrolled into view.
-        let Some(on) = self.context.keyed.take() else { return };
+        // key had the list follow its selection, which this frame's build scrolled into view, and
+        // the row is the selection's now, as a key typed after the Menu key may have moved it.
+        if !core::mem::take(&mut self.context.keyed) {
+            return;
+        }
+        let on = match self.pane().list.selected {
+            Some(i) => Context::Row(LIST_ROW_KEY + i as u64),
+            None => Context::Folder,
+        };
         let at = match on {
             Context::Row(key) => libui::layout::locate(view, l, key).map(|r| (r.origin.x, r.bottom() as i32)),
             _ => libui::layout::locate(view, l, LIST_KEY).map(|r| (r.origin.x, r.origin.y)),
@@ -66,30 +73,43 @@ impl App {
     }
 
     /// Note a pointer event before it is routed: a left press counts toward the click run, and a
-    /// right press is where the menu it asks for opens.
+    /// right press is where the menu it asks for opens. Any other press ends the run, so a left
+    /// click after it, say the one dismissing a menu, is a first click and not a double's second.
     pub fn note_pointer(&mut self, p: &PointerEvent) {
         if p.kind != POINTER_BUTTON || p.flags & POINTER_PRESSED == 0 {
             return;
         }
         match p.button {
             libkern::abi::BTN_LEFT => self.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms, p.modifiers),
-            libkern::abi::BTN_RIGHT => self.context.press = Some((p.x, p.y)),
-            _ => {}
+            button => {
+                self.clicks.reset();
+                self.click_run = 1;
+                if button == libkern::abi::BTN_RIGHT {
+                    self.context.press = Some((p.x, p.y));
+                }
+            }
         }
     }
 
     /// A right press asked for `on`'s menu: open it where the press landed.
     ///
     /// **Not a press**: a row not in the selection becomes it, alone, but the click run and its
-    /// modifiers are neither read nor changed, so nothing opens and no range moves. A row in it
-    /// keeps the selection and the marks, which the menu then acts on, as the Edit menu does.
+    /// modifiers are not read, so nothing opens and no range moves. A row in it keeps the set,
+    /// which Cut and Copy act on, and becomes its primary, the row Rename, Delete, Duplicate and
+    /// Properties act on: a marked row is drawn as the primary is, so it must be the one they name.
     pub(super) fn open_context_menu(&mut self, on: Context) {
         let Some((x, y)) = self.context.press.take() else { return };
         match on {
             Context::Row(key) => {
                 let Some(i) = list_row_of(key).filter(|&i| i < self.pane().entries.len()) else { return };
-                let name = &self.pane().entries[i].name;
-                if self.pane().list.selected != Some(i) && !self.marked.contains(name) {
+                let name = self.pane().entries[i].name.clone();
+                if let Some(at) = self.marked.iter().position(|n| *n == name) {
+                    self.marked.remove(at);
+                    if let Some(primary) = self.selected_name().map(String::from) {
+                        self.marked.push(primary);
+                    }
+                    self.pane_mut().list.selected = Some(i);
+                } else if self.pane().list.selected != Some(i) {
                     self.marked.clear();
                     self.anchor = Some(i);
                     self.pane_mut().list.selected = Some(i);
@@ -109,16 +129,12 @@ impl App {
 
     /// The Menu key or `Shift+F10`: the selected row's menu, or with none the folder's.
     ///
-    /// Opened by the next [`place_menus`](Self::place_menus), from where the row is then: the list
-    /// builds only the rows that fit, so a selection scrolled away has nothing to hang from until
-    /// the list follows it back.
+    /// Opened by the next [`place_menus`](Self::place_menus), for the selection then and from where
+    /// its row is then: the list builds only the rows that fit, so a selection scrolled away has
+    /// nothing to hang from until the list follows it back.
     pub(super) fn menu_key(&mut self) {
-        let on = match self.pane().list.selected {
-            Some(i) => Context::Row(LIST_ROW_KEY + i as u64),
-            None => Context::Folder,
-        };
         self.pane_mut().list.follow();
-        self.context.keyed = Some(on);
+        self.context.keyed = true;
     }
 
     /// The listing was replaced: a context menu shown was for what it held, or for where it was.
@@ -126,7 +142,7 @@ impl App {
         if matches!(self.menus.shown(), Some(Shown::Context(_))) {
             self.menus.close();
         }
-        self.context.keyed = None;
+        self.context.keyed = false;
     }
 
     /// Whether `msg` is a row of the bar's menus or of the context menu shown: choosing one closes

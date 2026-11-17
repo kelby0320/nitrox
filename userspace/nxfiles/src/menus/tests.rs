@@ -38,7 +38,11 @@ impl Window {
     /// A press and its release of `button` at `(x, y)`, with `mods` held, a second after the last.
     fn click_at(&mut self, button: u16, x: i32, y: i32, mods: u16) {
         self.ms += 1_000;
-        let held = if button == BTN_LEFT { 1 } else { 2 };
+        let held = match button {
+            BTN_LEFT => 1,
+            BTN_RIGHT => 2,
+            _ => 4,
+        };
         for pressed in [true, false] {
             let ev = PointerEvent {
                 kind: POINTER_BUTTON,
@@ -407,4 +411,180 @@ fn the_popup_draws_the_context_menu_shown() {
         assert!(drawn.iter().any(|t| t == label), "{label} is not drawn: {drawn:?}");
     }
     assert!(!drawn.iter().any(|t| t == "New Tab"), "the File menu was drawn instead");
+}
+
+/// `x`, the one letter these tests type.
+const KEY_X: u16 = 45;
+
+/// The rename a prompt chosen from the menu asks for, typed `x` and entered.
+fn renamed(w: &mut Window) -> Option<FileOp> {
+    w.choose("Rename");
+    w.key(KEY_X, 0);
+    w.key(libkern::abi::KEY_ENTER, 0);
+    w.a.take_op()
+}
+
+#[test]
+fn a_right_press_on_a_marked_row_is_the_row_its_menu_acts_on() {
+    let mut w = five();
+    w.click(BTN_LEFT, row(0), 0);
+    w.click(BTN_LEFT, row(2), MOD_CTRL);
+    w.click(BTN_RIGHT, row(2), 0);
+    assert_eq!(w.picked(), ["f0.txt", "f2.txt"], "the set stays");
+    w.choose("Delete");
+    assert_eq!(w.a.confirming(), Some("f2.txt"), "Delete asks about the row pressed");
+    w.a.update(Msg::KeepIt);
+    w.click(BTN_RIGHT, row(0), 0);
+    w.choose("Properties");
+    assert_eq!(w.a.properties.as_ref().map(|(_, e)| e.name.as_str()), Some("f0.txt"), "and back");
+    w.a.update(Msg::CloseProperties);
+    w.click(BTN_RIGHT, row(2), 0);
+    w.choose("Copy");
+    let (_, paths) = w.a.take_clip_push().expect("Copy pushed");
+    assert_eq!(paths, ["/home/f0.txt", "/home/f2.txt"], "Copy still takes the set");
+
+    let mut w = five();
+    w.click(BTN_LEFT, row(1), 0);
+    w.click(BTN_LEFT, row(3), MOD_SHIFT);
+    w.click(BTN_RIGHT, row(3), 0);
+    assert_eq!(w.picked(), ["f1.txt", "f2.txt", "f3.txt"]);
+    let to = renamed(&mut w);
+    assert_eq!(to, Some(FileOp::Rename { from: "/home/f3.txt".into(), to: "/home/x".into() }), "a range's end");
+}
+
+#[test]
+fn a_right_press_on_the_only_mark_makes_its_rows_available() {
+    let mut w = five();
+    w.click(BTN_LEFT, row(0), 0);
+    w.click(BTN_LEFT, row(2), MOD_CTRL);
+    w.click(BTN_LEFT, row(0), MOD_CTRL);
+    assert_eq!((w.a.pane().list.selected, w.picked()), (None, alloc::vec![String::from("f2.txt")]), "precondition");
+    w.click(BTN_RIGHT, row(2), 0);
+    let m = w.a.context_menu().expect("its menu");
+    let off = m.items.iter().filter(|it| matches!(it, Item::Action { enabled: false, .. })).count();
+    assert_eq!(off, 0, "every row is available");
+    w.choose("Delete");
+    assert_eq!(w.a.confirming(), Some("f2.txt"));
+}
+
+#[test]
+fn the_menu_key_opens_on_the_selection_the_frame_finds() {
+    let mut w = five();
+    w.click(BTN_LEFT, row(2), 0);
+    w.key(KEY_COMPOSE, 0);
+    w.key(libkern::abi::KEY_DOWN, 0);
+    let r = w.locate(row(3));
+    assert_eq!(w.a.context_shown(), Some(((r.origin.x, r.bottom() as i32), Some("f3.txt"))), "hung from f3, for f3");
+    w.choose("Delete");
+    assert_eq!(w.a.confirming(), Some("f3.txt"), "and acting on it");
+}
+
+#[test]
+fn a_rows_menu_asked_for_after_its_row_is_gone_opens_nothing() {
+    let mut w = five();
+    let at = w.locate(row(4));
+    let ev = PointerEvent {
+        kind: POINTER_BUTTON,
+        button: BTN_RIGHT,
+        buttons: 2,
+        flags: POINTER_PRESSED,
+        x: at.origin.x + 10,
+        y: at.origin.y + 10,
+        ..Default::default()
+    };
+    w.a.note_pointer(&ev);
+    w.a.show("/home", (0..2).map(|i| Entry::file(&alloc::format!("f{i}.txt"))).collect());
+    w.a.update(Msg::ContextMenu(Context::Row(row(4))));
+    assert_eq!(w.a.menus.shown(), None);
+}
+
+#[test]
+fn a_right_press_outside_the_selection_moves_the_anchor_and_clears_the_strip() {
+    let mut w = five();
+    w.click(BTN_LEFT, row(0), 0);
+    w.a.update(Msg::CopyFiles);
+    assert!(w.a.notice.is_some(), "precondition: the strip says something");
+    w.click(BTN_RIGHT, row(3), 0);
+    assert_eq!(w.a.notice, None, "a right press clears it, as a click does");
+    w.a.menus.close();
+    w.click(BTN_LEFT, row(4), MOD_SHIFT);
+    assert_eq!(w.picked(), ["f3.txt", "f4.txt"], "the range starts where the right press was");
+}
+
+#[test]
+fn the_menu_keys_request_opens_one_menu_once() {
+    let mut w = five();
+    w.click(BTN_LEFT, row(1), 0);
+    w.key(KEY_COMPOSE, 0);
+    w.frame();
+    assert!(w.a.context_menu().is_some(), "precondition");
+    w.a.menu_key_event(KeyEvent::new(1, libkern::abi::KEY_ESC, KEY_DOWN, 0));
+    w.frame();
+    assert_eq!(w.a.menus.shown(), None, "Esc closed it, and nothing reopened it");
+}
+
+#[test]
+fn an_older_context_menus_popup_draws_none_of_the_newer_ones_rows() {
+    fn texts<M>(e: &Element<M>, out: &mut Vec<String>) {
+        if let libui::element::Node::Text(t) = &e.node {
+            out.push(t.to_string());
+        }
+        for c in e.children() {
+            texts(c, out);
+        }
+    }
+    let mut w = five();
+    w.click(BTN_RIGHT, row(1), 0);
+    let old = w.a.menus.shown().expect("a row's menu");
+    let list = w.locate(LIST_KEY);
+    w.click_at(BTN_RIGHT, list.origin.x + 9, list.bottom() as i32 - 9, 0);
+    assert_ne!(w.a.menus.shown(), Some(old), "precondition: the folder's menu replaced it");
+    let mut drawn = Vec::new();
+    texts(&w.a.menu_view(old, &UiTheme::default(), None), &mut drawn);
+    assert!(!drawn.iter().any(|t| FOLDER.contains(&t.as_str()) && t != "-"), "the old popup drew {drawn:?}");
+}
+
+#[test]
+fn a_prompt_chosen_while_searching_takes_the_keys() {
+    let mut w = five();
+    w.a.update(Msg::OpenSearch);
+    // `f`, which every row's name holds.
+    w.key(33, 0);
+    assert_eq!(w.a.search_text(), Some("f"), "precondition: a search is up");
+    w.click(BTN_RIGHT, row(3), 0);
+    let to = renamed(&mut w);
+    assert_eq!(to, Some(FileOp::Rename { from: "/home/f3.txt".into(), to: "/home/x".into() }));
+}
+
+#[test]
+fn a_right_or_middle_press_ends_the_click_run() {
+    for button in [BTN_RIGHT, libkern::abi::BTN_MIDDLE] {
+        let mut w = five();
+        w.click(BTN_LEFT, row(1), 0);
+        w.ms -= 900;
+        w.click(button, row(1), 0);
+        w.ms -= 900;
+        w.click(BTN_LEFT, row(1), 0);
+        assert_eq!(w.a.take_open(), None, "{button:#x}: the left click after it opened the file");
+    }
+    let mut w = five();
+    w.double_click(row(1));
+    assert_eq!(w.a.take_open().as_deref(), Some("/home/f1.txt"), "the same two clicks alone are a double");
+}
+
+#[test]
+fn a_bar_menu_outlives_the_frame_that_closes_a_drives() {
+    let mut w = five();
+    w.a.update(Msg::MenuBar(0));
+    w.frame();
+    assert_eq!(w.a.menus.shown(), Some(Shown::Bar(0)));
+}
+
+#[test]
+fn a_right_presses_point_opens_one_menu() {
+    let mut w = five();
+    w.click(BTN_RIGHT, row(1), 0);
+    w.a.menus.close();
+    w.a.update(Msg::ContextMenu(Context::Row(row(2))));
+    assert_eq!(w.a.menus.shown(), None, "a message with no press of its own opened a menu at the last one's");
 }
