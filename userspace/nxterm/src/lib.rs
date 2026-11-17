@@ -532,12 +532,7 @@ impl App {
     /// Apply a message from the chrome.
     pub fn update(&mut self, msg: Msg) {
         // Choosing dismisses the menu, whichever row; a message that is not a row leaves it alone.
-        if self
-            .menu_table()
-            .iter()
-            .flat_map(|m| m.items.iter())
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
-        {
+        if libui::menu::sends(&self.menu_table(), &msg) {
             self.menus.close();
         }
         match msg {
@@ -645,6 +640,10 @@ impl App {
         if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
             self.update(msg);
             return;
+        }
+        // Before the find field and the encoder: `Shift+F10` reaches no program, as in GNOME's.
+        if libui::menu::is_menu_key(&k) {
+            return self.menu_key();
         }
         // While a find is open the keys are the field's, or they would type into the shell; after
         // the chord check so `Ctrl+Shift+F` can reopen it.

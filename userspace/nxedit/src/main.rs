@@ -358,9 +358,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 }
             }
             let ui = app.view(&theme, top.hovered_key());
-            let l = layout(&ui, *bounds, &FontMetrics::new(&font, theme.font_px));
-            // Read every frame: before the first there is nowhere to put a popup.
-            app.place_menus(&ui, &l);
+            let m = FontMetrics::new(&font, theme.font_px);
+            let l = layout(&ui, *bounds, &m);
+            // Read every frame: before the first there is nowhere to put a popup. Measured in the
+            // document's face, as the caret a Menu key hangs a menu from is drawn in it.
+            app.place_menus(&ui, &l, |s| m.text_size_as(s, nxedit::BUFFER_STYLE).w);
             if !top.present_laid_out(&mut win, &ui, &l, &font, &theme) {
                 fail(b"nxedit: the window could not be drawn\n");
             }
@@ -388,6 +390,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             if synced.undrawn {
                 log::write(b"nxedit: the menu could not be drawn\n");
+            }
+            // Where it is and how big, and the row under the pointer: `check-login` walks down to a
+            // row by its key, a number this program chose.
+            if let Some((id, (x, y), size)) = synced.opened {
+                let mut l = Line::new();
+                l.s(b"nxedit: menu popup ").u(id as u64).s(b" at ").i(x as i64).s(b",").i(y as i64);
+                l.s(b" ").u(size.w as u64).s(b"x").u(size.h as u64).end();
+            }
+            if let Some(now) = synced.hover {
+                let mut l = Line::new();
+                l.s(b"nxedit: menu hover ");
+                match now {
+                    Some(k) => l.u(k),
+                    None => l.s(b"none"),
+                };
+                l.end();
             }
 
             // The application names the directory and this lists it: `libui::chooser` cannot
@@ -720,8 +738,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     Routed::Dismissed(shown) => app.menus.dismissed(shown),
                     // The popup holds the keyboard, so its keys never reach the editor's router.
                     Routed::Key(k) => {
-                        let table = app.menu_table();
-                        if let Some(msg) = app.menus.choose(&k, &table, None) {
+                        let (table, context) = (app.menu_table(), app.context_menu());
+                        if let Some(msg) = app.menus.choose(&k, &table, context.as_ref()) {
                             app.update(msg);
                         }
                     }

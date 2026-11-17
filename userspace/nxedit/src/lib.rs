@@ -282,6 +282,8 @@ pub struct App {
     quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     pub menus: MenuState,
+    /// Where the context menu hangs from: the document's origin, and a Menu key waiting for it.
+    context: menus::ContextMenu,
     /// The next key to hand out. Monotonic, so a stale message never names a replacement.
     next_key: u64,
     /// What the status strip says.
@@ -576,6 +578,7 @@ impl App {
             quit: false,
             // Zero: the length is set every frame by `set_anchors`.
             menus: MenuState::new(0),
+            context: menus::ContextMenu::default(),
             next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
@@ -874,14 +877,8 @@ impl App {
         if !matches!(msg, Msg::Key(_)) {
             self.cycling = None;
         }
-        // Choosing dismisses the menu, asked of the table so a row added later cannot forget.
-        // A message that is not a row leaves it alone, so `MenuBar` can open one.
-        if self
-            .menu_table()
-            .iter()
-            .flat_map(|m| m.items.iter())
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
-        {
+        // Choosing a row dismisses the menu, asked of the table; any other message leaves it alone.
+        if libui::menu::sends(&self.menu_table(), &msg) {
             self.menus.close();
         }
         match msg {
@@ -1155,6 +1152,9 @@ impl App {
                 }
             }
             return;
+        }
+        if libui::menu::is_menu_key(&k) {
+            return self.menu_key();
         }
         if k.modifiers & MOD_CTRL != 0 {
             // The cycle is taken before the table: it continues a paste and means nothing
@@ -3498,7 +3498,7 @@ mod tests {
         let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
         let n = a.menu_count();
         assert!(n >= 2, "a bar with fewer than two menus is not this window's");
-        a.place_menus(&view, &l);
+        a.place_menus(&view, &l, |s| s.len() as u32);
         for i in 0..n {
             a.menus.toggle(i);
             assert_eq!(a.menus.open(), Some(i));

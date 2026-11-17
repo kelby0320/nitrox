@@ -509,6 +509,10 @@ Since Phase 6 Part B.5 it holds the **locks and the keyboard's lights**: it type
 and on the keypad with Num Lock on and off, and reads what the PS/2 keyboard's lights were set to
 from QEMU's own trace of them (`-trace ps2_set_ledstate`), exactly, step by step — the one place a
 gate learns a device's state from the emulator rather than from the guest.
+Since pre-Phase-7 Part F.5 it **right-clicks the grid**: Find's selection survives the press, the
+context menu's Copy copies it and its Paste types it at the shell, and the Menu key opens the
+menu. It waits for `nxterm: selected 4 chars` before the click, as a pointer event can overtake
+keys still on their way.
 
 `cargo xtask check-login` is the **graphical login gate**, on the release image as
 `test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection

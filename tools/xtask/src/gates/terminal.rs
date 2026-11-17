@@ -299,6 +299,7 @@ pub(crate) fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     qmp.send_key("ret", false)?;
     session.expect("nxterm: menu chose Paste")?;
     println!("  ok: Down skipped the greyed row and Enter chose the next one");
+    terminal_context_menu(&mut qmp, &mut session)?;
 
     // A second window with a shell of its own, which one opened with nothing to talk to would look
     // the same as. The shell's line comes first: `open_window` starts it before it returns.
@@ -336,6 +337,54 @@ pub(crate) fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
         "\nxtask: terminal gate PASSED — a keystroke reached the shell and its answer \
          reached the grid ✓"
     );
+    Ok(())
+}
+
+/// **A right click keeps the selection and opens the menu at the press**: its Copy copies Find's
+/// `home`, and a second right click's Paste types it at the shell. Then the Menu key opens it. Each
+/// waits for `focus=1`, which the compositor sends only once the closing popup has gone.
+fn terminal_context_menu(qmp: &mut Qmp, session: &mut Session) -> R<()> {
+    // In the grid: the terminal's window is at the screen's top-left, and this is where the gate
+    // clicked it to the front.
+    const AT: (i32, i32) = (397, 295);
+    session.expect("nxterm: focus=1")?;
+    // A prompt to find `home` in: Clear left the grid empty, and the shell draws one per line.
+    press(qmp, "ret")?;
+    session.expect("nxterm: grid> /home>")?;
+    qmp.send_key("ctrl", true)?;
+    qmp.send_key("shift", true)?;
+    press(qmp, "f")?;
+    qmp.send_key("shift", false)?;
+    qmp.send_key("ctrl", false)?;
+    for k in ["h", "o", "m", "e", "ret"] {
+        press(qmp, k)?;
+    }
+    // **Before the right click**: a pointer event can overtake keys still on their way. The field
+    // stays open, as an `Esc` that overtook it could close the menu instead.
+    session.expect("nxterm: selected 4 chars")?;
+    for (row, name, receipt) in [(100, "Copy", "nxterm: copied 4 bytes"), (101, "Paste", "nxterm: pasted 4 bytes")] {
+        right_click_at(qmp, session, AT.0, AT.1)?;
+        session.expect("nxterm: menu popup ")?;
+        let popup = session.rest_of_line()?;
+        let (_, px, py, pw, ph) = parse_menu_popup(&popup).ok_or_else(|| format!("no menu placement in {popup:?}"))?;
+        // At the press, or flipped to end there.
+        if (px, py) != AT && (px + pw as i32, py + ph as i32) != AT {
+            return Err(format!("the menu {popup:?} does not hang from the right click at {AT:?}").into());
+        }
+        let span = (py + MENU_FRAME, py + ph as i32 - MENU_FRAME);
+        let at = walk_to_menu_row(qmp, session, "nxterm: menu hover ", px + pw as i32 / 2, span, row)?;
+        click_at(qmp, session, at.0, at.1)?;
+        session.expect(&format!("nxterm: menu chose {name}"))?;
+        session.expect(receipt)?;
+        session.expect("nxterm: focus=1")?;
+    }
+    session.expect("nxterm: grid> /home> home")?;
+    println!("  ok: a right click kept Find's selection, its Copy copied it and its Paste typed it");
+    press(qmp, "compose")?;
+    session.expect("nxterm: menu popup ")?;
+    press(qmp, "esc")?;
+    session.expect("nxterm: focus=1")?;
+    println!("  ok: the Menu key opened the menu");
     Ok(())
 }
 
