@@ -36,6 +36,9 @@ use libui::widget::{
     status_separator, status_text, tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
 };
 
+mod clip;
+mod menus;
+
 /// The status bar's height in pixels: `libui`'s `status_bar`, along the window's foot.
 pub const STATUS_H: u32 = libui::widget::STATUS_BAR_H;
 
@@ -280,6 +283,8 @@ pub struct App {
     quit: bool,
     /// Which menu is open, where each bar word sits, and where the keyboard is inside it.
     pub menus: MenuState,
+    /// Where the context menu hangs from: the document's origin, and a Menu key waiting for it.
+    context: menus::ContextMenu,
     /// The next key to hand out. Monotonic, so a stale message never names a replacement.
     next_key: u64,
     /// What the status strip says.
@@ -297,6 +302,8 @@ pub struct App {
     save_requested: Option<u64>,
     /// What the editor owes the clipboard — see [`ClipRequest`].
     clip_request: Option<ClipRequest>,
+    /// The tab and the revision a cut left, which a refused copy undoes if they still stand.
+    cut_at: Option<(u64, u64)>,
     /// The paste a cycle would continue, or `None`. See [`Cycling`].
     cycling: Option<Cycling>,
     /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
@@ -574,6 +581,7 @@ impl App {
             quit: false,
             // Zero: the length is set every frame by `set_anchors`.
             menus: MenuState::new(0),
+            context: menus::ContextMenu::default(),
             next_key: TAB_KEY_BASE + 1,
             field: None,
             home: String::from(home),
@@ -588,6 +596,7 @@ impl App {
             maximized: false,
             save_requested: None,
             clip_request: None,
+            cut_at: None,
             cycling: None,
             state_requested: None,
             move_requested: false,
@@ -743,22 +752,6 @@ impl App {
         self.buf().blocked.as_deref()
     }
 
-    /// Copy the selection onto the ring, deleting it as well when `cut`. Nothing selected is not a
-    /// request: an empty entry would move the ring's serial under a client mid-cycle.
-    fn copy(&mut self, cut: bool) {
-        let Some(text) = self.buf().text.selected_text() else {
-            self.status = String::from(if cut { "nothing to cut" } else { "nothing to copy" });
-            return;
-        };
-        if cut {
-            self.buf_mut().text.delete_selection();
-            // A cut is a complete edit, so the next keystroke is a separate undo step.
-            self.buf_mut().text.end_group();
-        }
-        self.status = String::from(if cut { "cut" } else { "copied" });
-        self.clip_request = Some(ClipRequest::Copy(text));
-    }
-
     /// What the editor owes the clipboard, taken exactly once.
     pub fn take_clip_request(&mut self) -> Option<ClipRequest> {
         self.clip_request.take()
@@ -872,14 +865,8 @@ impl App {
         if !matches!(msg, Msg::Key(_)) {
             self.cycling = None;
         }
-        // Choosing dismisses the menu, asked of the table so a row added later cannot forget.
-        // A message that is not a row leaves it alone, so `MenuBar` can open one.
-        if self
-            .menu_table()
-            .iter()
-            .flat_map(|m| m.items.iter())
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
-        {
+        // Choosing a row dismisses the menu, asked of the table; any other message leaves it alone.
+        if libui::menu::sends(&self.menu_table(), &msg) {
             self.menus.close();
         }
         match msg {
@@ -1154,6 +1141,9 @@ impl App {
             }
             return;
         }
+        if libui::menu::is_menu_key(&k) {
+            return self.menu_key();
+        }
         if k.modifiers & MOD_CTRL != 0 {
             // The cycle is taken before the table: it continues a paste and means nothing
             // otherwise, so it has no business in a list of things to choose.
@@ -1171,67 +1161,6 @@ impl App {
             return;
         }
         self.buf_mut().text.apply(k.keycode, k.modifiers, k.locks);
-    }
-
-    /// Record where each bar word sits, so an open menu knows where to hang from.
-    pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
-        let n = self.menu_count();
-        self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
-    }
-
-    /// How many menus the bar has — derived from the table, never declared, as a constant drifted.
-    pub fn menu_count(&self) -> usize {
-        self.menu_table().len()
-    }
-
-    /// The bar's menus, in bar order. Built rather than stored: half the rows depend on state.
-    /// The chords are declared here and read back by [`libui::menu::accel_match`].
-    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
-        let has_selection = self.buf().text.has_selection();
-        // Nothing is available while a field is open: `key` gives an open field every keystroke,
-        // and a menu row would be a way around that.
-        let free = self.field.is_none();
-        let act = |it: Item<Msg>| it.enabled(free);
-        vec![
-            Menu {
-                title: "File",
-                items: vec![
-                    act(Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab)),
-                    act(Item::new("Close Tab", Accel::ctrl(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current))),
-                    Item::Separator,
-                    // Save is enabled on a clean buffer too: greying it would hide the name
-                    // prompt of an untitled buffer behind a state a person cannot see.
-                    act(Item::new("Open…", Accel::ctrl(OPEN_KEYCODE, "O"), Msg::OpenFile)),
-                    act(Item::new("Save", Accel::ctrl(SAVE_KEYCODE, "S"), Msg::Save)),
-                    act(Item::new("Save As…", Accel::ctrl_shift(SAVE_AS_KEYCODE, "S"), Msg::SaveAs)),
-                    Item::Separator,
-                    act(Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow)),
-                    Item::Separator,
-                    act(Item::plain("Close Window", Msg::Close)),
-                    act(Item::new("Quit", Accel::ctrl(QUIT_KEYCODE, "Q"), Msg::Quit)),
-                ],
-            },
-            Menu {
-                title: "Edit",
-                items: vec![
-                    act(Item::new("Undo", Accel::ctrl(UNDO_KEYCODE, "Z"), Msg::Undo)),
-                    act(Item::new("Redo", Accel::ctrl(REDO_KEYCODE, "Y"), Msg::Redo)),
-                    Item::Separator,
-                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::Cut).enabled(free && has_selection),
-                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::Copy).enabled(free && has_selection),
-                    act(Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::Paste)),
-                    // Offered whenever the buffer holds anything: making a selection is its job.
-                    Item::new("Select All", Accel::ctrl(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
-                        // Never `text()`: a copy of the whole file, and this table is rebuilt on
-                        // every keystroke for `accel_match`.
-                        .enabled(free && self.buf().text.lines().iter().any(|l| !l.is_empty())),
-                    Item::Separator,
-                    act(Item::new("Find", Accel::ctrl(FIND_KEYCODE, "F"), Msg::Find)),
-                    act(Item::new("Replace\u{2026}", Accel::ctrl(REPLACE_KEYCODE, "H"), Msg::Replace)),
-                    act(Item::new("Go to Line\u{2026}", Accel::ctrl(GO_TO_KEYCODE, "G"), Msg::GoTo)),
-                ],
-            },
-        ]
     }
 
     /// The chooser's tree, the root of a window of its own. Empty when nothing is being chosen.
@@ -1296,27 +1225,6 @@ impl App {
         out
     }
 
-    /// Resolve a pointer event over the document, given a way to measure text as drawn.
-    ///
-    /// A left press places the caret and drops the selection; a motion with the left button held
-    /// extends it; anything else, another button's press too, is ignored. Answers whether it changed.
-    pub fn take_area_pointer(&mut self, width: impl Fn(&str) -> u32) -> bool {
-        use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED};
-        let Some(p) = self.area_pointer.take() else { return false };
-        let pressed = p.kind == POINTER_BUTTON && p.flags & POINTER_PRESSED != 0 && p.button == libkern::abi::BTN_LEFT;
-        let dragging = p.kind == POINTER_MOTION && p.buttons & 1 != 0;
-        if !pressed && !dragging {
-            return false;
-        }
-        let (line, col) = self.buf().text.at_point(p.x, p.y, ROW_H, width);
-        if pressed {
-            self.buf_mut().text.place(line, col);
-        } else {
-            self.buf_mut().text.extend_to(line, col);
-        }
-        true
-    }
-
     /// How big the buffer is, as the tab strip says it: `1173 bytes`. What would be written,
     /// not what was read.
     pub fn size_text(&self) -> String {
@@ -1328,15 +1236,6 @@ impl App {
     /// failure to catch is "highlighted as the wrong thing", not "off".
     pub fn language_name(&self) -> &'static str {
         syntax::name_of(self.buf().lang)
-    }
-
-    /// The open menu's popup, framed — the root of a second window, not a layer in this one.
-    pub fn menu_view(&self, shown: Shown, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let menus = self.menu_table();
-        match if let Shown::Bar(i) = shown { menus.get(i) } else { None } {
-            Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
-            None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
-        }
     }
 
     /// Whether another window has been asked for. Clears the record.
@@ -3587,7 +3486,7 @@ mod tests {
         let l = libui::layout::layout(&view, Rect::new(0, 0, size.w, size.h), &cell);
         let n = a.menu_count();
         assert!(n >= 2, "a bar with fewer than two menus is not this window's");
-        a.place_menus(&view, &l);
+        a.place_menus(&view, &l, |s| s.len() as u32);
         for i in 0..n {
             a.menus.toggle(i);
             assert_eq!(a.menus.open(), Some(i));

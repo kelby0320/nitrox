@@ -38509,3 +38509,26 @@ F.3 merged, #448. F.4, `context-menus.md` § F.4, built on `pre-phase-7/part-f4-
   The Menu key's menu is the selection's when the frame opens it, not when the key arrived. A right
   or middle press ends the click run, a prompt closes the search, and an older context menu's popup
   draws none of a newer one's rows.
+
+## 2026-11-16 — Before Phase 7, F.5: the editor's and the terminal's menus
+
+F.4 merged, #449. F.5, `context-menus.md` § F.5, built on `pre-phase-7/part-f5-editor-terminal-menus`.
+
+- **The editor's menu opens from its document's own pointer handler** (`9a6b1588`, `416fa61b`), the one place
+  with the font to turn the press into a line and a column. A press inside the selection keeps it,
+  and one outside places the caret first, so the menu's rows act on what it shows. The Menu key
+  opens it at the caret at the next frame, the only place that can measure the caret.
+- **The terminal's opens from the grid's**, keeping the selection; its Menu key opens at the
+  cursor at once, the cells being fixed.
+- **A context menu's rows are its bar's**, taken by message with `libui::menu::bar_rows`, which
+  Files now uses too. `is_menu_key` and `sends` moved below the three applications with it.
+- **libterm encodes no function key**, so the plan's "a program no longer receives `Shift+F10`"
+  was already true. The Menu key is checked before the encoder, so an encoding added later keeps it
+  out.
+- `check-terminal` copies Find's selection and pastes it at the shell through the menu, and
+  `check-login` pastes a copied word where a right click put the caret. A pointer event from QEMU
+  can overtake keys in flight, so the terminal now reports its selection's length.
+- After review, **a right press is inside a selection only on a selected character**, not on a
+  boundary next to one. **A cut is its own undo step**, one the clipboard cannot hold deletes
+  nothing, and one it refuses is undone; the raw deletion in `TextAreaState` is private, so no
+  caller can delete without an undo step.

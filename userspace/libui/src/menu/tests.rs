@@ -478,3 +478,55 @@ fn a_shown_menu_hangs_under_its_word_or_at_its_point() {
     st.open_context(41, 51);
     assert_eq!(st.shown(), Some(Shown::Context(n.wrapping_add(1))), "each opening is a new serial");
 }
+
+#[test]
+fn the_menu_key_and_shift_f10_are_the_keyboards_way_to_a_context_menu() {
+    use librsproto::surface::MOD_META;
+    let k = |keycode, modifiers| KeyEvent::new(1, keycode, librsproto::surface::KEY_DOWN, modifiers);
+    let (f9, f10, compose) = (libkern::abi::KEY_F1 + 8, libkern::abi::KEY_F10, libkern::abi::KEY_COMPOSE);
+    assert!(is_menu_key(&k(compose, 0)), "the Menu key");
+    assert!(is_menu_key(&k(f10, MOD_SHIFT)), "Shift+F10");
+    for (code, mods, what) in [
+        (f10, 0, "F10 alone"),
+        (f10, MOD_SHIFT | MOD_CTRL, "Ctrl+Shift+F10"),
+        (f10, MOD_SHIFT | MOD_ALT, "Alt+Shift+F10"),
+        (f10, MOD_SHIFT | MOD_META, "Super+Shift+F10"),
+        (f9, MOD_SHIFT, "Shift+F9"),
+    ] {
+        assert!(!is_menu_key(&k(code, mods)), "{what}");
+    }
+}
+
+#[test]
+fn a_context_menus_rows_are_the_bars_own_in_the_order_asked() {
+    let bar = || {
+        alloc::vec![
+            Menu { title: "File", items: alloc::vec![Item::plain("Quit", 1u32)] },
+            Menu {
+                title: "Edit",
+                items: alloc::vec![
+                    Item::new("Copy", Accel::ctrl(46, "C"), 2u32).enabled(false),
+                    Item::Separator,
+                    Item::plain("Paste", 3u32).marked(true),
+                ],
+            },
+        ]
+    };
+    let rows = bar_rows(bar(), &[Some(3), None, Some(2)]).expect("both are on the bar");
+    let read: Vec<_> = rows
+        .iter()
+        .map(|it| match it {
+            Item::Action { label, accel, msg, enabled, marked, .. } => {
+                alloc::format!(
+                    "{label} {} {msg} {enabled} {marked}",
+                    accel.as_ref().map(Accel::label).unwrap_or_default()
+                )
+            }
+            Item::Separator => String::from("-"),
+        })
+        .collect();
+    assert_eq!(read, ["Paste  3 true true", "-", "Copy Ctrl+C 2 false false"]);
+    assert!(bar_rows(bar(), &[Some(2), Some(9)]).is_none(), "a row the bar does not have");
+    assert!(sends(&bar(), &3) && sends(&bar(), &1), "a row of either menu");
+    assert!(!sends(&bar(), &9), "and nothing else");
+}

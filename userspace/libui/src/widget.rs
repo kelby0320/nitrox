@@ -94,6 +94,9 @@ mod list_menu_tests;
 mod list_view_tests;
 
 #[cfg(test)]
+mod text_area_tests;
+
+#[cfg(test)]
 mod text_field_tests;
 
 #[cfg(test)]

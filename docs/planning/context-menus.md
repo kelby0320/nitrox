@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16; F.1 to F.4 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1 to F.5 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why
@@ -658,6 +658,77 @@ menu's rows, Copy enabled only with a selection. Clear and Reset stay on the bar
   the buffer, by its receipt.
 
 Docs: `widget-toolkit.md` (`text_area`). Author.
+
+**Built 2026-11-16** (`9a6b1588` and `416fa61b`, after the editor's menus and the terminal's menus and grid pointer
+moved to modules of their own, `d2649345`, by the implementer).
+- **libui**: `menu::is_menu_key`, `bar_rows` and `sends`, which Files now takes in place of its
+  own; `TextAreaState::point_below`, `at_point` turned back, and `follow`.
+- **The editor**: `take_area_pointer` opens the menu on a right press, measured from the document
+  (`AREA_INNER_KEY`, not `AREA_KEY`'s box, which holds the gutter). `place_menus` takes the
+  document's measure, and opens a menu the Menu key asked for at the caret.
+- **The terminal**: `grid_pointer`'s right press, and the Menu key at the cursor, the view snapped
+  back to the output first.
+
+**Departures, for the maintainer's eye:**
+- **libterm encodes no function key**, so no program received `Shift+F10` before this either, and
+  "every other F-key still does" has nothing to pin. The test pins that the Menu key and
+  `Shift+F10` open the menu and send nothing, and that `F10`, `Shift+F9` and `Alt+Shift+F10` open
+  none. The check sits before the encoder, so an F-key encoding added later keeps `Shift+F10` out.
+- **`Shift+F10` is the key only with no other modifier**, in all three applications.
+- **A right or middle press ends the terminal's click run**, as #449's review found for Files.
+- **The terminal reports its selection's length on change** (`nxterm: selected N chars`), a count
+  and never the text. A pointer event from QEMU overtook the keys still on their way: the gate's
+  right click reached the grid between Find's `o` and `m`.
+- **The editor logs `menu popup` and `menu hover`**, as Files and the terminal do, for the gate to
+  walk to Paste.
+- **`check-terminal` presses Enter before Find**: the Clear it chooses just before leaves the grid
+  empty, and the shell draws a prompt only for a new line. **`check-login` undoes its paste and
+  saves**, leaving the file as the steps after it expect.
+
+**Nineteen tests.** Five of libui's:
+- the point below a cell is `at_point` turned back;
+- a cell scrolled out of view has none;
+- `follow` brings a caret back;
+- the menu key, and the keys that are not it;
+- `bar_rows` in order, with separators and a missing row, and `sends`.
+
+Eight of the editor's, through its real tree and router:
+- a right press inside a selection keeps it, opens at the press, and Cut takes the selection;
+- one outside moves the caret there, Cut is greyed, and Paste pastes there;
+- a left press places the caret, and a middle press moves nothing;
+- with a field open every row is greyed;
+- the Menu key and `Shift+F10` at the caret cell's bottom-left, and `F10` alone not;
+- the Menu key bringing a caret scrolled away back first;
+- an older popup drawing no rows;
+- the row the gate aims at.
+
+Six of the terminal's:
+- a right press, routed, keeps the selection and opens at the press, and Copy copies it;
+- the menu keys at the cursor's cell, typing nothing, and the keys that are not them;
+- the Menu key snapping the view back;
+- a right press ending the click run;
+- an older popup drawing no rows;
+- the rows the gate aims at.
+
+**Mutations**: twenty-three, each failing the test meant to catch it. They include the gutter's box
+in place of the document's, which every press-placing test fails. **Gate controls**: an editor
+whose right press never moves the caret fails `check-login` at the save's byte count; a terminal
+whose right press drops the selection fails `check-terminal` at Copy.
+
+**After review** (`33e591cc`):
+- **A right press is inside the selection only on a selected character** (`TextAreaState::char_at`).
+  It had been tested against the nearest boundary, inclusive at the end. So a press in the blank
+  space past the line, below the text, or on the half-character either side kept the selection,
+  and Cut and Paste acted on text the press was not on.
+- **A cut the clipboard cannot hold deletes nothing**, and **one it refuses is undone** if nothing
+  has been edited since. Cut used to delete before the clipboard answered, and over 3,964 bytes the
+  clipboard always refuses. **A cut is its own undo step** (`cut_selection`): it used to join the
+  edit before it, so Undo took that too. The raw deletion is private now, so no caller can skip
+  its step. This predates F.5; the menu was a third way to it.
+- **A right release opens no second menu**, tested in both applications. The router follows a
+  release with an enter, so the editor's test hands it a release directly.
+- **A line past the buffer has no point** though its row is shown.
+- `check-login`'s row and paragraph in the gate conventions name its right clicks.
 
 ### What Part F does not do
 

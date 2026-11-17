@@ -362,6 +362,42 @@ pub(crate) fn login_editor(qmp: &mut Qmp, session: &mut Session, size: DisplaySi
     press(qmp, "esc")?;
     println!("  ok: find took the keys, matched, and gave them back");
 
+    // **A right click is the document's menu, and its Paste pastes where the click was**: find left
+    // `tro` selected, and a right click past the end of the text, outside the selection, moves the
+    // caret there first. The shell reads the file back.
+    qmp.send_key("ctrl", true)?;
+    press(qmp, "c")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: copied 3 bytes")?;
+    let (_, ex, ey, ew, eh) = edit_win;
+    right_click_at(qmp, session, ex + ew as i32 / 2, ey + eh as i32 / 2)?;
+    session.expect("nxedit: menu popup ")?;
+    let popup = session.rest_of_line()?;
+    let (_, px, py, _, ph) = parse_menu_popup(&popup).ok_or_else(|| format!("no menu placement in {popup:?}"))?;
+    // `Paste`, the menu's sixth row (`nxedit::menus::tests` pins the number).
+    const PASTE_ROW: u64 = 105;
+    let span = (py + MENU_FRAME, py + ph as i32 - MENU_FRAME);
+    let paste = walk_to_menu_row(qmp, session, "nxedit: menu hover ", px + 20, span, PASTE_ROW)?;
+    click_at(qmp, session, paste.0, paste.1)?;
+    session.expect("nxedit: pasted 3 bytes")?;
+    qmp.send_key("ctrl", true)?;
+    press(qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: saved /home/papers/notes.txt - 12 bytes")?;
+    session.send("open ./papers/notes.txt")?;
+    session.expect(&format!("{TYPED}abtro"))?;
+    session.expect("/home>")?;
+    println!("  ok: a right click past the text moved the caret, and its menu's Paste pasted there");
+    // Undone and saved, so the file is as the steps after this one expect it.
+    qmp.send_key("ctrl", true)?;
+    press(qmp, "z")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: buffer rev ")?;
+    qmp.send_key("ctrl", true)?;
+    press(qmp, "s")?;
+    qmp.send_key("ctrl", false)?;
+    session.expect("nxedit: saved /home/papers/notes.txt - 9 bytes")?;
+
     let (edit_id, ex, ey, ew, _eh) = edit_win;
     let title_grab = (ex + ew as i32 / 2, ey + chrome::TITLE_Y);
     move_pointer_to(qmp, title_grab.0, title_grab.1)?;

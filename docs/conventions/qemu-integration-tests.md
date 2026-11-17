@@ -421,7 +421,7 @@ each time.
 | `check-terminal` | `harness` | 54 | The compositor-to-shell round trip — a click, keys to `nxsh`, the answer rendered — `OSC 7` back to `nxterm`, and the PS/2 locks and lights read from QEMU's trace. |
 | `check-fbcon` | `harness` | 35 | A machine with no serial port: the boot and a panic read off the screen with the kernel's own glyphs. |
 | `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 49 steps through the real `login()` and `tty` layer, a Ctrl-C at `nitrox login:` among them. |
-| `check-login` | `release` | 61 | The graphical greeter on PS/2, then the desktop driven step by step: menus, windows, the overview, Files, the editor, the clipboard, dialogs. |
+| `check-login` | `release` | 61 | The graphical greeter on PS/2, then the desktop driven step by step: menus, windows, the overview, Files, the editor, the clipboard, dialogs, and Files' and the editor's context menus. |
 | `check-login --usb` | `release` | 70 | The greeter and that session on a machine with no i8042, every key and click USB's. |
 | `check-logout` | `release-live` | 140 / 56 | Ending a session: log out past the editor's question, restart and shut down, in three boots. |
 | `check-live` | `release-live` | 23 | The live stick: its RAM-disk root, the greeter within 1.5 s of the mount, the boot medium flagged and passed over. |
@@ -509,6 +509,10 @@ Since Phase 6 Part B.5 it holds the **locks and the keyboard's lights**: it type
 and on the keypad with Num Lock on and off, and reads what the PS/2 keyboard's lights were set to
 from QEMU's own trace of them (`-trace ps2_set_ledstate`), exactly, step by step — the one place a
 gate learns a device's state from the emulator rather than from the guest.
+Since pre-Phase-7 Part F.5 it **right-clicks the grid**: Find's selection survives the press, the
+context menu's Copy copies it and its Paste types it at the shell, and the Menu key opens the
+menu. It waits for `nxterm: selected 4 chars` before the click, as a pointer event can overtake
+keys still on their way.
 
 `cargo xtask check-login` is the **graphical login gate**, on the release image as
 `test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection
@@ -516,7 +520,9 @@ gate learns a device's state from the emulator rather than from the guest.
 and `check-logout` are the gates where the display arm exists for a person rather than for a test:
 every other display gate boots `--selftest`. It runs unconditionally in CI's QEMU job, and so does
 **`check-login --usb`**, the same login on a machine with no i8042, typed and clicked on a USB
-keyboard and mouse (Phase 6 Part B). Landed with
+keyboard and mouse (Phase 6 Part B). Since pre-Phase-7 Part F it **right-clicks**: a file's row and
+its Properties, the Menu key on the selected row, the folder's menu flipped inside the work area of
+a maximized Files, and in the editor a Paste where a right click past the text put the caret. Landed with
 M7 Part D, deliberately *before* the shell it will eventually show, so Parts E and F land against a
 gate that exists.
 

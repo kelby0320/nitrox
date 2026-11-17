@@ -1,6 +1,6 @@
 # Nitrox: The Widget Toolkit
 
-**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`, and 2026-11-16, when pre-Phase-7 Part F.1 made a click the left button's and gave a right press `on_context` and a middle click `on_middle`, and F.3 gave every application one menu window, `menu::Host`, and `MenuState` a context menu, and F.4 a list its menus, `list_view_with_menus`), and this document describes what exists.**
+**Status: built (2026-08-11, last checked 2026-09-22, when the desktop refresh's Part A added a real `Theme::dark()`, Part B rounded the frames — `Node::Outline` — and Part C gave menus owned labels, hints, swatches and a header, and shapes inside a surface `Node::RoundedFill`; Part G added a text scale and a bold weight, `scaled` and `bold`, Part D gave a field a rounded edge — the accent ring when focused, `border` at rest — and Part H restyled the tab strip, added `status_bar` and `pill`, put a dim subtitle beside a title and the accent on a focused window's edge, Part I gave a list columns, cells and row swatches, and Part J added `mono`; after Part K the current tab gained its outline and the title-bar buttons, a tab's `×` and the `+` a hover; checked again 2026-10-07, when Phase 6 Part F gave a list row a trailing `RowButton`, and 2026-11-16, when pre-Phase-7 Part F.1 made a click the left button's and gave a right press `on_context` and a middle click `on_middle`, and F.3 gave every application one menu window, `menu::Host`, and `MenuState` a context menu, F.4 a list its menus, `list_view_with_menus`, and F.5 the menu key, a context menu's rows from its bar, and a text area's point below a cell), and this document describes what exists.**
 M15 added `center` / `center_v` to the layout vocabulary — the first wrapper that *moves* its
 child — and gave `text_area` a scrollbar, a wheel and pointer events of its own, with both it and
 `list_view` following their caret or selection once per change rather than every frame; §7 and the
@@ -536,7 +536,7 @@ space for it:
 
 | Widget | Why it exists |
 |---|---|
-| `text_area` | The editor's buffer. Multi-line, with a cursor, a **selection**, a goal column for vertical movement, and a scrollbar and wheel of its own since M15 Part B. It **takes pointer events**: a press places the caret at the point (`TextAreaState::at_point`), a drag from there extends the selection, and a press on the bar scrolls or grabs the thumb. `TextAreaState` carries all of it; the widget draws the visible lines, the selection behind them and the caret |
+| `text_area` | The editor's buffer. Multi-line, with a cursor, a **selection**, a goal column for vertical movement, and a scrollbar and wheel of its own since M15 Part B. It **takes pointer events**: a press places the caret at the point (`TextAreaState::at_point`), a drag from there extends the selection, and a press on the bar scrolls or grabs the thumb. `TextAreaState` carries all of it; the widget draws the visible lines, the selection behind them and the caret. `point_below` is `at_point` turned back, a cell's bottom-left, where a menu asked for at the caret hangs, and `follow` has the next build follow the caret though nothing moved it (pre-Phase-7 Part F.5). `char_at` is the character a press is on, where `at_point` is the nearest boundary: a right press is inside a selection only on a selected character. `cut_selection` deletes the selection as one undo step of its own; the raw deletion every edit makes after opening its step is private |
 
 **Its scrolling follows the caret's *line*, not its every move** (M15 Part D). Following on every
 build is what a scrollbar cannot survive: `ensure_visible` runs each frame, so a view scrolled away
@@ -572,6 +572,8 @@ the widget set that is a small type system rather than a function:
 | `KeyOutcome::Chose` | **Names the menu as well as the row.** Choosing closes, so a caller that asked `open()` afterwards would get `None` and lose the message |
 | `bar` / `popup` | The two trees: one word per menu, and the open menu's rows. `popup_headed` puts a caller's element above the rows — the Applications menu's filter field — and the caller keys it, since it shares a column with rows that are all keyed |
 | `accel_match` | The message whose item claims a key, from the same table the popup draws |
+| `is_menu_key` | The keyboard's way to a context menu: the Menu key, or `Shift+F10` with no other modifier (F.5) |
+| `bar_rows` / `sends` | A context menu's rows, taken from its window's bar by their messages, a `None` a separator; and whether a row of some menus sends a message, which choosing it closes (F.5) |
 
 **A click on an open menu's own word closes it** (pre-Phase-7 Part F.3). The press dismisses the
 menu at the compositor, and the same click's release then reached the word's `on_press`, which
@@ -605,8 +607,17 @@ list has one.
   caller about to hang a menu from the selected row. Only the rows that fit are built, so a row
   scrolled away has nothing to hang from until the list follows it back.
 
-**Files' context rows that its bar also has are the bar's rows**, taken from its table by their
-message, so a label, a chord or whether a row is enabled cannot differ between the two.
+**A context menu's rows that its window's bar also has are the bar's rows** (`bar_rows`), so a
+label, a chord or whether a row is enabled cannot differ between the two: Files' Cut to
+Properties, the editor's Undo to Select All, greyed while a field is open as the bar's are, and
+the terminal's Copy to Clear Scrollback.
+
+**Where a right press asks for a menu depends on who can measure it** (F.5). Files' rows carry
+`on_context`. The editor's document and the terminal's grid read the press through their own
+`on_pointer`, which sees every button: the editor needs the font to turn the point into a line and
+a column, and keeps a selection the press lands in or places the caret first, so the menu's rows
+act on what it shows. The Menu key opens the editor's menu at the next frame, the only place that
+can measure the caret, and the terminal's at once, its cells being fixed.
 
 **What it replaced.** `menu_bar` and `menu_item` already existed and every application used them;
 what each one had written for itself was the *other* half — open/close state, the anchor capture

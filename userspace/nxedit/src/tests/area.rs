@@ -216,10 +216,10 @@ fn a_document_scroll_survives_the_next_repaint() {
     assert_eq!(a.buf().text.offset(), scrolled, "the repaint put the document back where its caret is");
 }
 
-/// Only the left button places the caret: a right press inside a selection leaves it for a menu to
-/// act on, and a middle press moves nothing.
+/// A right press inside a selection leaves it for the menu to act on, and a middle press moves
+/// nothing; a right press outside one is `menus::tests`'.
 #[test]
-fn only_a_left_press_moves_the_caret_or_drops_the_selection() {
+fn a_right_press_inside_a_selection_and_a_middle_press_move_nothing() {
     use librsproto::surface::{POINTER_BUTTON, POINTER_MOTION, POINTER_PRESSED, PointerEvent};
     let mut a = App::new("/home/notes.txt", "/home");
     a.loaded("hello world", b"hello world\n");

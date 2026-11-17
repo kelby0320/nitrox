@@ -236,6 +236,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         backends: alloc::vec::Vec<TabBackend>,
         bounds: Rect,
         menu: Host,
+        /// The selection when last reported.
+        selected: Option<libterm::grid::Selection>,
     }
 
     /// Open a window of this terminal, dressed and with a shell in its first tab.
@@ -253,7 +255,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         dress(win, top.id());
         let mut backends = alloc::vec::Vec::new();
         reconcile_backends(&mut app, &mut backends, root, env);
-        Some(Win { top, app, backends, bounds: Rect::new(0, 0, size.w, size.h), menu: Host::new(BUFFERS) })
+        let (bounds, menu) = (Rect::new(0, 0, size.w, size.h), Host::new(BUFFERS));
+        Some(Win { top, app, backends, bounds, menu, selected: None })
     }
 
     let mut quit_pending = false;
@@ -296,11 +299,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
 
     let mut backends: alloc::vec::Vec<TabBackend> = alloc::vec::Vec::new();
     reconcile_backends(&mut app, &mut backends, root, &env);
-    let mut wins = alloc::vec![Win { top, app, backends, bounds, menu }];
+    let mut wins = alloc::vec![Win { top, app, backends, bounds, menu, selected: None }];
 
     loop {
         for entry in wins.iter_mut() {
-            let Win { top, app, backends, bounds, menu } = entry;
+            let Win { top, app, backends, bounds, menu, selected } = entry;
             let window_id = top.id();
             let ui = app.view(&theme, top.hovered_key());
             let l = layout(&ui, *bounds, &FontMetrics::new(&ui_font, theme.font_px));
@@ -337,6 +340,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     };
                     l.end();
                 }
+            }
+
+            // The selection's length, a count and never the text, on change: `check-terminal` waits
+            // on it before a right click, which can overtake the keys that made the selection.
+            // Compared by its ends, so the text is copied only when they move.
+            if app.grid().selection() != *selected {
+                *selected = app.grid().selection();
+                let n = app.grid().selected_text().map_or(0, |t| t.chars().count());
+                Line::new().s(b"nxterm: selected ").u(n as u64).s(b" chars").end();
             }
 
             // The grid holds the keyboard whenever the menu is not open; a button click takes
@@ -607,7 +619,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // A process's tabs, not a window's: each is a handle in the one `sys_wait`.
             let open: usize = wins.iter().map(|w| w.app.tabs().len()).sum();
             let elsewhere = open - wins[wi].app.tabs().len();
-            let Win { top, app, backends: _, bounds, menu } = &mut wins[wi];
+            let Win { top, app, backends: _, bounds, menu, selected: _ } = &mut wins[wi];
             app.set_tabs_elsewhere(elsewhere);
             let window_id = top.id();
             // Rebuilt for this window, as routing is against its tree. No layout here:
@@ -624,8 +636,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     // The popup holds the keyboard: arrows, Esc and Enter drive the menu, and none
                     // reaches the grid.
                     Routed::Key(k) => {
-                        let table = app.menu_table();
-                        if let Some(m) = app.menus.choose(&k, &table, None) {
+                        let (table, context) = (app.menu_table(), app.context_menu());
+                        if let Some(m) = app.menus.choose(&k, &table, context.as_ref()) {
                             chose(m);
                             app.update(m);
                         }
@@ -672,12 +684,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                     // Counted before routing so the press can ask which click it was; the record's
                     // own time is used, so a stalled client does not read two clicks as a double.
-                    if p.kind == librsproto::surface::POINTER_BUTTON
-                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
-                        && p.button == libkern::abi::BTN_LEFT
-                    {
-                        app.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms);
-                    }
+                    app.note_pointer(&p);
                     let msgs = top.route(&ui, &ui_font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {
                         app.update(m);

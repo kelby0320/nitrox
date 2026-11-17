@@ -31,6 +31,9 @@ use libui::widget::{
 };
 use libui::widget::{ScrollState, TAB_STRIP_H, TextFieldState, Theme as UiTheme, WidgetState, scrollbar, text_field};
 
+mod menus;
+mod pointer;
+
 /// The `custom` node the grid is drawn into.
 pub const GRID_KIND: u32 = 0x4772_6964;
 
@@ -529,12 +532,7 @@ impl App {
     /// Apply a message from the chrome.
     pub fn update(&mut self, msg: Msg) {
         // Choosing dismisses the menu, whichever row; a message that is not a row leaves it alone.
-        if self
-            .menu_table()
-            .iter()
-            .flat_map(|m| m.items.iter())
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
-        {
+        if libui::menu::sends(&self.menu_table(), &msg) {
             self.menus.close();
         }
         match msg {
@@ -632,61 +630,6 @@ impl App {
         self.send(text.as_bytes());
     }
 
-    /// A pointer event over the grid: press to anchor, drag to extend, release to end.
-    ///
-    /// Only the left button, and only while held: the router delivers motion unconditionally.
-    fn grid_pointer(&mut self, p: PointerEvent) {
-        let Some((line, col)) = self.cell_at(p.x, p.y) else { return };
-        if p.kind == POINTER_BUTTON && p.button == BTN_LEFT {
-            if p.flags & POINTER_PRESSED != 0 {
-                // Past three wraps back to a sweep, as a fourth click has no larger unit.
-                match self.click_run {
-                    2 => {
-                        self.tab_mut().grid.select_word_at(line, col);
-                    }
-                    3 => {
-                        self.tab_mut().grid.select_line_at(line);
-                    }
-                    _ => self.tab_mut().grid.select_from(line, col),
-                }
-                self.tab_mut().view_moved = true;
-            }
-            return;
-        }
-        if p.kind == POINTER_MOTION && p.buttons & 1 != 0 {
-            self.tab_mut().grid.extend(line, col);
-            self.tab_mut().view_moved = true;
-        }
-    }
-
-    /// Record a pointer press at `at`, `at_ms` milliseconds into the monotonic clock, before the
-    /// event is routed so it can ask which click it was.
-    pub fn note_press(&mut self, at: libdraw::geom::Point, at_ms: u64) {
-        let n = self.clicks.press(at, at_ms);
-        self.click_run = if n > 3 {
-            // Re-seeded, not merely forgotten: a bare `reset` would make this press a first click
-            // and the next one too.
-            self.clicks.reset();
-            self.clicks.press(at, at_ms)
-        } else {
-            n
-        };
-    }
-
-    /// The absolute `(line, column)` a grid-local pixel falls in, or `None` outside it.
-    pub fn cell_at(&self, x: i32, y: i32) -> Option<(u64, usize)> {
-        if x < 0 || y < 0 || self.metrics.cell_w == 0 || self.metrics.cell_h == 0 {
-            return None;
-        }
-        let col = (x as u32 / self.metrics.cell_w) as usize;
-        let row = (y as u32 / self.metrics.cell_h) as usize;
-        if row >= self.tab().grid.rows() {
-            return None;
-        }
-        // Clamped rather than refused: a drag off the right edge means "to the end of the line".
-        Some((self.view_line() + row as u64, col.min(self.tab().grid.cols())))
-    }
-
     /// Type what a key produced, if it is a key that types.
     fn key(&mut self, k: KeyEvent) {
         if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
@@ -697,6 +640,10 @@ impl App {
         if let Some(msg) = libui::menu::accel_match(&self.menu_table(), &k) {
             self.update(msg);
             return;
+        }
+        // Before the find field and the encoder: `Shift+F10` reaches no program, as in GNOME's.
+        if libui::menu::is_menu_key(&k) {
+            return self.menu_key();
         }
         // While a find is open the keys are the field's, or they would type into the shell; after
         // the chord check so `Ctrl+Shift+F` can reopen it.
@@ -800,53 +747,6 @@ impl App {
         // What the `Dock` will leave it, less the grip's square: the grip is the topmost layer, so
         // a track under it cannot be pressed.
         self.window.h.saturating_sub(BARS_H + GRIP_W)
-    }
-
-    /// Record where each bar word sits, so an open menu knows where to hang from.
-    pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
-        let n = self.menu_count();
-        self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
-    }
-
-    /// How many menus the bar has, derived from the table.
-    pub fn menu_count(&self) -> usize {
-        self.menu_table().len()
-    }
-
-    /// The bar's menus, in bar order.
-    ///
-    /// Built rather than stored; Clear and Reset sit under Edit.
-    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
-        vec![
-            Menu {
-                title: "File",
-                items: vec![
-                    Item::new("New Tab", Accel::ctrl_shift(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
-                    Item::new("Close Tab", Accel::ctrl_shift(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current)),
-                    Item::Separator,
-                    Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow),
-                    Item::Separator,
-                    Item::plain("Close Window", Msg::Close),
-                    Item::new("Quit", Accel::ctrl_shift(QUIT_KEYCODE, "Q"), Msg::Quit),
-                ],
-            },
-            Menu {
-                title: "Edit",
-                items: vec![
-                    Item::new("Copy", Accel::ctrl_shift(COPY_KEYCODE, "C"), Msg::Copy)
-                        .enabled(self.tab().grid.has_selection()),
-                    Item::new("Paste", Accel::ctrl_shift(PASTE_KEYCODE, "V"), Msg::Paste),
-                    Item::new("Select All", Accel::ctrl_shift(SELECT_ALL_KEYCODE, "A"), Msg::SelectAll)
-                        .enabled(self.tab().grid.line_text(self.tab().grid.top_line()).is_some()),
-                    Item::new("Find", Accel::ctrl_shift(FIND_KEYCODE, "F"), Msg::Find),
-                    Item::new("Clear Scrollback", Accel::ctrl_shift(CLEAR_KEYCODE, "K"), Msg::ClearScrollback)
-                        .enabled(self.tab().grid.oldest_line() < self.tab().grid.top_line()),
-                    Item::Separator,
-                    Item::plain("Clear", Msg::Clear),
-                    Item::plain("Reset", Msg::Reset),
-                ],
-            },
-        ]
     }
 
     /// The element tree for the current state.
@@ -954,15 +854,6 @@ impl App {
 
         // The menu is not in this tree: a `popup` window of its own, clipped only by the screen.
         body
-    }
-
-    /// The popup of the menu `shown` — the root of a second window, not a layer in this one.
-    pub fn menu_view(&self, shown: Shown, ui: &UiTheme, hovered: Option<u64>) -> Element<Msg> {
-        let menus = self.menu_table();
-        match if let Shown::Bar(i) = shown { menus.get(i) } else { None } {
-            Some(m) => libui::menu::popup(m, &self.menus, MENU_ROW_KEY, hovered, ui),
-            None => libui::widget::popup_frame(padding(Insets::all(2), libui::element::text("")), ui),
-        }
     }
 }
 
