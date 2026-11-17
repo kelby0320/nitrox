@@ -326,9 +326,9 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     quietly(s, "man 5 manual-page", "The contract between a page")?;
     s.expect("/home>")?;
-    // A serial line cannot say its size, so `terminal` refuses and `man` drew to 80 columns.
-    s.send("terminal")?;
-    s.expect("terminal: its size is not known")?;
+    // A serial line cannot say its size: `terminal` reports it null, and `man` drew to 80 columns.
+    quietly(s, "let unknown = terminal | filter columns == null | filter rows == null | count", "/home>")?;
+    quietly(s, "format(\"unknown={}\", unknown)", "unknown=1")?;
     s.expect("/home>")?;
     // The keyword's filter, which only `man` runs: one page is named so.
     quietly(s, "let kw = man --keyword rsproto-auth | count", "/home>")?;

@@ -474,7 +474,7 @@ each fill reading up to 31 pages ahead.
 the real prompt over the serial console and matches on what comes back — 56 steps,
 expect-driven rather than sleep-driven. Since Phase 6 Part H.2 one of them is `nxsh`'s `time`: its
 line, of its shape, before the value it passes through. Since pre-Phase-7 Part G.2 one is
-`terminal`'s refusal: a serial line cannot say its size.
+`terminal` on serial, whose size it reports null, as a serial line cannot say it.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
 a fixed script under `test-harness`, so the `login:` prompt, the typed password, the real shell

@@ -298,7 +298,8 @@ Part G is done when G.7 has merged and what Miri reports is triaged.
 **Departures, for the maintainer's eye:**
 - **`terminal`, a new coreutil**, printing the size, which the gate asks: the plan said
   `check-terminal` asks without saying how, and its grid is 80 wide, the fallback every program
-  uses.
+  uses. **Shaped to grow**, the maintainer's call: one command, its queries the record, null where
+  unknown, and its settings options that ask the window (`shell-language.md` § 10).
 - **The size goes with the attach**, the plan's "on attaching" made a body rather than a message:
   the shell spawned next could ask before a separate one arrived.
 - **Canonical reads still draw as a dumb terminal** (`TODO(canonical-wrap)`), and a serial line's
@@ -318,7 +319,7 @@ long to short, of several rows, over a long line and replaced, Enter mid-line, a
 - **`check-terminal`**: `terminal` answers the grid `nxterm` logged, and a line wider than the grid
   is edited across its wrap;
 - **`check-login`**: after the drag, `terminal` in the session's window answers the new width;
-- **`test-interactive`**: on serial, `terminal` says the size is unknown.
+- **`test-interactive`**: on serial, `terminal` reports the size null.
 
 ### G.3 The pager
 

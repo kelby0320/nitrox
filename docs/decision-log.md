@@ -38594,6 +38594,13 @@ G.1 merged, #451. G.2, `manual.md` § G.2, built on `pre-phase-7/part-g2-tty-siz
   the cursor (`TODO(canonical-wrap)`).
 - **`terminal`, a coreutil the plan did not name**, prints the size as a one-row table. The plan
   had `check-terminal` "ask the size" without saying how, and its grid is 80 wide, the width every
-  program falls back to, so nothing else could tell a size that came through from none. It fails on
-  a serial line rather than answer 80 by 24. Its page is G.6's, with every command's.
+  program falls back to, so nothing else could tell a size that came through from none. Its page is
+  G.6's, with every command's.
+- **`terminal` is shaped to grow, the maintainer's call: one command, not Unix's three.** `tty`,
+  `stty` and `tput` came apart by history, and `tput`'s capability database has no job with one
+  emulator; a typed record answers what `tput cols` and `stty size` each answer. **A query is the
+  record**, gaining a column per thing learned, so its size is **null on serial**, not a failure
+  that would hide every later column. **A setting will be an option asking the window**, as
+  `disk --mount` is an option: a stage's terminal is a sibling of the shell's with its own echo and
+  line, so `stty`'s model, one device every process shares, does not carry over.
 - **Page Up and Page Down** are decoded for whoever reads keys: the pager, G.3.
