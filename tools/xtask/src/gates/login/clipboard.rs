@@ -279,42 +279,10 @@ pub(crate) fn login_buffers_and_clipboard(qmp: &mut Qmp, session: &mut Session, 
     let (_, px, py, _pw, ph) =
         parse_menu_popup(&popup).ok_or_else(|| format!("could not read the menu's placement from {popup:?}"))?;
 
-    // **The row is found rather than computed**: the File menu's **separator** takes height without
-    // being a row. The walk stops when the guest agrees it is over `Rename`. The border plus space
-    // above the first row is six.
-    const MENU_FRAME: i32 = 6;
+    // The File menu's `Rename`.
     const RENAME_ROW: u64 = 109;
-    let rx = px + 20;
-    let mut ry = py + MENU_FRAME;
-    let mut rename_at = None;
-    // **Each step records where it went**: `move_pointer_to` does not update the tracked position,
-    // so a loop leaving it alone would run off the popup.
-    while ry < py + ph as i32 - MENU_FRAME {
-        move_pointer_to(qmp, rx, ry)?;
-        qmp.pointer = Some((rx, ry));
-        // **The row the pointer settled on, not the first it crossed** (`Session::settled_line`).
-        let over = session.settled_line(
-            "nxfiles: menu hover ",
-            std::time::Duration::from_millis(150),
-            std::time::Duration::from_millis(400),
-        )?;
-        if over.as_deref() == Some(RENAME_ROW.to_string().as_str()) {
-            println!("  ok: the pointer settled over row {RENAME_ROW}");
-            rename_at = Some((rx, ry));
-            break;
-        }
-        ry += 4;
-    }
-    let Some(rename_at) = rename_at else {
-        return Err(format!(
-            "the pointer walked {}..{} down the File menu and the guest never reported row \
-             {RENAME_ROW} under it",
-            py + MENU_FRAME,
-            py + ph as i32 - MENU_FRAME
-        )
-        .into());
-    };
-    qmp.pointer = Some(rename_at);
+    let span = (py + MENU_FRAME, py + ph as i32 - MENU_FRAME);
+    let rename_at = walk_to_menu_row(qmp, session, "nxfiles: menu hover ", px + 20, span, RENAME_ROW)?;
     click_at(qmp, session, rename_at.0, rename_at.1)?;
     // **Wait for the menu popup to be gone before typing**: a `popup` takes focus, so until
     // `nxfiles` closes it every key goes there and is dropped. Emitted after the close, that is the

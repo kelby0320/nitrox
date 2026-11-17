@@ -8,12 +8,21 @@ use crate::*;
 /// retry its inverse. The fix is fewer misses: `Qmp::pointer` remembers a confirmed press, so
 /// clicks walk instead of re-pinning with a burst that overruns the guest's input ring.
 pub(crate) fn click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
+    click_with(qmp, session, "left", x, y)
+}
+
+/// [`click_at`] with the right button: a context menu's gesture, confirmed as a click is.
+pub(crate) fn right_click_at(qmp: &mut Qmp, session: &mut Session, x: i32, y: i32) -> R<String> {
+    click_with(qmp, session, "right", x, y)
+}
+
+fn click_with(qmp: &mut Qmp, session: &mut Session, button: &str, x: i32, y: i32) -> R<String> {
     const ATTEMPTS: u32 = 3;
     const PER_ATTEMPT: std::time::Duration = std::time::Duration::from_secs(10);
     for attempt in 1..=ATTEMPTS {
         move_pointer_to(qmp, x, y)?;
-        qmp.send_button("left", true)?;
-        qmp.send_button("left", false)?;
+        qmp.send_button(button, true)?;
+        qmp.send_button(button, false)?;
         if session.expect_within(&format!("compositor: press at x={x} y={y}"), PER_ATTEMPT)? {
             qmp.pointer = Some((x, y));
             // Flush, so the release is certain to have been sent: QEMU holds a packet its

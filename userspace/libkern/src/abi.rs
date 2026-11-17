@@ -734,6 +734,8 @@ pub const KEY_SPACE: u16 = 57;
 pub const KEY_CAPSLOCK: u16 = 58;
 /// F1.
 pub const KEY_F1: u16 = 59;
+/// F10: with Shift, the keyboard's way to a context menu, beside [`KEY_COMPOSE`].
+pub const KEY_F10: u16 = 68;
 /// Num Lock.
 pub const KEY_NUMLOCK: u16 = 69;
 /// Scroll Lock.

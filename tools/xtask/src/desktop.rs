@@ -11,6 +11,57 @@ pub(crate) fn parse_menu_popup(tail: &str) -> Option<(u32, i32, i32, u32, u32)> 
     Some((id.parse().ok()?, x.parse().ok()?, y.parse().ok()?, w.parse().ok()?, h.parse().ok()?))
 }
 
+/// Read `<x>,<y> for <what>` — the tail of `nxfiles`' context-menu line: where the menu was asked
+/// for, window-local, and the row's or drive's name, or `the folder`.
+pub(crate) fn parse_context_menu(tail: &str) -> Option<(i32, i32, &str)> {
+    let (at, what) = tail.trim().split_once(" for ")?;
+    let (x, y) = at.split_once(',')?;
+    Some((x.parse().ok()?, y.parse().ok()?, what))
+}
+
+/// How far inside a menu popup its first row starts: the border, and the space above the row.
+pub(crate) const MENU_FRAME: i32 = 6;
+
+/// Walk the pointer down a menu popup at `x`, from `y` to `end` four pixels a step, until the guest
+/// reports `row` under it on a `hover` line, and answer where.
+///
+/// **The row is found rather than computed**: a separator takes height without being a row, and a
+/// row's height follows the theme. **The row the pointer settled on, not the first it crossed**
+/// (`Session::settled_line`).
+pub(crate) fn walk_to_menu_row(
+    qmp: &mut Qmp,
+    session: &mut Session,
+    hover: &str,
+    x: i32,
+    (y, end): (i32, i32),
+    row: u64,
+) -> R<(i32, i32)> {
+    let mut at = y;
+    while at < end {
+        move_pointer_to(qmp, x, at)?;
+        // **Each step records where it went**: `move_pointer_to` does not, so a walk leaving it
+        // alone would re-walk the whole delta each step and run off the popup.
+        qmp.pointer = Some((x, at));
+        let over = session.settled_line(
+            hover,
+            std::time::Duration::from_millis(150),
+            std::time::Duration::from_millis(400),
+        )?;
+        if over.as_deref() == Some(row.to_string().as_str()) {
+            println!("  ok: the pointer settled over row {row}");
+            return Ok((x, at));
+        }
+        at += 4;
+    }
+    let seen: Vec<String> = session.transcript().lines().filter(|l| l.contains(hover)).map(str::to_string).collect();
+    Err(format!(
+        "the pointer walked {y}..{end} down the menu and the guest never reported row {row} under it; it \
+         reported: {}",
+        if seen.is_empty() { String::from("nothing") } else { seen.join(", ") }
+    )
+    .into())
+}
+
 /// Read `<id> of window <parent> at <x>,<y> <w>x<h>` — the tail of the shell's dialog placement.
 pub(crate) fn parse_dialog_placement(tail: &str) -> Option<(u32, u32, i32, i32, u32, u32)> {
     let (id, rest) = tail.trim().split_once(" of window ")?;

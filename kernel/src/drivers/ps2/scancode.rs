@@ -161,6 +161,7 @@ mod tests {
         assert_eq!(d.feed(0x2A), Decoded::Key { code: KEY_LEFTSHIFT, pressed: true });
         assert_eq!(d.feed(0x39), Decoded::Key { code: KEY_SPACE, pressed: true });
         assert_eq!(d.feed(0x3B), Decoded::Key { code: KEY_F1, pressed: true });
+        assert_eq!(d.feed(0x44), Decoded::Key { code: KEY_F10, pressed: true });
         assert_eq!(d.feed(0x53), Decoded::Key { code: KEY_KPDOT, pressed: true });
     }
 

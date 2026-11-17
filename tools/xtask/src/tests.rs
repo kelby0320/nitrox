@@ -753,3 +753,12 @@ fn every_critical_server_is_declared_before_the_terminal_server() {
     let decls = declared(&moved);
     assert_eq!(decls.last(), Some(&("late".to_string(), true)));
 }
+
+#[test]
+fn a_context_menu_line_reads_its_point_and_what_it_is_for() {
+    assert_eq!(parse_context_menu("1010,692 for the folder\n"), Some((1010, 692, "the folder")));
+    assert_eq!(parse_context_menu("200,150 for my notes.txt"), Some((200, 150, "my notes.txt")));
+    assert_eq!(parse_context_menu("-3,7 for a"), Some((-3, 7, "a")), "a point left of the window");
+    assert_eq!(parse_context_menu("200,150"), None, "for nothing");
+    assert_eq!(parse_context_menu("200 for a"), None, "half a point");
+}

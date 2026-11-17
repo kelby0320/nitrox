@@ -40,14 +40,14 @@ pub const PROPS_H: u32 = 236;
 /// Everything the browser is.
 pub struct App {
     /// The open panes, in tab order. Never empty: closing the last tab closes the window.
-    panes: Vec<Pane>,
-    current: u64,
+    pub(super) panes: Vec<Pane>,
+    pub(super) current: u64,
     clip_push: Option<(librsproto::clipboard::PathVerb, Vec<String>)>,
     clip_read: bool,
     /// The entries picked besides the one the list state holds, by name: indices do not survive
     /// a re-sort.
-    marked: Vec<String>,
-    anchor: Option<usize>,
+    pub(super) marked: Vec<String>,
+    pub(super) anchor: Option<usize>,
     /// This session's home, which the sidebar's first row goes to; `main` reads it from the
     /// environment.
     home: String,
@@ -72,10 +72,10 @@ pub struct App {
     /// menu's rule.
     search: Option<TextFieldState>,
     /// Counts runs of pointer presses, fed by the binary (the only half that can read a clock).
-    clicks: libui::click::Clicks,
+    pub(super) clicks: libui::click::Clicks,
     /// Where within the thumb the scrollbar was taken hold of; one per window, as a grab is.
     scroll_grab: libui::widget::ScrollGrab,
-    click_run: u32,
+    pub(super) click_run: u32,
     click_mods: u16,
     /// The next tab key — monotonic, so a stale message cannot name a pane that took its place;
     /// numbered from [`TAB_KEY_BASE`] to stay clear of element keys and list-row indices.
@@ -107,6 +107,8 @@ pub struct App {
     ///
     /// The window it drops into is the binary's, opened and destroyed with this.
     pub menus: MenuState,
+    /// What the context menu is for, and where it was asked for.
+    pub(super) context: ContextMenus,
     /// A name being typed, and what it is for. `Some` is a mode: the keys belong to the field and
     /// the strip shows it in place of the path.
     prompt: Option<(Action, Target, TextFieldState)>,
@@ -178,6 +180,7 @@ impl App {
             quit: false,
             // Zero: `set_anchors` sizes this every frame before anything reads it.
             menus: MenuState::new(0),
+            context: ContextMenus::default(),
             prompt: None,
             confirm: None,
             dialog_focused: true,
@@ -194,7 +197,7 @@ impl App {
         self.panes.iter().find(|p| p.key == self.current).unwrap_or(&self.panes[0])
     }
 
-    fn pane_mut(&mut self) -> &mut Pane {
+    pub(super) fn pane_mut(&mut self) -> &mut Pane {
         let key = self.current;
         let i = self.panes.iter().position(|p| p.key == key).unwrap_or(0);
         &mut self.panes[i]
@@ -321,6 +324,7 @@ impl App {
         // *file* row re-selects without re-listing, which this never sees.
         self.prompt = None;
         self.confirm = None;
+        self.close_context_menu();
     }
 
     /// Turn a wire entry into a row; only an entry with an empty name is dropped.
@@ -348,15 +352,7 @@ impl App {
 
     /// Apply a message.
     pub fn update(&mut self, msg: Msg) {
-        // Choosing dismisses the menu, whichever row it was. Asked of the table, not repeated in
-        // the arms, so a row added later cannot forget. A message that is not a row leaves it
-        // alone, which keeps `MenuBar` able to open one.
-        if self
-            .menu_table()
-            .iter()
-            .flat_map(|m| m.items.iter())
-            .any(|it| matches!(it, Item::Action { msg: m, .. } if *m == msg))
-        {
+        if self.is_menu_row(&msg) {
             self.menus.close();
         }
         match msg {
@@ -420,6 +416,7 @@ impl App {
             Msg::ResizeWindow(edges) => self.resize_requested = Some(edges),
             Msg::Close => self.closing = true,
             Msg::MenuBar(i) => self.menus.toggle(i),
+            Msg::ContextMenu(on) => self.open_context_menu(on),
             Msg::NewWindow => self.new_window = true,
             Msg::Quit => self.quit = true,
             Msg::Choose(a) => self.choose(a),
@@ -592,10 +589,10 @@ impl App {
                 self.properties = selected.clone().map(|e| (self.pane().path.clone(), e));
             }
             // The field starts empty: pre-filling would need a selection and a caret to be useful.
-            // The location bar closes too: `key` checks it first and `view` draws the prompt
-            // first, so with both open the keyboard would feed the field nobody can see.
+            // The location bar and the search close too: `key` checks both first, so with either
+            // open the keyboard would feed it and not the prompt.
             _ => {
-                self.location = None;
+                (self.location, self.search) = (None, None);
                 self.prompt = Some((a, target, TextFieldState::new()));
             }
         }
@@ -756,6 +753,7 @@ impl App {
                 }
             }
             libkern::abi::KEY_BACKSPACE => self.update(Msg::Up),
+            _ if is_menu_key(&k) => self.menu_key(),
             _ => {}
         }
     }
@@ -1102,89 +1100,6 @@ impl App {
     /// The edges a `StartResize` is owed for. Clears the record.
     pub fn take_resize_request(&mut self) -> Option<u32> {
         self.resize_requested.take()
-    }
-
-    /// Record where each bar word sits, so an open menu knows where to hang from.
-    ///
-    /// One method with one count (the bar's menus), testable on the host: a count kept in the
-    /// binary drifted and *View* opened a popup with nowhere to go.
-    pub fn place_menus(&mut self, view: &Element<Msg>, l: &libui::layout::Layout) {
-        let n = self.menu_count();
-        self.menus.set_anchors((0..n).map(|i| libui::layout::locate(view, l, MENU_BAR_KEY + i as u64)).collect());
-    }
-
-    /// How many menus the bar has — derived from the table, never declared: a constant here
-    /// drifted from `menu_table` and a bar word did nothing, with no error anywhere.
-    pub fn menu_count(&self) -> usize {
-        self.menu_table().len()
-    }
-
-    /// The bar's menus, in bar order.
-    ///
-    /// Built from `&self` because half the rows depend on state: the ones that act on a
-    /// selection are disabled without one, and Close Tab on the last tab.
-    pub fn menu_table(&self) -> Vec<Menu<Msg>> {
-        let selected = self.pane().list.selected.is_some();
-        let act = |label: &'static str, a: Action| {
-            Item::plain(label, Msg::Choose(a)).enabled(!a.needs_selection() || selected)
-        };
-        let here = self.pane().order;
-        let order_row = |label: &'static str, o: libfs::Order| Item::plain(label, Msg::SetOrder(o)).marked(o == here);
-        vec![
-            Menu {
-                title: "File",
-                items: vec![
-                    Item::new("New Tab", Accel::ctrl(NEW_TAB_KEYCODE, "T"), Msg::NewTab),
-                    Item::new("Close Tab", Accel::ctrl(CLOSE_TAB_KEYCODE, "W"), Msg::CloseTab(self.current))
-                        .enabled(self.panes.len() > 1),
-                    Item::new("Go to Location\u{2026}", Accel::ctrl(LOCATION_KEYCODE, "L"), Msg::OpenLocation),
-                    Item::Separator,
-                    Item::new("New Window", Accel::ctrl_shift(NEW_WINDOW_KEYCODE, "N"), Msg::NewWindow),
-                    Item::new("Quit", Accel::ctrl(QUIT_KEYCODE, "Q"), Msg::Quit),
-                    Item::Separator,
-                    act("New File", Action::NewFile),
-                    act("New Folder", Action::NewFolder),
-                    act("Rename", Action::Rename),
-                    // In `deny`: the one row here that destroys something. It still asks first.
-                    act("Delete", Action::Delete).destructive(true),
-                    // Last, after the destructive row: it changes nothing, so a mis-aimed press
-                    // lands on it instead of Delete.
-                    Item::new("Properties", Accel::ctrl(PROPERTIES_KEYCODE, "I"), Msg::Choose(Action::Properties))
-                        .enabled(selected),
-                ],
-            },
-            // Cut, Copy and Paste move a path through `/dev/clipboard`; Duplicate asks for a name
-            // and writes a file.
-            Menu {
-                title: "Edit",
-                items: vec![
-                    Item::new("Cut", Accel::ctrl(CUT_KEYCODE, "X"), Msg::CutFiles).enabled(selected),
-                    Item::new("Copy", Accel::ctrl(COPY_KEYCODE, "C"), Msg::CopyFiles).enabled(selected),
-                    // Paste is offered whatever is on the ring: reading it is a syscall this
-                    // crate does not make. A paste of text says so instead.
-                    Item::new("Paste", Accel::ctrl(PASTE_KEYCODE, "V"), Msg::PasteFiles),
-                    Item::Separator,
-                    act("Duplicate\u{2026}", Action::Duplicate),
-                ],
-            },
-            // The four orders are a radio group and the last row a toggle, marked from the tab
-            // whose menu this is.
-            Menu {
-                title: "View",
-                items: vec![
-                    order_row("Name (A\u{2013}Z)", libfs::Order::NameAsc),
-                    order_row("Name (Z\u{2013}A)", libfs::Order::NameDesc),
-                    order_row("Oldest First", libfs::Order::OldestFirst),
-                    order_row("Newest First", libfs::Order::NewestFirst),
-                    Item::Separator,
-                    Item::new("Show Hidden Files", Accel::ctrl(HIDDEN_KEYCODE, "H"), Msg::ToggleHidden)
-                        .marked(self.pane().show_hidden),
-                    // In View: this row changes which rows are shown, and `check-login` indexes
-                    // the File menu's rows, so one wedged into it would move a gate's aim.
-                    Item::new("Search\u{2026}", Accel::ctrl(SEARCH_KEYCODE, "F"), Msg::OpenSearch),
-                ],
-            },
-        ]
     }
 
     /// The name a delete is asking about, for the binary that owns the dialog's window.
@@ -1609,7 +1524,7 @@ impl App {
                 .collect();
             self.drive_list.selected = here_drive;
             let drives_h = side_h.saturating_sub(places_h + DRIVES_HEADING_H);
-            let drives = list_view(
+            let drives = list_view_with_menus(
                 &drive_rows,
                 &[],
                 &mut self.drive_list,
@@ -1618,6 +1533,7 @@ impl App {
                 drive_row,
                 None,
                 None,
+                drive_menus(),
                 hovered,
                 Some(ui.sidebar),
                 ui,
@@ -1639,7 +1555,7 @@ impl App {
         let stored = self.pane().list.selected;
         let position = stored.and_then(|e| shown.iter().position(|&i| i == e));
         self.pane_mut().list.selected = position;
-        let list = list_view(
+        let list = list_view_with_menus(
             &rows,
             LIST_COLUMNS,
             &mut self.pane_mut().list,
@@ -1648,6 +1564,7 @@ impl App {
             press_row,
             Some(grab_row),
             Some(Msg::Scroll),
+            listing_menus(),
             highlight,
             None,
             ui,

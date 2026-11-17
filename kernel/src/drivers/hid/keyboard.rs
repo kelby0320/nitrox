@@ -292,6 +292,7 @@ mod tests {
         assert_eq!(keycode(0x2C), Some(KEY_SPACE));
         assert_eq!(keycode(0x39), Some(KEY_CAPSLOCK));
         assert_eq!(keycode(0x3A), Some(KEY_F1));
+        assert_eq!(keycode(0x43), Some(KEY_F10));
         assert_eq!(keycode(0x45), Some(88), "F12");
         assert_eq!(keycode(0x47), Some(KEY_SCROLLLOCK));
         assert_eq!(

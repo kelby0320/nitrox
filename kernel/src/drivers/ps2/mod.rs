@@ -331,7 +331,7 @@ fn submit_write(
 }
 
 #[cfg(feature = "fbcon-gate")]
-const CRASH_KEY: u16 = crate::libkern::input::KEY_F1 + 9;
+const CRASH_KEY: u16 = crate::libkern::input::KEY_F10;
 
 /// Drain the controller into the rings, for both ISRs: **both ports deliver through the same data
 /// port**, so whichever line fires the byte might be either device's and the status bit is the only

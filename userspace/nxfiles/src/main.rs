@@ -572,6 +572,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                 l.s(b"nxfiles: menu popup ").u(id as u64).s(b" at ").i(x as i64).s(b",").i(y as i64);
                 l.s(b" ").u(size.w as u64).s(b"x").u(size.h as u64).end();
             }
+            // What a context menu is for and where it was asked for: `check-login` places it by this.
+            if let (Some(_), Some(((x, y), name))) = (synced.opened, app.context_shown()) {
+                let mut l = Line::new();
+                l.s(b"nxfiles: context menu at ").i(x as i64).s(b",").i(y as i64);
+                match name {
+                    Some(n) => l.s(b" for ").untrusted(n.as_bytes()),
+                    None => l.s(b" for the folder"),
+                };
+                l.end();
+            }
             if let Some(now) = synced.hover {
                 let mut l = Line::new();
                 l.s(b"nxfiles: menu hover ");
@@ -869,12 +879,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     Routed::Dismissed(shown) => app.menus.dismissed(shown),
                     // Arrows, Esc and Enter drive the open menu: a popup holds the keyboard, so these
                     // never reach the browser's router.
-                    Routed::Key(k) => {
-                        let table = app.menu_table();
-                        if let Some(msg) = app.menus.choose(&k, &table, None) {
-                            app.update(msg);
-                        }
-                    }
+                    Routed::Key(k) => app.menu_key_event(k),
                     Routed::Msgs(msgs) => {
                         for msg in msgs {
                             app.update(msg);
@@ -929,14 +934,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     }
                 }
                 WindowEvent::Pointer(p) => {
-                    // Counted before the event is routed, so the message the press produces can
-                    // ask what number the click was; the record's own time is used.
-                    if p.kind == librsproto::surface::POINTER_BUTTON
-                        && p.flags & librsproto::surface::POINTER_PRESSED != 0
-                        && p.button == libkern::abi::BTN_LEFT
-                    {
-                        app.note_press(libdraw::geom::Point::new(p.x, p.y), p.time_ms, p.modifiers);
-                    }
+                    // Noted before the event is routed, so the message a press produces can ask
+                    // what number the click was, or where the menu it asks for opens.
+                    app.note_pointer(&p);
                     let msgs = top.route(&ui, &font, &theme, &WindowEvent::Pointer(p));
                     for m in msgs {
                         app.update(m);

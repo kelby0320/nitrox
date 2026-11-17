@@ -18,22 +18,23 @@ use alloc::vec;
 use libdraw::geom::{Rect, Size};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
 use librsproto::surface::{
-    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, PointerEvent, RESIZE_BOTTOM, RESIZE_RIGHT,
-    WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
+    KEY_DOWN, KEY_REPEAT, KeyEvent, MOD_CTRL, MOD_SHIFT, POINTER_BUTTON, POINTER_PRESSED, PointerEvent, RESIZE_BOTTOM,
+    RESIZE_RIGHT, WINDOW_STATE_MAXIMIZED, WINDOW_STATE_MINIMIZED, WINDOW_STATE_NORMAL,
 };
 use libui::element::{
     Edge, Element, Insets, center_v, column, dock, docked, ink, padding, row, sized, text, with_spacing,
 };
 use libui::menu::{Accel, Item, Menu, MenuState, Shown};
 use libui::widget::{
-    ColumnAlign, DIALOG_GAP, ListColumn, ListRow, ListState, RowButton, STATUS_BAR_H, Swatch, TAB_STRIP_H, TITLE_BAR_H,
-    TabExtras, TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button, dialog_frame,
-    list_view, popup_frame, resize_grip, status_bar, status_separator, status_text, tab_strip, text_field, title_bar,
-    window_frame_with_grip,
+    ColumnAlign, DIALOG_GAP, ListColumn, ListMenus, ListRow, ListState, RowButton, STATUS_BAR_H, Swatch, TAB_STRIP_H,
+    TITLE_BAR_H, TabExtras, TextFieldState, Theme as UiTheme, TitleButtons, WINDOW_FRAME_H, WidgetState, button,
+    dialog_frame, list_view, list_view_with_menus, popup_frame, resize_grip, status_bar, status_separator, status_text,
+    tab_strip, text_field, title_bar, window_frame_with_grip,
 };
 
 mod app;
 mod keys;
+mod menus;
 mod model;
 mod msg;
 mod popups;
@@ -41,6 +42,7 @@ mod text;
 
 pub use app::*;
 pub use keys::*;
+pub use menus::*;
 pub use model::*;
 pub use msg::*;
 pub use text::*;

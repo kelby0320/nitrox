@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16; F.1, F.2 and F.3 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1 to F.4 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why
@@ -539,6 +539,83 @@ With nothing selected, they open the folder's menu at the listing's top-left.
 - the Menu key, which opens the selected row's menu.
 
 Docs: `widget-toolkit.md` (`list_view`). Author; the menu tables can be the implementer's.
+
+**Built 2026-11-16** (`c6fb94d6` and `1adbcba0`, after the bar's menu table moved to `menus.rs`, `140080e6`, by the
+implementer). `list_view_with_menus` takes a `ListMenus`; `list_view` keeps its signature.
+`ListState::follow` re-follows a selection. Files' `Context` is a row, the folder or a drive, asked
+for by `Msg::ContextMenu`. `note_pointer`, which the binary calls before routing each pointer event,
+counts a left press and records where a right one landed. `KEY_F10` is new in `libkern::abi`.
+
+**Departures, for the maintainer's eye:**
+- **A context row the bar has is taken from the bar's table by its message**, rather than built
+  from a definition the two share. It is the same row, so the two cannot differ, and there is no
+  definition to keep.
+- **A new listing closes a context menu.** A drive pulled while a row's menu is open re-lists home,
+  and the menu's rows would act on home's first row. `show` already drops a prompt and a question,
+  for the same reason. **A menu whose drive has gone closes** at the next frame, rather than staying
+  up empty.
+- **A right press on the folder's space leaves the selection alone**, as its rows act on none.
+- **A menu opened by the keyboard has no row lit**: `select_first` serves bar menus, so Down lights
+  the first row and Up the last.
+- **Files logs `context menu at x,y for <name>`**, window-local, after `menu popup`: the gate reads
+  what a menu is for and where it was asked for.
+- **The gate's walk down a menu is one helper**, `walk_to_menu_row`, which the File menu's rename
+  now uses too. `right_click_at` confirms a right press as `click_at` does a left one.
+
+**Twenty tests.** Four of the list's:
+- a row's menu on a row, the space's below the rows, none from `list_view`;
+- a row's on its button;
+- none on the scrollbar;
+- `follow`.
+
+Fifteen of Files', each driving the real tree and router:
+- after a double click, a right press on another file opens nothing and selects it alone;
+- inside a Shift range it keeps the range, and Copy copies all of it;
+- on a marked row it keeps the marks, and on another clears them;
+- a row's menu at the press, the folder's below the rows and in an empty folder, and Open opening;
+- none on the scrollbar, which the right button does not page;
+- the Menu key and `Shift+F10` at the selected row's bottom-left, and `F10` alone not;
+- the Menu key bringing a scrolled-away selection back first;
+- with nothing selected, the folder's menu at the listing's top-left;
+- every shared row equal to the bar's, in four states;
+- a drive's menu sending what its row and its button send;
+- a context menu's keys;
+- the receipt and the row the gate aims at;
+- a new listing closing a menu, and a keyed request;
+- a drive's menu closing when the drive goes;
+- the popup drawing the context menu.
+
+And the gate's receipt parser.
+
+**Mutations**: each failed the test meant to catch it.
+- The list's four: no space menu, the space menu on the whole element, no row menu on a button's
+  row, `follow` doing nothing.
+- Files' sixteen: a right press as a press, every row selected alone, marks kept, the press not
+  noted, no folder menu, no `follow`, the row's top-left, `F10` without Shift, Delete built by hand,
+  a context row not closing the menu, `show` keeping the menu or the keyed request, Eject always
+  enabled, the keys ignoring the context menu, the popup drawing none, a drive's empty menu kept.
+- Two of `check-login`'s: a context menu placed inside rather than about its point fails the
+  maximized step, and Files without the Menu key fails the keyboard step.
+
+**After review** (`766a466e`):
+- **A right press on a marked row makes it the primary**, the old primary joining the marks, so the
+  set is the same. A marked row is drawn as the primary is, and Rename, Delete, Duplicate and
+  Properties act on the primary: a right press on a mark asked Delete about another file, and on
+  the only mark left every row but Open disabled. The plan's "acts on all of them" holds for Cut and
+  Copy.
+- **The Menu key's menu is the selection's as the frame finds it**, not as the key found it: a
+  Down typed in the same batch hung a menu from one row whose rows acted on the next.
+- **A right or middle press ends the click run.** The plan had a right press neither read nor
+  change it, and a left click dismissing the menu became a double click's second and opened the
+  file.
+- **A prompt chosen from a menu closes the search**, as it already closed the location bar, which
+  took its keys.
+- **An older context menu's popup draws nothing of a newer one**, whose rows its last events would
+  have routed against.
+- Eleven tests, one for each of these, and for the row index checked against a listing that shrank,
+  the anchor and the strip a right press sets, a key request taken once, a bar menu outliving the
+  frame that closes a drive's, and a right press's point taken once. The six surviving mutants the
+  review ran fail them.
 
 ### F.5 The editor's and the terminal's menus
 
