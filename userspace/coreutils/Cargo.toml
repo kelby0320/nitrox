@@ -116,3 +116,8 @@ path = "src/bin/log.rs"
 [[bin]]
 name = "man"
 path = "src/bin/man.rs"
+
+# The size of the terminal a stage was handed, as its window last said.
+[[bin]]
+name = "terminal"
+path = "src/bin/terminal.rs"

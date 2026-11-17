@@ -28,6 +28,7 @@ pub mod services;
 pub mod session;
 pub mod storage;
 pub mod surface;
+pub mod tty;
 pub mod views;
 
 /// The protocol magic: ASCII `"RSMG"`. Every message begins with it.
@@ -178,6 +179,12 @@ pub const OP_TTY_TOKEN: u16 = 0x0B0A;
 pub const OP_TTY_REDEEM: u16 = 0x0B0B;
 /// Bytes in a `Tty::Token` — 128 bits; one length for the minting server and the view broker.
 pub const TTY_TOKEN_LEN: usize = 16;
+/// `Tty::Size` — this terminal's columns and rows, its backend's, as a [`tty::Size`]; `0×0` where
+/// the backend has not said (`rsproto-tty-ops.md` § Size).
+pub const OP_TTY_SIZE: u16 = 0x0B0C;
+/// Emulator → server on a backend channel, unsolicited: the grid is now this [`tty::Size`]. The
+/// first goes with [`OP_TTY_ATTACH_BACKEND`], so it is there before a program can ask.
+pub const OP_TTY_RESIZE: u16 = 0x0B0D;
 
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;

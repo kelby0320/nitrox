@@ -76,7 +76,8 @@ A table's columns are as wide as their widest cell, the header's included, two c
 
 ## Width and style
 
-- **The width is 80 columns** while a program cannot learn its terminal's (`TODO(tty-size)`).
+- **The width is the terminal's**, as `Tty::Size` answers it, and **80 columns** where the size is
+  unknown, as on a serial line.
 - **A word longer than a line is broken where the line ends.** No line is wider than the width
   but a code block's.
 - **Plain or styled**: styled, bold is `ESC[1m`, code `ESC[36m` and emphasis `ESC[4m`, each

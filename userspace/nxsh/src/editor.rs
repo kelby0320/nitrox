@@ -29,7 +29,11 @@ pub struct Editor {
     search: Option<Search>,
     /// The statement's earlier lines, when one continues past a line's end.
     pending: String,
+    width: usize,
 }
+
+/// The width a terminal that cannot say its size is taken to have, as the serial console cannot.
+pub const WIDTH_UNKNOWN: usize = 80;
 
 impl Default for Editor {
     fn default() -> Self {
@@ -40,7 +44,19 @@ impl Default for Editor {
 impl Editor {
     /// An empty prompt.
     pub fn new() -> Editor {
-        Editor { disc: Discipline::new(), search: None, pending: String::new() }
+        Editor { disc: Discipline::new(), search: None, pending: String::new(), width: WIDTH_UNKNOWN }
+    }
+
+    /// The terminal is `cols` wide, or cannot say (`None`).
+    pub fn set_width(&mut self, cols: Option<usize>) {
+        let cols = cols.filter(|&c| c > 0);
+        self.width = cols.unwrap_or(WIDTH_UNKNOWN);
+        self.disc.set_width(cols);
+    }
+
+    /// A prompt `columns` wide was written, and the line starts after it.
+    pub fn set_prompt(&mut self, columns: usize) {
+        self.disc.set_prompt(columns);
     }
 
     /// The line as typed so far.
@@ -70,16 +86,14 @@ impl Editor {
     ) -> Vec<Out> {
         if let Some(st) = self.search.as_mut() {
             return match search_key(st, b, history) {
-                SearchStep::Redraw => alloc::vec![Out::Write(st.redraw())],
+                SearchStep::Redraw => alloc::vec![Out::Write(self.disc.replace_line(st.display().as_bytes()))],
                 SearchStep::Cancel => {
-                    let mut out = st.erase();
-                    out.extend_from_slice(&self.disc.replace_line(st.original.as_bytes()));
+                    let out = self.disc.replace_line(st.original.as_bytes());
                     self.search = None;
                     alloc::vec![Out::Write(out)]
                 }
                 SearchStep::Keep => {
-                    let mut out = st.erase();
-                    out.extend_from_slice(&self.disc.replace_line(st.kept().as_bytes()));
+                    let out = self.disc.replace_line(st.kept().as_bytes());
                     self.search = None;
                     // As readline decides: the `ESC` begins a cursor key only if the key's next
                     // byte arrived with it. A person's next key comes in a later read, so a bare
@@ -90,23 +104,19 @@ impl Editor {
                     alloc::vec![Out::Write(out)]
                 }
                 SearchStep::Accept => {
-                    let mut out = st.erase();
-                    let chosen = st.matched.clone();
-                    out.extend_from_slice(&self.disc.replace_line(chosen.as_bytes()));
-                    out.extend_from_slice(b"\r\n");
+                    let mut out = self.disc.replace_line(st.matched.as_bytes());
                     self.search = None;
-                    let mut outs = alloc::vec![Out::Write(out)];
-                    // Submit by feeding the terminator, as a typed line takes.
+                    // Submitted as a typed line is, its echo with it.
                     match self.disc.feed(b'\n') {
-                        Step::Line { bytes, .. } => {
+                        Step::Line { bytes, echo } => {
+                            out.extend_from_slice(&echo);
                             self.pending.push_str(&String::from_utf8_lossy(&bytes));
                             let line = core::mem::take(&mut self.pending);
                             history.push(&line);
-                            outs.push(Out::Run(line));
+                            alloc::vec![Out::Write(out), Out::Run(line)]
                         }
-                        _ => outs.push(Out::Prompt),
+                        _ => alloc::vec![Out::Write(out), Out::Prompt],
                     }
-                    outs
                 }
                 SearchStep::None => Vec::new(),
             };
@@ -116,9 +126,8 @@ impl Editor {
         let escaping = self.disc.in_escape();
         if b == 0x12 && !escaping {
             let original = String::from_utf8_lossy(self.disc.line()).into_owned();
-            let mut out = self.disc.replace_line(b"");
-            let mut st = Search::new(original);
-            out.extend_from_slice(&st.redraw());
+            let st = Search::new(original);
+            let out = self.disc.replace_line(st.display().as_bytes());
             self.search = Some(st);
             return alloc::vec![Out::Write(out)];
         }
@@ -187,7 +196,7 @@ impl Editor {
             },
             // The list goes on its own lines, with no cursor addressing, for the serial console.
             Action::List => alloc::vec![
-                Out::Write(listing(&c.candidates)),
+                Out::Write(listing(&c.candidates, self.width)),
                 if self.pending.is_empty() { Out::Prompt } else { Out::Continuation },
                 Out::Write(self.disc.redraw()),
             ],
@@ -225,6 +234,26 @@ mod tests {
         ran
     }
 
+    /// Tab's listing is drawn to the width the terminal last said, and to 80 when it cannot say.
+    #[test]
+    fn a_listing_is_drawn_to_the_terminals_width() {
+        let names: Vec<String> = (b'a'..=b'm').map(|c| alloc::format!("x{}", c as char)).collect();
+        let rows = |width: Option<usize>| {
+            let mut e = Editor::new();
+            e.set_width(width);
+            let mut h = History::new();
+            let mut complete = |_: &str| Completion { start: 0, candidates: names.clone() };
+            let _ = e.feed(b'x', None, &mut h, &mut complete);
+            e.feed(b'\t', None, &mut h, &mut complete).into_iter().find_map(|out| match out {
+                Out::Write(w) if w.starts_with(b"\r\n") => Some(w.windows(2).filter(|p| p == b"\r\n").count() - 1),
+                _ => None,
+            })
+        };
+        assert_eq!(rows(Some(40)), Some(2), "ten four-wide names to a row");
+        assert_eq!(rows(Some(80)), Some(1));
+        assert_eq!((rows(None), rows(Some(0))), (Some(1), Some(1)), "a size it cannot say is 80");
+    }
+
     #[test]
     fn a_bare_escape_ending_a_search_leaves_the_next_key_alone() {
         let ran = |next: &[u8]| typed(&["whoami"], &[b"\x12whoa", b"\x1b", next]).0;
@@ -242,6 +271,44 @@ mod tests {
         assert_eq!(ran(b"\x1b[H\x1b[3~\r"), ["hoami"]);
         assert_eq!(ran(b"\x1bOH_\r"), ["_whoami"], "a terminal in application mode");
         assert_eq!(typed(&["whoami"], &[b"\x12whoa\x1b[Dx\r"]).0, ["whoamxi"], "the search and the key in one read");
+    }
+
+    fn written(past: &[&str], reads: &[&[u8]]) -> (Vec<u8>, Vec<String>) {
+        let (mut e, mut h) = (Editor::new(), History::new());
+        for p in past {
+            h.push(p);
+        }
+        let (mut out, mut ran) = (Vec::new(), Vec::new());
+        for read in reads {
+            for (i, &b) in read.iter().enumerate() {
+                for o in e.feed(b, read.get(i + 1).copied(), &mut h, &mut |w| Completion::none(w.len())) {
+                    match o {
+                        Out::Write(w) => out.extend(w),
+                        Out::Run(src) => ran.push(src),
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (out, ran)
+    }
+
+    /// Of unknown width, a search is drawn and erased by Backspace, as it always was.
+    #[test]
+    fn a_search_is_drawn_and_erased_with_the_line() {
+        let (out, _) = written(&["whoami"], &[b"typed", b"\x12"]);
+        assert_eq!(out, [&b"typed"[..], &b"\x08 \x08".repeat(5), b"search '' -> "].concat());
+        let (out, _) = written(&["whoami"], &[b"typed\x12", b"\x07"]);
+        let shown = b"search '' -> ".len();
+        assert!(out.ends_with(&[b"\x08 \x08".repeat(shown), b"typed".to_vec()].concat()), "{out:?}");
+    }
+
+    /// An accepted match ends its line as Enter would, then runs.
+    #[test]
+    fn an_accepted_search_ends_its_line_and_runs() {
+        let (out, ran) = written(&["whoami"], &[b"\x12who", b"\r"]);
+        assert!(out.ends_with(b"whoami\r\n"), "{out:?}");
+        assert_eq!(ran, ["whoami"]);
     }
 
     #[test]

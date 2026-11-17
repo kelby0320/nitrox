@@ -458,6 +458,8 @@ fn every_form_of_each_key_is_reported() {
         (b"\x1b[8~", Key::End),
         (b"\x1bOF", Key::End),
         (b"\x1b[3~", Key::Delete),
+        (b"\x1b[5~", Key::PageUp),
+        (b"\x1b[6~", Key::PageDown),
         (b"\x1b[1;5D", Key::Left),
         (b"\x1bOA", Key::Up),
     ] {
@@ -571,4 +573,18 @@ fn an_escape_after_ss3_starts_a_new_sequence() {
     let mut d = Discipline::new();
     let got: Vec<Step> = b"\x1bO\x1b[D".iter().map(|&b| d.feed(b)).filter(|s| *s != Step::None).collect();
     assert_eq!(got, [Step::Key(Key::Left)]);
+}
+
+/// A page key is for whoever reads keys: the line takes no page, so an edit with one is nothing.
+#[test]
+fn a_page_key_edits_nothing() {
+    let mut d = Discipline::new();
+    for b in b"hello" {
+        d.feed(*b);
+    }
+    let _ = d.edit(Key::Left);
+    for k in [Key::PageUp, Key::PageDown] {
+        assert_eq!(d.edit(k), Vec::<u8>::new(), "{k:?}");
+        assert_eq!((d.line(), d.cursor()), (&b"hello"[..], 4), "{k:?}");
+    }
 }

@@ -147,6 +147,34 @@ pub(crate) fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect("nxterm: grid> usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]")?;
     println!("  ok: `nxsh --help` rendered in the grid, not on the kernel log");
 
+    // **A stage is answered the window's grid**, read wherever an earlier wait left the transcript.
+    let grid = session.line_since(0, "nxterm: started, grid ", |_| true, std::time::Duration::from_secs(1))?;
+    let (cols, rows) = grid.split_once('x').ok_or_else(|| format!("no grid size in {grid:?}"))?;
+    type_at_terminal(&mut qmp, "terminal")?;
+    session.expect("nxterm: grid> columns")?;
+    session.expect(&format!("nxterm: grid> {cols} "))?;
+    let row = session.matched_line()?;
+    let said: Vec<&str> = row.trim_start_matches("nxterm: grid>").split_whitespace().collect();
+    if said != [cols, rows] {
+        return Err(format!("`terminal` answered {said:?} on a {cols}x{rows} grid").into());
+    }
+    println!("  ok: `terminal` answered the {cols}x{rows} grid the window told the tty server");
+
+    // **A line past its row is edited across the wrap**: after `/> `, 80 characters leave `az"` on
+    // the next row; Left crosses back up and Backspace pulls `z"` to its start, where a redraw by
+    // Backspace alone leaves `az"`. The row is read as Enter passes over it.
+    std::thread::sleep(std::time::Duration::from_millis(40));
+    press(&mut qmp, "ret")?;
+    type_text(&mut qmp, &format!("\"{}z\"", "a".repeat(77)))?;
+    session.expect("nxterm: grid> az\"")?;
+    for key in ["left", "left", "left", "left", "backspace", "ret"] {
+        std::thread::sleep(std::time::Duration::from_millis(40));
+        press(&mut qmp, key)?;
+    }
+    session.expect("nxterm: grid> z\"")?;
+    session.expect(&format!("nxterm: grid> {}z", "a".repeat(76)))?;
+    println!("  ok: a line wider than the grid was edited across its wrap, and ran as edited");
+
     // The title follows the shell's current directory; that it changes once, not per prompt, is
     // `a_repeated_announcement_is_not_a_change` (`expect` cannot assert an absence).
     type_at_terminal(&mut qmp, "cd /home")?;

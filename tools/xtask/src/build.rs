@@ -32,6 +32,9 @@ pub(crate) const COREUTILS: &[&str] = &[
     // The manual, read from `/system/manual`, where the profile server projects each package's
     // pages.
     "man",
+    // The size of the terminal a stage was handed, which a window's emulator tells the tty server
+    // and a serial line cannot.
+    "terminal",
 ];
 
 /// The system services, packaged into the store like any other program.

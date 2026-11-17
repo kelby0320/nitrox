@@ -611,8 +611,12 @@ fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Han
     tty.write(b"\r\n");
 
     let mut history = nxsh::history::History::new();
-    let prompt = |interp: &Interp| nxsh::repl::prompt(interp.cwd().unwrap_or("/"), true);
-    tty.write(prompt(&interp).as_bytes());
+    let prompt = |editor: &mut nxsh::editor::Editor, interp: &Interp| {
+        let position = interp.cwd().unwrap_or("/");
+        tty.write(nxsh::repl::prompt(position, true).as_bytes());
+        editor.set_prompt(nxsh::repl::prompt_width(position));
+    };
+    prompt(&mut editor, &interp);
 
     let mut chunk = [0u8; 64];
     loop {
@@ -631,21 +635,27 @@ fn repl(mut host: NitroxHost, env: libstream::wire::Record, terminal: Option<Han
         // back empty. The tty only reports it; what it means is the caller's decision.
         if notices.take_interrupt() {
             tty.write(&editor.interrupt());
-            tty.write(prompt(&interp).as_bytes());
+            prompt(&mut editor, &interp);
             continue;
         }
+        // After the check above: an interrupt queued behind this read's bytes is the line's, and
+        // the exchange records it for the line's first checkpoint.
+        editor.set_width(tty.size().map(|s| usize::from(s.cols)));
         let read = &chunk[..n];
         for (i, &b) in read.iter().enumerate() {
             for out in editor.feed(b, read.get(i + 1).copied(), &mut history, &mut |whole| interp.complete(whole)) {
                 match out {
                     nxsh::editor::Out::Write(bytes) => tty.write(&bytes),
-                    nxsh::editor::Out::Prompt => tty.write(prompt(&interp).as_bytes()),
-                    nxsh::editor::Out::Continuation => tty.write(nxsh::repl::continuation_prompt().as_bytes()),
+                    nxsh::editor::Out::Prompt => prompt(&mut editor, &interp),
+                    nxsh::editor::Out::Continuation => {
+                        tty.write(nxsh::repl::continuation_prompt().as_bytes());
+                        editor.set_prompt(nxsh::repl::continuation_prompt().chars().count());
+                    }
                     nxsh::editor::Out::Run(src) => {
                         if let Some(status) = run_and_render(&mut interp, &tty, &src) {
                             return status;
                         }
-                        tty.write(prompt(&interp).as_bytes());
+                        prompt(&mut editor, &interp);
                     }
                     nxsh::editor::Out::Eof => return EXIT_OK,
                 }

@@ -10,7 +10,8 @@ use libkern::{KError, Rights};
 use libos::log;
 use libos::{Carried, Channel, Deadline, Handle, Msg, Namespace, NsReadOnly, Only, Ref, Spawn, WaitSet, block_on};
 use librsproto::server::send;
-use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, RS_FLAG_REPLY, decode};
+use librsproto::tty::Size;
+use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_INPUT, OP_TTY_OUTPUT, OP_TTY_RESIZE, RS_FLAG_REPLY, decode};
 use libstream::setup::{StageStreams, send_stage_setup};
 
 /// The most terminal input one message carries ([`librsproto::RS_MAX_BODY`]); a paste reaches it.
@@ -28,13 +29,15 @@ pub struct Backend {
     gone: bool,
     /// What [`output`](Backend::output) lends out, so holding it holds this `Backend`.
     msg: Box<Msg>,
+    told: Size,
 }
 
-/// Obtain a terminal and become its backend.
+/// Obtain a terminal and become its backend, its grid `size` from the start.
 ///
 /// Returns `(terminal, backend)`: the terminal channel to hand the shell, and the backend this
-/// process keeps. `None` if `/dev/tty` does not resolve or the server refuses.
-pub fn attach(root: Ref<'_, Namespace, NsReadOnly>) -> Option<(Handle<Channel, Only>, Backend)> {
+/// process keeps. `None` if `/dev/tty` does not resolve or the server refuses. The size goes with
+/// the attach, not after it, so the shell spawned next cannot ask before the server knows.
+pub fn attach(root: Ref<'_, Namespace, NsReadOnly>, size: Size) -> Option<(Handle<Channel, Only>, Backend)> {
     let rights = Rights::SEND | Rights::RECV | Rights::WAIT | Rights::TRANSFER;
     let Ok(tty) = block_on(root.lookup::<Channel, Only>("/dev/tty", rights)) else {
         log::write(b"nxterm: /dev/tty did not resolve\n");
@@ -44,7 +47,7 @@ pub fn attach(root: Ref<'_, Namespace, NsReadOnly>) -> Option<(Handle<Channel, O
     // `far` is moved: once the server owns it, its close is how this process learns the terminal
     // ended.
     let mut carried = Carried::new();
-    if carried.push(far).is_err() || send(&tty, OP_TTY_ATTACH_BACKEND, 1, 0, &[], &mut carried).is_err() {
+    if carried.push(far).is_err() || send(&tty, OP_TTY_ATTACH_BACKEND, 1, 0, &size.encode(), &mut carried).is_err() {
         log::write(b"nxterm: AttachBackend did not send\n");
         return None;
     }
@@ -58,7 +61,7 @@ pub fn attach(root: Ref<'_, Namespace, NsReadOnly>) -> Option<(Handle<Channel, O
         log::write(b"nxterm: AttachBackend refused\n");
         return None;
     }
-    Some((tty, Backend { channel: near, gone: false, msg: Box::new(Msg::new()) }))
+    Some((tty, Backend { channel: near, gone: false, msg: Box::new(Msg::new()), told: size }))
 }
 
 /// Receive one message on `ch` and report whether it is a non-error reply.
@@ -74,6 +77,13 @@ impl Backend {
     /// Tell the server the user typed `bytes`, exactly what a serial keyboard would produce.
     pub fn typed(&self, bytes: &[u8]) -> bool {
         bytes.chunks(MAX_BODY).all(|part| send(&self.channel, OP_TTY_INPUT, 0, 0, part, &mut Carried::new()).is_ok())
+    }
+
+    /// Tell the server the grid is now `size`, if that is news; a failed send is tried next frame.
+    pub fn resize(&mut self, size: Size) {
+        if size != self.told && send(&self.channel, OP_TTY_RESIZE, 0, 0, &size.encode(), &mut Carried::new()).is_ok() {
+            self.told = size;
+        }
     }
 
     /// Take one queued message of program output, if there is one.

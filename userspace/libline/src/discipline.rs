@@ -41,6 +41,10 @@ pub enum Key {
     End,
     /// Delete the character under the cursor (`ESC [ 3 ~`).
     Delete,
+    /// A page back (`ESC [ 5 ~`): the line takes no page, so it is for whoever reads keys.
+    PageUp,
+    /// A page on (`ESC [ 6 ~`).
+    PageDown,
 }
 
 /// Where the escape-sequence parser is; a sequence naming no key is discarded, not accumulated.
@@ -57,16 +61,21 @@ enum EscState {
     Ss3,
 }
 
-/// One terminal's editing state. Its redraw is Backspace and text, needing no terminal width; that
-/// holds for a line shorter than its row, and a full or wrapped one draws wrong (`TODO(tty-size)`).
+mod screen;
+
+use screen::{Geometry, move_cursor};
+
+/// One terminal's editing state. With a width it redraws by row and column; without, as on a serial
+/// line, by Backspace and text, which draws a wrapped line wrong (`TODO(serial-size)`).
 pub struct Discipline {
     line: Vec<u8>,
-    /// Where typing lands: a character boundary, never before the last row, which Backspace cannot
-    /// climb out of.
+    /// Where typing lands: a character boundary, never before a recalled statement's last row.
     cursor: usize,
     echo: bool,
     max: usize,
     esc: EscState,
+    width: Option<usize>,
+    prompt: usize,
 }
 
 /// The longest line accepted before further printable input is refused, not truncated: a
@@ -111,6 +120,8 @@ fn csi_key(fin: u8, param: u32) -> Option<Key> {
         (b'H', _) | (b'~', 1 | 7) => Some(Key::Home),
         (b'F', _) | (b'~', 4 | 8) => Some(Key::End),
         (b'~', 3) => Some(Key::Delete),
+        (b'~', 5) => Some(Key::PageUp),
+        (b'~', 6) => Some(Key::PageDown),
         _ => None,
     }
 }
@@ -118,7 +129,30 @@ fn csi_key(fin: u8, param: u32) -> Option<Key> {
 impl Discipline {
     /// An empty line with echo on.
     pub fn new() -> Self {
-        Discipline { line: Vec::new(), cursor: 0, echo: true, max: LINE_MAX, esc: EscState::Ground }
+        Discipline {
+            line: Vec::new(),
+            cursor: 0,
+            echo: true,
+            max: LINE_MAX,
+            esc: EscState::Ground,
+            width: None,
+            prompt: 0,
+        }
+    }
+
+    /// The terminal is `width` columns wide, or cannot say (`None`, or 0); set again whenever it
+    /// may have changed, as a refitted terminal has rewrapped what it shows.
+    pub fn set_width(&mut self, width: Option<usize>) {
+        self.width = width.filter(|&w| w > 0);
+    }
+
+    /// The line starts after a prompt `columns` wide.
+    pub fn set_prompt(&mut self, columns: usize) {
+        self.prompt = columns;
+    }
+
+    fn geometry(&self) -> Option<Geometry> {
+        self.width.map(|width| Geometry { width, prompt: self.prompt })
     }
 
     /// Whether typed characters are echoed. Off is how a password is read; it is the server's
@@ -169,6 +203,15 @@ impl Discipline {
         }
         // A sequence half-read when the line is replaced is abandoned with it.
         self.esc = EscState::Ground;
+        if let Some(g) = self.geometry() {
+            let at = self.cell(g, self.cursor);
+            let mut new = [before, after].concat();
+            new.truncate(whole_chars(&new, self.max));
+            let last_row = new.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
+            self.cursor = before.len().min(new.len()).max(last_row);
+            self.line = new;
+            return if self.echo { self.repaint(g, at, 0, true) } else { Vec::new() };
+        }
         let mut out = Vec::new();
         out.extend_from_slice(&self.line[self.cursor..]);
         for _ in 0..chars(&self.line) {
@@ -190,6 +233,9 @@ impl Discipline {
         if !self.echo {
             return Vec::new();
         }
+        if let Some(g) = self.geometry() {
+            return self.repaint(g, self.cell(g, 0), 0, false);
+        }
         let mut out = self.line.clone();
         back(&mut out, chars(&self.line[self.cursor..]));
         out
@@ -197,6 +243,9 @@ impl Discipline {
 
     /// Act on an editing key and return what to write; Up and Down are not edits, and do nothing.
     pub fn edit(&mut self, key: Key) -> Vec<u8> {
+        if let Some(g) = self.geometry() {
+            return self.edit_on(g, key);
+        }
         let mut out = Vec::new();
         match key {
             Key::Left if self.cursor > self.row_start() => {
@@ -225,6 +274,27 @@ impl Discipline {
             _ => {}
         }
         if self.echo { out } else { Vec::new() }
+    }
+
+    fn edit_on(&mut self, g: Geometry, key: Key) -> Vec<u8> {
+        let at = self.cell(g, self.cursor);
+        match key {
+            Key::Left if self.cursor > self.row_start() => self.cursor = self.prev(self.cursor),
+            Key::Right if self.cursor < self.line.len() => self.cursor = self.next(self.cursor),
+            Key::Home => self.cursor = self.row_start(),
+            Key::End => self.cursor = self.line.len(),
+            Key::Delete if self.cursor < self.line.len() => {
+                let next = self.next(self.cursor);
+                self.line.drain(self.cursor..next);
+                return if self.echo { self.repaint(g, at, self.cursor, true) } else { Vec::new() };
+            }
+            _ => return Vec::new(),
+        }
+        let mut out = Vec::new();
+        if self.echo {
+            move_cursor(&mut out, at, self.cell(g, self.cursor));
+        }
+        out
     }
 
     /// Where the last row starts: after the last `\n`, which only a recalled statement holds.
@@ -276,9 +346,14 @@ impl Discipline {
     /// Remove the bytes from `from` to the cursor, which is left at `from`, and say what to write.
     fn remove_before(&mut self, from: usize) -> Step {
         let n = chars(&self.line[from..self.cursor]);
+        let at = self.geometry().map(|g| (g, self.cell(g, self.cursor)));
         self.line.drain(from..self.cursor);
         self.cursor = from;
-        self.erased_before(n)
+        match at {
+            Some((g, at)) if self.echo && n > 0 => Step::Echo(self.repaint(g, at, from, true)),
+            Some(_) => Step::None,
+            None => self.erased_before(n),
+        }
     }
 
     /// Feed one byte from the device.
@@ -354,12 +429,16 @@ impl Discipline {
             // CR and LF both end a line, wherever the cursor is; which one a serial line sends is
             // an accident.
             b'\r' | b'\n' => {
-                let bytes = core::mem::take(&mut self.line);
-                self.cursor = 0;
                 // Echoed because the user typed it: omitting it leaves the next prompt against
                 // their input (`alicepassword:`). In no-echo mode nothing was shown, so the
                 // caller supplies its own newline.
-                let echo = if self.echo { b"\r\n".to_vec() } else { Vec::new() };
+                let echo = match self.geometry() {
+                    _ if !self.echo => Vec::new(),
+                    Some(g) => self.finish(g),
+                    None => b"\r\n".to_vec(),
+                };
+                let bytes = core::mem::take(&mut self.line);
+                self.cursor = 0;
                 Step::Line { bytes, echo }
             }
             // Ctrl-D is end-of-input at an empty line; mid-line it does nothing, since discarding
@@ -401,10 +480,14 @@ impl Discipline {
                 if self.line.len() >= self.max {
                     return Step::None; // refuse, do not truncate
                 }
+                let at = self.geometry().map(|g| (g, self.cell(g, self.cursor)));
                 self.line.insert(self.cursor, b);
                 self.cursor += 1;
                 if !self.echo {
                     return Step::None;
+                }
+                if let Some((g, at)) = at {
+                    return Step::Echo(self.repaint(g, at, self.cursor - 1, false));
                 }
                 let mut out = alloc::vec![b];
                 out.extend(self.rewrite_tail(0));

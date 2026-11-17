@@ -134,6 +134,12 @@ impl Stage {
         self.streams.stdin.as_ref().map(|h| Port::new(h.as_ref()))
     }
 
+    /// The size of the terminal the stage was handed, as its window last said; `None` with no
+    /// terminal, or one that cannot say, as the serial console cannot.
+    pub fn terminal_size(&self) -> Option<librsproto::tty::Size> {
+        self.terminal.as_ref().and_then(libprompt::size_on)
+    }
+
     /// A port on `stdout`, if it has one.
     pub fn stdout(&self) -> Option<Port<'_>> {
         self.streams.stdout.as_ref().map(|h| Port::new(h.as_ref()))
@@ -384,6 +390,20 @@ mod tests {
         assert_eq!(stage.text(b"a page\n"), Err(libstream::wire::WireError::PeerClosed));
         let mut msg = libos::Msg::new();
         assert!(err_far.recv(&mut msg).is_err(), "nothing went to stderr in its place");
+    }
+
+    #[test]
+    fn a_stage_asks_the_terminal_it_was_handed_its_size() {
+        use librsproto::tty::Size;
+        let (stage, _, (_, term_far), _) = shell_stage(&[]);
+        let window = Size { cols: 100, rows: 30 };
+        let mut msg = libos::Msg::new();
+        let n = librsproto::encode(msg.payload_mut(), librsproto::OP_TTY_SIZE, 1, 0, &window.encode(), 0).unwrap();
+        msg.set_len(n).unwrap();
+        term_far.send(&msg, &mut libos::Carried::new()).unwrap();
+        assert_eq!(stage.terminal_size(), Some(window));
+        mock::reset();
+        assert_eq!(Stage::enter(start(&[], 0, 0)).terminal_size(), None, "no terminal, no size");
     }
 
     #[test]

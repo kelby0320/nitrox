@@ -1,10 +1,10 @@
 # rsproto — Tty operations (`0x0Bxx`)
 
 **Status: normative for what is built (2026-08-13; `OpenSibling` 2026-09-23; `Token` and `Redeem`
-2026-10-01).** `ReadLine`, `Read`, `Write`, `SetMode`, `Close` and `Interrupt` are implemented in
-`userspace/tty-server/`; `AttachBackend`, `Output` and `Input` landed with Milestone 5 Part C,
-`OpenSibling` with administration Part A.2, and `Token` and `Redeem` with the laptop polish's
-Part A. Job control and terminal emulation are unbuilt —
+2026-10-01; `Size` and `Resize` 2026-11-17).** `ReadLine`, `Read`, `Write`, `SetMode`, `Close` and
+`Interrupt` are implemented in `userspace/tty-server/`; `AttachBackend`, `Output` and `Input` landed
+with Milestone 5 Part C, `OpenSibling` with administration Part A.2, `Token` and `Redeem` with the
+laptop polish's Part A, and `Size` and `Resize` with pre-Phase-7 Part G.2. Job control and terminal emulation are unbuilt —
 see [`console-and-tty.md`](../architecture/console-and-tty.md) for the design and its staging.
 
 Written 2026-08-13, when Part C gave this category a **second channel role** and the contract
@@ -24,8 +24,8 @@ Since Part C there is a third role, the **backend channel**, held by a terminal 
 | Role | Speaks | Who holds it |
 |---|---|---|
 | forwarding endpoint | `Namespace::Resolve` | `/dev/tty`, bound by service-mgr; by session-mgr in each session |
-| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` / `Token` / `Redeem` | the program using the terminal; `Redeem` the view broker, on a terminal it resolves itself |
-| backend channel | `Output` (server→emulator), `Input` (emulator→server) | a terminal emulator |
+| terminal channel | `ReadLine` / `Read` / `Write` / `SetMode` / `Close` / `AttachBackend` / `OpenSibling` / `Token` / `Redeem` / `Size` | the program using the terminal; `Redeem` the view broker, on a terminal it resolves itself |
+| backend channel | `Output` (server→emulator), `Input` and `Resize` (emulator→server) | a terminal emulator |
 
 **A terminal is per resolver, not per session.** Each program that resolves `/dev/tty` gets its
 own — `session-mgr` opens one for the login prompt, `nxsh` opens its own, and every stage `nxsh`
@@ -113,10 +113,11 @@ grouping, and `Ctrl-C` typed in one window has no business interrupting a progra
 
 ### `AttachBackend` (`0x0B06`)
 
-Request: empty body, **one moved handle** — a channel whose far end the sender keeps, with
-`SEND`, `RECV`, `WAIT` and `INSPECT`. Reply: empty on success; `InvalidArgument` if no handle was
-moved or it is not a channel end, `NoAccess` if it lacks one of the four rights, and `NotFound` if
-the terminal is gone. The handle is checked first, so a gone terminal sent a bad one answers for
+Request: **one moved handle** — a channel whose far end the sender keeps, with `SEND`, `RECV`,
+`WAIT` and `INSPECT` — and a body that is empty or **the emulator's grid**, a size as `Size`
+answers one. Reply: empty on success; `InvalidArgument` if no handle was moved, it is not a channel
+end, or the body is neither empty nor a size, `NoAccess` if it lacks one of the four rights, and
+`NotFound` if the terminal is gone. The handle is checked first, so a gone terminal sent a bad one answers for
 the handle. A refused handle is closed. The server sends output on the channel, receives input
 from it, and waits on it beside every terminal it serves, so one it could not wait on would fail
 every wait of its loop; it learns what it was given by a stat, which needs `INSPECT`.
@@ -129,6 +130,10 @@ between a master and a slave; here the tty server *is* the discipline, so an emu
 a master would be, and the terminal channel is what it hands to the program it hosts. The usual
 sequence is: resolve `/dev/tty`, `AttachBackend`, then give the terminal channel away — the
 emulator has no further use for it.
+
+**The size goes with the attach**, not in a `Resize` after it: an emulator attaches and then
+spawns the program, and a size sent separately could reach the server after the program asked. An
+empty body leaves the size unknown until the first `Resize`.
 
 A terminal may be re-pointed; the previous backend is dropped if no terminal is left on it.
 Re-pointing **keeps an outstanding read**: it is the same terminal and the same client, and
@@ -147,6 +152,17 @@ one. Writes longer than one message are split across several.
 **Emulator → server on a backend channel. Unsolicited, `request_id` 0, no reply.** Body is what
 a keyboard would have produced on a serial line. The server runs the discipline over it exactly
 as over console input, which is what keeps one implementation of `Ctrl-C`, erase and echo.
+
+### `Resize` (`0x0B0D`)
+
+**Emulator → server on a backend channel. Unsolicited, `request_id` 0, no reply.** Body: the
+grid's new size, as `Size` answers one. Sent at every refit — a window's resize, or a font change
+that fits a different grid — and only then: the size persists until the next. A body that is not
+a size is ignored, as anything else on this channel is, there being no request to refuse.
+
+The server tells nobody: a program asks when it is about to draw to the width. **There is no
+`SIGWINCH`**, since a message pushed to every terminal on a window would queue, during a drag,
+on every terminal whose holder is not reading.
 
 ### `OpenSibling` (`0x0B09`)
 
@@ -186,6 +202,17 @@ and the token is gone. `NotFound` for a token never minted, already redeemed, or
 Answered **on any terminal**: knowing the token is the proof, so the broker redeems over a
 terminal it resolved from its own namespace, not over one a caller sent. The server keeps sixteen
 tokens at most; past that the oldest goes, which costs its holder a password prompt.
+
+### `Size` (`0x0B0C`)
+
+Request: empty. Reply: **4 bytes**, columns then rows, each a little-endian `u16`
+(`librsproto::tty::Size`).
+
+**A terminal's size is its backend's**: every sibling in a window answers the window's grid, as the
+emulator last said it in `AttachBackend` or `Resize`. **`0×0` means unknown**, a side of 0 as much
+as both: the serial console's, which cannot say, and a window's whose emulator has not. A program
+asks when it draws to the width — the shell at every read, `man` before rendering — and draws to
+80 columns when the answer is unknown. A refit is seen at the next question, not pushed.
 
 ## Lifetime
 

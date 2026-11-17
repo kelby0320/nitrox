@@ -281,8 +281,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         backends.retain(|b| app.tabs().iter().any(|t| t.key() == b.key));
         let want: alloc::vec::Vec<u64> =
             app.tabs().iter().map(|t| t.key()).filter(|k| !backends.iter().any(|b| b.key == *k)).collect();
+        let size = librsproto::tty::Size::of_grid(app.grid().cols(), app.grid().rows());
         for key in want {
-            match backend::attach(root) {
+            match backend::attach(root, size) {
                 Some((terminal, b)) => {
                     // Said on success too: a release image could not otherwise tell a hosting
                     // terminal from an empty window.
@@ -474,7 +475,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             // Done here, not in the event arm, because output arrives unprompted and a prompt would
             // show one keypress late.
             let mut ended: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+            // One grid size for every tab: a refit reshapes them all.
+            let size = librsproto::tty::Size::of_grid(app.grid().cols(), app.grid().rows());
             for tb in backends.iter_mut() {
+                tb.backend.resize(size);
                 let out =
                     app.tabs_mut().iter_mut().find(|t| t.key() == tb.key).map(|t| t.take_outbox()).unwrap_or_default();
                 if !out.is_empty() && !tb.backend.typed(&out) {

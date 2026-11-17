@@ -1,7 +1,9 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-10-19**, when the line discipline gained a cursor and
-the editing keys, which `nxsh` acts on and canonical mode drops (pre-Phase-7 Part C.2). On
+**Status: stages 1–4 built; last checked 2026-11-17**, when a terminal gained a size: a window's
+emulator tells the server its grid and a program asks it (`Tty::Size`, pre-Phase-7 Part G.2). On
+2026-10-19 the line discipline gained a cursor and the editing keys, which `nxsh` acts on and
+canonical mode drops (pre-Phase-7 Part C.2). On
 2026-10-02 a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
@@ -290,6 +292,12 @@ Two things changed shape and are worth naming, because both were assumptions rat
   per application, which is [`graphical-session.md`](graphical-session.md) §6.1's
   question and Milestone 7's work (`TODO(gui-dev-tty)`).
 
+**A terminal's size is its backend's** (pre-Phase-7 Part G.2). `nxterm` sends its grid with the
+attach and again at every refit (`Tty::Resize`), and every terminal on the window — the shell's and
+each stage's sibling — answers it to `Tty::Size`. Nothing is pushed: `nxsh` asks after every read,
+so its completion listing fits a window refitted mid-line, and `man` asks before it renders. The
+console's size is unknown, as a serial line cannot say, and a program draws to 80 columns there.
+
 ## Stage 3 — line editing, history, and where they belong
 
 Scoping pass, 2026-08-03. Stage 3 reads as "add history", and the interesting part is that
@@ -357,13 +365,21 @@ other. The discipline's host tests cover it either way.
   (`ESC O`) to its final byte, keeping the CSI's first parameter, and reports Up, Down, Left,
   Right, Home, End and Delete (`ESC [ 3 ~`, and the `1~`/`7~` and `4~`/`8~` forms other
   terminals send). Anything else is consumed and never reaches the line, but for a byte that
-  cannot end an SS3, Enter say, which ends it and is acted on. **Canonical mode drops
+  cannot end an SS3, Enter say, which ends it and is acted on. Page Up and Page Down
+  (`ESC [ 5 ~`, `ESC [ 6 ~`) are reported too, for a program reading keys; the line takes no page. **Canonical mode drops
   every key**, as Linux's line discipline knows no cursor; `nxsh`, reading raw, acts on them.
 - **A redraw model.** Built: the discipline holds a cursor, where typing, Backspace, Ctrl-U and
-  Ctrl-W act, and says what to write for each edit as a dumb terminal draws it, with Backspace
-  and text. Reverse search, history and completion replace the line through it, so it always
-  knows what is shown. A line that fills its row is drawn wrong, as Backspace alone always was
-  there: `TODO(tty-size)`.
+  Ctrl-W act, and says what to write for each edit. Reverse search, history and completion
+  replace the line through it, a search's own line included, so it always knows what is shown.
+  **Where the terminal says its width** (pre-Phase-7 Part G.2) it places each character by row
+  and column from the prompt's width, which `nxsh` tells it with each prompt, moves the cursor
+  with `CSI A`/`B`/`C`/`D`, and erases with `CSI K` and `CSI J`. **No cursor is left with a wrap
+  pending**: a write that fills a row exactly is followed by a space and a carriage return, which
+  leaves the cursor at the next row's start on a terminal that holds the wrap, as xterm and
+  `libterm` do, and on one that does not, as `fbcon`. **Where it cannot**, it draws as a dumb
+  terminal does, with Backspace and text, and a line that fills its row is drawn wrong there:
+  `TODO(serial-size)`, and in canonical mode, whose server does not know where its client's
+  prompt ended, `TODO(canonical-wrap)`.
 
 ### The cheaper alternative, and why not
 

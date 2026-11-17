@@ -227,11 +227,10 @@ impl Completion {
 /// A decision, not byte plumbing: how many fit on a row, what gets cut and how the cut is
 /// reported are host-testable, and the loop's share is one `write`.
 ///
-/// Wrapped at 80 columns, since the tty protocol carries no terminal size. Capped at
-/// [`MAX_LISTED`] with the remainder counted, not dropped. `\r\n`, not `\n`: the shell holds the
-/// line discipline itself, so nothing downstream adds the carriage return.
-pub fn listing(candidates: &[String]) -> Vec<u8> {
-    const WIDTH: usize = 80;
+/// Wrapped at `width` columns, the terminal's. Capped at [`MAX_LISTED`] with the remainder
+/// counted, not dropped. `\r\n`, not `\n`: the shell holds the line discipline itself, so nothing
+/// downstream adds the carriage return.
+pub fn listing(candidates: &[String], width: usize) -> Vec<u8> {
     const GAP: usize = 2;
 
     let shown = candidates.len().min(MAX_LISTED);
@@ -242,7 +241,7 @@ pub fn listing(candidates: &[String]) -> Vec<u8> {
     // One column width for all of them, so the names line up.
     let widest = candidates[..shown].iter().map(|c| c.chars().count()).max().unwrap_or(0);
     // At least one per row, or a name wider than the terminal would divide by zero.
-    let per_row = (WIDTH / (widest + GAP)).max(1);
+    let per_row = (width / (widest + GAP)).max(1);
 
     for (i, c) in candidates[..shown].iter().enumerate() {
         out.extend_from_slice(c.as_bytes());
@@ -456,7 +455,7 @@ mod tests {
 
     fn listed(candidates: &[&str]) -> String {
         let v: Vec<String> = candidates.iter().map(|c| String::from(*c)).collect();
-        String::from_utf8(listing(&v)).expect("the listing is text")
+        String::from_utf8(listing(&v, 80)).expect("the listing is text")
     }
 
     #[test]
@@ -478,6 +477,15 @@ mod tests {
     }
 
     #[test]
+    fn a_listing_fills_the_width_it_is_given() {
+        let names: Vec<String> = alloc::vec![String::from("abcd"); 13];
+        let rows = |width| String::from_utf8(listing(&names, width)).expect("text").matches("\r\n").count() - 1;
+        assert_eq!((rows(80), rows(40), rows(5)), (1, 3, 13));
+        assert_eq!((rows(42), rows(41)), (2, 3), "seven to a row at 42, six at 41");
+        assert_eq!((rows(12), rows(11)), (7, 13), "two at 12, one at 11");
+    }
+
+    #[test]
     fn a_name_wider_than_the_screen_does_not_divide_by_zero() {
         let long = "a".repeat(200);
         let out = listed(&[&long, &long]);
@@ -487,7 +495,7 @@ mod tests {
     #[test]
     fn a_listing_counts_what_it_could_not_show() {
         let names: Vec<String> = (0..MAX_LISTED + 7).map(|i| alloc::format!("n{i}")).collect();
-        let out = String::from_utf8(listing(&names)).expect("text");
+        let out = String::from_utf8(listing(&names, 80)).expect("text");
         assert!(out.contains("... and 7 more"), "the remainder was dropped silently: {out:?}");
         assert!(out.contains("n0"), "the first candidate should still be shown");
         assert!(!out.contains(&alloc::format!("n{}", MAX_LISTED)), "a candidate past the cap was shown");

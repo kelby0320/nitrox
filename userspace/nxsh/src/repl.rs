@@ -103,6 +103,11 @@ pub fn prompt(position: &str, styled: bool) -> String {
     s
 }
 
+/// How many columns [`prompt`] takes on the screen: its escapes take none.
+pub fn prompt_width(position: &str) -> usize {
+    position.chars().count() + 2
+}
+
 /// The shell's own diagnostic, as it goes to a terminal: `nxsh: <message>`, in the diagnostic
 /// colour when there is one.
 ///
@@ -205,5 +210,16 @@ mod tests {
         assert!(c.starts_with("\x1b]7;/home/alice\x07"), "{c:?}");
         assert!(c.contains("/home/alice> "), "{c:?} split the prompt");
         assert!(c.ends_with(crate::style::RESET), "{c:?}");
+    }
+
+    /// The width the line editor counts from is what the prompt shows, its escapes left out.
+    #[test]
+    fn the_prompts_width_is_what_it_shows() {
+        for (position, styled) in [("/home/alice", true), ("/", false), ("/home/caf\u{e9}", true)] {
+            let p = prompt(position, styled);
+            let shown = p.split('\x07').nth(1).expect("after the title").replace(crate::style::PROMPT, "");
+            let shown = shown.replace(crate::style::RESET, "");
+            assert_eq!(prompt_width(position), shown.chars().count(), "{p:?}");
+        }
     }
 }

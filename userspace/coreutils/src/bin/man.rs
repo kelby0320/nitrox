@@ -25,8 +25,7 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The width a page is rendered at, assumed while a program cannot learn its terminal's,
-/// `TODO(tty-size)`.
+/// The width a page is rendered at when its terminal cannot say, as the serial console cannot.
 const WIDTH: usize = 80;
 
 const FLAGS: [Flag; 1] =
@@ -73,7 +72,8 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
         }
         Request::Page(section, name) => (section, name),
     };
-    let page = manual::answer(&pages, section, name, WIDTH).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_FAILURE));
+    let width = stage.terminal_size().map_or(WIDTH, |s| usize::from(s.cols));
+    let page = manual::answer(&pages, section, name, width).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_FAILURE));
     // A reader that has gone wanted no more; any other failure is one.
     match stage.text(page.as_bytes()) {
         Ok(true) | Err(libstream::wire::WireError::PeerClosed) => {}

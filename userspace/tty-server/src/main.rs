@@ -30,10 +30,11 @@ use libos::{
 };
 use librsproto::namespace::parse_resolve_request;
 use librsproto::server;
+use librsproto::tty::Size;
 use librsproto::{
     OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OPEN_SIBLING, OP_TTY_OUTPUT, OP_TTY_READ,
-    OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_SET_MODE, OP_TTY_TOKEN, OP_TTY_WRITE, RS_FLAG_REPLY, TTY_MODE_ECHO, decode,
-    encode,
+    OP_TTY_READ_LINE, OP_TTY_REDEEM, OP_TTY_RESIZE, OP_TTY_SET_MODE, OP_TTY_SIZE, OP_TTY_TOKEN, OP_TTY_WRITE,
+    RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
 };
 use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink, backend_refusal};
 use tty_server::tokens::Tokens;
@@ -324,10 +325,13 @@ impl Server {
             }
             OP_TTY_ATTACH_BACKEND => {
                 let handle: Option<Endpoint> = sent.take(0);
+                // The grid the emulator starts with, or none said: an empty body is unknown.
+                let size = if body.is_empty() { Some(Size::UNKNOWN) } else { Size::decode(body) };
                 // Succeeding silently with no handle would leave the emulator waiting for output that
                 // goes to the console.
                 let refused = match &handle {
                     None => Some(KError::InvalidArgument),
+                    Some(_) if size.is_none() => Some(KError::InvalidArgument),
                     Some(h) => match h.stat() {
                         Ok(info) => backend_refusal(info.object_type, info.rights),
                         // Without `INSPECT` the server cannot see what it was given, so cannot take it.
@@ -338,7 +342,7 @@ impl Server {
                 match (refused, handle) {
                     (None, Some(h)) => {
                         let key = h.raw().0;
-                        if let Some((_, left)) = self.reg.attach_backend(ch, key) {
+                        if let Some((_, left)) = self.reg.attach_backend(ch, key, size.unwrap_or(Size::UNKNOWN)) {
                             self.links.backends.insert(key, h);
                             // Closed, so the emulator of the backend the terminal left sees it end.
                             if let Some(l) = left {
@@ -358,6 +362,10 @@ impl Server {
                 }
             }
             OP_TTY_OPEN_SIBLING => self.open_sibling(ch, request_id),
+            OP_TTY_SIZE => match self.reg.size_of(ch) {
+                Some(size) => self.links.answer(ch, op, request_id, &size.encode()),
+                None => self.links.fail(ch, op, request_id, KError::NotFound),
+            },
             // A token for this terminal's backend: how the view broker learns which terminal a
             // request came from without asking the requester.
             OP_TTY_TOKEN => match (self.reg.backend_of_terminal(ch), random_token(self.root.as_ref())) {
@@ -392,11 +400,19 @@ impl Server {
             Err(e) => return e.code() != KError::PeerClosed,
         };
         let Ok(m) = decode(msg.payload()) else { return true };
-        // Anything but input is ignored: this channel carries unsolicited messages, so there is no
-        // request to fail.
-        if m.op == OP_TTY_INPUT {
-            let acts = self.reg.feed(id, m.body);
-            self.links.perform(&acts);
+        // Anything else is ignored, a malformed size too: this channel carries unsolicited
+        // messages, so there is no request to fail.
+        match m.op {
+            OP_TTY_INPUT => {
+                let acts = self.reg.feed(id, m.body);
+                self.links.perform(&acts);
+            }
+            OP_TTY_RESIZE => {
+                if let Some(size) = Size::decode(m.body) {
+                    self.reg.resize(id, size);
+                }
+            }
+            _ => {}
         }
         true
     }
