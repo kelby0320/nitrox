@@ -715,6 +715,21 @@ in place of the document's, which every press-placing test fails. **Gate control
 whose right press never moves the caret fails `check-login` at the save's byte count; a terminal
 whose right press drops the selection fails `check-terminal` at Copy.
 
+**After review** (`33e591cc`):
+- **A right press is inside the selection only on a selected character** (`TextAreaState::char_at`).
+  It had been tested against the nearest boundary, inclusive at the end. So a press in the blank
+  space past the line, below the text, or on the half-character either side kept the selection,
+  and Cut and Paste acted on text the press was not on.
+- **A cut the clipboard cannot hold deletes nothing**, and **one it refuses is undone** if nothing
+  has been edited since. Cut used to delete before the clipboard answered, and over 3,964 bytes the
+  clipboard always refuses. **A cut is its own undo step** (`cut_selection`): it used to join the
+  edit before it, so Undo took that too. The raw deletion is private now, so no caller can skip
+  its step. This predates F.5; the menu was a third way to it.
+- **A right release opens no second menu**, tested in both applications. The router follows a
+  release with an enter, so the editor's test hands it a release directly.
+- **A line past the buffer has no point** though its row is shown.
+- `check-login`'s row and paragraph in the gate conventions name its right clicks.
+
 ### What Part F does not do
 
 - **A desktop menu**, or **a window's menu** on its title bar or task button: the maintainer's calls

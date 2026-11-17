@@ -38528,3 +38528,7 @@ F.4 merged, #449. F.5, `context-menus.md` § F.5, built on `pre-phase-7/part-f5-
 - `check-terminal` copies Find's selection and pastes it at the shell through the menu, and
   `check-login` pastes a copied word where a right click put the caret. A pointer event from QEMU
   can overtake keys in flight, so the terminal now reports its selection's length.
+- After review, **a right press is inside a selection only on a selected character**, not on a
+  boundary next to one. **A cut is its own undo step**, one the clipboard cannot hold deletes
+  nothing, and one it refuses is undone; the raw deletion in `TextAreaState` is private, so no
+  caller can delete without an undo step.
