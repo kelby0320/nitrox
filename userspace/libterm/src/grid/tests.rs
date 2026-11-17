@@ -835,3 +835,47 @@ fn has_selection_is_the_cheap_half_of_selected_text() {
     assert_eq!(g.selected_text(), None);
     assert!(!g.has_selection());
 }
+
+/// The alternate screen comes up clear with the cursor where it was, and leaving it puts back the
+/// screen it covered, its cursor and its attributes.
+#[test]
+fn the_alternate_screen_covers_the_main_one_and_gives_it_back() {
+    let mut g = Grid::new(10, 3);
+    feed(&mut g, "one\r\ntwo\x1b[31m");
+    let attrs = g.attributes();
+    feed(&mut g, "\x1b[?1049h");
+    assert!(g.alternate());
+    assert_eq!(((0..3).map(|r| line(&g, r)).collect::<Vec<_>>(), g.cursor()), (alloc::vec![String::new(); 3], (1, 3)));
+    feed(&mut g, "\x1b[0m\x1b[Hpage\x1b[?1049h");
+    assert_eq!(line(&g, 0), "page", "asked again, the shown screen stays");
+    feed(&mut g, "\x1b[?1049l");
+    assert!(!g.alternate());
+    assert_eq!((line(&g, 0), line(&g, 1), g.cursor(), g.attributes()), ("one".into(), "two".into(), (1, 3), attrs));
+}
+
+/// What scrolls off the alternate screen is gone: it is no history, and the main screen's lines
+/// keep their numbers.
+#[test]
+fn the_alternate_screen_keeps_no_history() {
+    let mut g = Grid::new(10, 2);
+    feed(&mut g, "a\r\nb\r\nc");
+    let (history, top) = (g.scrollback().len(), g.top_line());
+    feed(&mut g, "\x1b[?1049h1\r\n2\r\n3\r\n4");
+    assert_eq!((g.scrollback().len(), g.top_line(), line(&g, 1)), (history, top, "4".into()));
+    feed(&mut g, "\x1b[?1049l");
+    assert_eq!((line(&g, 0), line(&g, 1)), ("b".into(), "c".into()));
+}
+
+/// A refit on the alternate screen rewraps the main one beneath, as it is shown again, and cuts
+/// the alternate one, which its program draws again.
+#[test]
+fn a_refit_on_the_alternate_screen_rewraps_the_main_one_beneath() {
+    let mut g = Grid::new(10, 3);
+    feed(&mut g, "abcdefghij");
+    feed(&mut g, "\x1b[?1049h\x1b[H0123456789\r\nxy");
+    g.resize(5, 3);
+    assert!(g.alternate());
+    assert_eq!((line(&g, 0), line(&g, 1), g.cursor()), ("01234".into(), "xy".into(), (1, 2)));
+    feed(&mut g, "\x1b[?1049l");
+    assert_eq!((line(&g, 0), line(&g, 1), g.cursor()), ("abcde".into(), "fghij".into(), (1, 4)));
+}

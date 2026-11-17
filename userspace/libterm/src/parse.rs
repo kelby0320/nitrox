@@ -99,6 +99,9 @@ pub enum Op {
     EraseInLine(Erase),
     /// One `SGR` effect.
     Attr(Sgr),
+    /// `DECSET`/`DECRST` 1049: to the alternate screen, the cursor saved, or back to the main one,
+    /// the cursor restored. A pager draws there, so quitting puts back what was on the screen.
+    AltScreen(bool),
 }
 
 /// Where the parser is in a sequence.
@@ -138,6 +141,8 @@ pub struct Parser {
     /// Parameters of the CSI in progress. `None` is "absent", not zero: `ESC [ ; 5 H`.
     params: [Option<u16>; MAX_PARAMS],
     count: usize,
+    /// The CSI began `?`: a DEC private mode, of which only the alternate screen's is acted on.
+    private: bool,
     osc: alloc::vec::Vec<u8>,
     osc_overran: bool,
     directory: Option<alloc::string::String>,
@@ -176,6 +181,7 @@ impl Parser {
             state: State::Ground,
             params: [None; MAX_PARAMS],
             count: 0,
+            private: false,
             osc: alloc::vec::Vec::new(),
             osc_overran: false,
             directory: None,
@@ -300,6 +306,7 @@ impl Parser {
             b'[' => {
                 self.params = [None; MAX_PARAMS];
                 self.count = 0;
+                self.private = false;
                 self.state = State::Csi;
             }
             // `ESC` cancels and restarts, so the new sequence is not printed as text.
@@ -408,7 +415,12 @@ impl Parser {
                 }
                 None => 0,
             },
-            // A private-parameter marker (`?`, `<`, `=`, `>`): outside the standard set; swallowed.
+            // `?` first marks a DEC private mode; elsewhere, and the other private-parameter
+            // markers (`<`, `=`, `>`), are outside the standard set: swallowed.
+            b'?' if self.count == 0 && !self.private => {
+                self.private = true;
+                0
+            }
             0x3C..=0x3F => {
                 self.state = State::CsiIgnore;
                 0
@@ -452,6 +464,14 @@ impl Parser {
             out[0] = op;
             1
         };
+        if self.private {
+            let alt = (0..self.count).any(|i| self.param(i) == Some(1049));
+            return match final_byte {
+                b'h' | b'l' if alt => one(Op::AltScreen(final_byte == b'h'), out),
+                // Every other private mode, the cursor's visibility among them, is dropped.
+                _ => 0,
+            };
+        }
         match final_byte {
             b'A' => one(Op::MoveBy { rows: -(self.count_at(0) as i32), cols: 0 }, out),
             b'B' => one(Op::MoveBy { rows: self.count_at(0) as i32, cols: 0 }, out),
@@ -641,6 +661,21 @@ mod tests {
     #[test]
     fn an_unknown_sgr_parameter_is_skipped_and_its_neighbours_survive() {
         assert_eq!(run("\x1b[3;31m"), alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red)))]);
+    }
+
+    /// Only `?` then 1049 switches screens; another private mode, or 1049 unmarked, is dropped.
+    #[test]
+    fn the_alternate_screen_is_private_mode_1049() {
+        assert_eq!(run("\x1b[?1049h"), alloc::vec![Op::AltScreen(true)]);
+        assert_eq!(run("\x1b[?1049l"), alloc::vec![Op::AltScreen(false)]);
+        assert_eq!(run("\x1b[?25;1049h"), alloc::vec![Op::AltScreen(true)], "among other modes");
+        for seq in ["\x1b[?25h", "\x1b[1049h", "\x1b[1?1049h", "\x1b[??1049h", "\x1b[?1049m", "\x1b[>1049h"] {
+            assert_eq!(run(seq), alloc::vec![], "{seq:?}");
+        }
+        assert_eq!(
+            run("\x1b[?1049hx\x1b[2J"),
+            alloc::vec![Op::AltScreen(true), Op::Print('x'), Op::EraseInDisplay(Erase::All)]
+        );
     }
 
     #[test]

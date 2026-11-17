@@ -73,6 +73,15 @@ fn chose(msg: Msg) {
 /// The harness's window onto the grid, which `check-terminal` matches as `grid> `.
 #[cfg(feature = "test-harness")]
 fn report_row(app: &App, row: usize) {
+    let (buf, n) = row_text(app, row);
+    if n > 0 {
+        Line::new().s(b"nxterm: grid> ").s(&buf[..n]).end();
+    }
+}
+
+/// Screen row `row` as shown, trailing blanks dropped, in at most 256 bytes.
+#[cfg(feature = "test-harness")]
+fn row_text(app: &App, row: usize) -> ([u8; 256], usize) {
     let mut buf = [0u8; 256];
     let mut n = 0;
     for col in 0..app.grid().cols() {
@@ -88,9 +97,7 @@ fn report_row(app: &App, row: usize) {
     while n > 0 && buf[n - 1] == b' ' {
         n -= 1;
     }
-    if n > 0 {
-        Line::new().s(b"nxterm: grid> ").s(&buf[..n]).end();
-    }
+    (buf, n)
 }
 
 /// Block until any of `handles` has something.
@@ -489,6 +496,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     let before = app.grid().cursor().0;
                     #[cfg(feature = "test-harness")]
                     let current = tb.key == app.current_tab();
+                    #[cfg(feature = "test-harness")]
+                    let shown: alloc::vec::Vec<_> =
+                        (0..app.grid().rows()).filter(|_| current).map(|r| row_text(app, r)).collect();
                     app.feed_tab(tb.key, bytes);
                     // Harness only: report a line once the cursor has left it, so `check-terminal`
                     // can assert on the grid's contents. The current tab only, so "what is on
@@ -498,11 +508,20 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                         // Every row the cursor passed (a chunk can complete several lines) and the
                         // row it is on: a finished line is only in the first set, a line still
                         // being typed only in the second.
+                        // On the alternate screen, every row the chunk changed too: a full-screen
+                        // program redraws a page without passing a row. Not on the main one, where
+                        // output scrolls and every row would change.
                         let now = app.grid().cursor().0;
-                        for row in before..now {
-                            report_row(app, row);
+                        let alt = app.grid().alternate();
+                        for row in 0..app.grid().rows() {
+                            let changed = alt && {
+                                let (is, n) = row_text(app, row);
+                                shown.get(row).is_none_or(|(was, m)| was[..*m] != is[..n])
+                            };
+                            if (before..now).contains(&row) || row == now || changed {
+                                report_row(app, row);
+                            }
                         }
-                        report_row(app, now);
                     }
                 }
                 // Once per change: `nxsh` announces its directory as `OSC 7`, `libterm` reads it
