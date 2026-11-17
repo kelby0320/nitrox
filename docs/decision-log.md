@@ -38565,3 +38565,54 @@ built on `pre-phase-7/part-g1-man`.
   `<name>.<section>.md`. **The fonts stay bound as they were**, the same route, under
   `TODO(writable-fonts)`.
 - **`docs/manual/` describes current behaviour**, as `spec/` does.
+
+## 2026-11-17 — Before Phase 7, G.2: the terminal's size
+
+G.1 merged, #451. G.2, `manual.md` § G.2, built on `pre-phase-7/part-g2-tty-size` (`26a000a9`,
+`105cb684`).
+
+- **The maintainer's call: the editing too.** The plan had the completion listing fitting the
+  width resolve `TODO(tty-size)`, but the tag was the line editor's: a line wider than its row was
+  drawn wrong. G.2 does both, the size and then the editing that uses it wherever the width is
+  known; serial stays as it was, under a narrower tag.
+- **A terminal's size is its backend's.** `Tty::Size` (`0x0B0C`) answers columns and rows, `0×0`
+  unknown, as the serial console's is. **An emulator sends its grid with `AttachBackend`**, as the
+  body, not in a `Resize` after it: `nxterm` spawns the shell straight after attaching, and the
+  shell could ask first. `Tty::Resize` (`0x0B0D`), on the backend channel, carries every refit.
+- **Nothing is pushed**, as `SIGWINCH` would be: a message to every terminal on a window would
+  queue during a drag on terminals whose holders never read. A program asks when it draws.
+- **`nxsh` asks after every read, after its check for a `Ctrl-C` at the prompt.** Asked first, the
+  exchange took an interrupt queued behind the read's bytes for one at an empty prompt, and dropped
+  the line typed with it: `test-interactive`'s step 17 caught it.
+- **The line discipline places each character by row and column** where the width is known,
+  counting from the prompt's width, which `nxsh` tells it with each prompt, and **leaves no cursor
+  with a wrap pending**: a write that fills a row exactly is followed by a space and a carriage
+  return, which leaves xterm's and `libterm`'s cursor, and `fbcon`'s, at the next row's start. A
+  search's line is the discipline's while it lasts, so it is drawn and erased the same way.
+- **What stays as it was is named**: a serial line's size is unknown (`TODO(serial-size)`), and a
+  canonical read draws as a dumb terminal, its server not knowing where its client's prompt left
+  the cursor (`TODO(canonical-wrap)`).
+- **`terminal`, a coreutil the plan did not name**, prints the size as a one-row table. The plan
+  had `check-terminal` "ask the size" without saying how, and its grid is 80 wide, the width every
+  program falls back to, so nothing else could tell a size that came through from none. Its page is
+  G.6's, with every command's.
+- **`terminal` is shaped to grow, the maintainer's call: one command, not Unix's three.** `tty`,
+  `stty` and `tput` came apart by history, and `tput`'s capability database has no job with one
+  emulator; a typed record answers what `tput cols` and `stty size` each answer. **A query is the
+  record**, gaining a column per thing learned, so its size is **null on serial**, not a failure
+  that would hide every later column. **A setting will be an option asking the window**, as
+  `disk --mount` is an option: a stage's terminal is a sibling of the shell's with its own echo and
+  line, so `stty`'s model, one device every process shares, does not carry over.
+- **Page Up and Page Down** are decoded for whoever reads keys: the pager, G.3.
+- **On review, a refit keeps the line where the shell counts it.** `libterm`'s reflow dropped every
+  trailing blank and held the cursor to its line's text, so a space typed at the prompt, or a line
+  a refit filled exactly, put the cursor a cell or a row from the discipline's count. **A row keeps
+  what was printed in it, blanks too**, and not cells never written or since erased, so an idle
+  screen's empty columns still do not wrap into rows; **the cursor keeps its offset**, its line
+  given the row to reach it. The discipline meets it halfway: it counts rows as the terminal lays
+  the text out, so ends a row its text fills exactly with a line feed rather than leave it wrapped
+  into what follows, and reaches the end of a row a refit filled by writing, as typing did.
+  Redrawing from a fresh row at every refit was the other way, and would have left the old line
+  above as debris.
+- **A size is read from a body's first four bytes**, any after them a later version's, as a field
+  added to a body's end is; the decoder wanted exactly four where `nxsh` read the first four.

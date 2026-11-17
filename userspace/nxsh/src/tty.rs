@@ -94,6 +94,16 @@ impl Tty {
         }
     }
 
+    /// The terminal's size, as its window last said; `None` if it cannot say, as the serial
+    /// console cannot, or the exchange failed.
+    pub(crate) fn size(&self) -> Option<librsproto::tty::Size> {
+        let mut out = [0u8; librsproto::tty::Size::LEN];
+        match self.request(librsproto::OP_TTY_SIZE, &[], &mut out) {
+            Some((false, n, _)) => librsproto::tty::Size::decode(&out[..n]).filter(|s| s.is_known()),
+            _ => None,
+        }
+    }
+
     /// Turn the terminal's own echo on or off; the shell holds the line buffer, so server-side echo
     /// would fight it.
     pub(crate) fn set_echo(&self, on: bool) {

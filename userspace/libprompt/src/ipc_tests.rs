@@ -2,9 +2,10 @@ use super::ipc::*;
 use super::*;
 use alloc::vec;
 use core::mem::MaybeUninit;
-use libkern::{IPC_HEADER_SIZE, IPC_PAYLOAD_SIZE, RawHandle, Rights};
+use libkern::{IPC_HEADER_SIZE, IPC_PAYLOAD_SIZE, KError, RawHandle, Rights};
 use libos::{Carried, Handle, Msg as WireMsg, mock};
-use librsproto::{OP_TTY_INTERRUPT, RS_FLAG_ERROR, RS_MAX_BODY};
+use librsproto::tty::Size;
+use librsproto::{OP_TTY_INTERRUPT, OP_TTY_SIZE, RS_FLAG_ERROR, RS_MAX_BODY};
 
 type End = Handle<Channel, Only>;
 
@@ -192,6 +193,26 @@ fn a_line_is_read_with_echo_on_and_a_refusal_or_interrupt_is_none() {
     let (a, b) = pair();
     drop(b);
     assert_eq!(ask_line_on(&a, b"user: "), None, "no terminal");
+}
+
+#[test]
+fn a_size_is_asked_and_an_unknown_or_refused_one_is_none() {
+    let (a, b) = pair();
+    put(&b, OP_TTY_INTERRUPT, 0, 0, b"");
+    put(&b, OP_TTY_SIZE, 1, 0, &Size { cols: 100, rows: 30 }.encode());
+    assert_eq!(size_on(&a), Some(Size { cols: 100, rows: 30 }), "the interrupt stepped over");
+    assert_eq!(got(&b), (OP_TTY_SIZE, 1, vec![]));
+
+    // A refusal's four bytes would decode as a size, `NotFound`'s as 65534 by 65535.
+    let refusal = (KError::NotFound as i32).to_le_bytes();
+    for (flags, body) in [(0, &Size::UNKNOWN.encode()[..]), (0, &[80, 0, 24][..]), (RS_FLAG_ERROR, &refusal[..])] {
+        let (a, b) = pair();
+        put(&b, OP_TTY_SIZE, 1, flags, body);
+        assert_eq!(size_on(&a), None, "{flags} {body:?}");
+    }
+    let (a, b) = pair();
+    drop(b);
+    assert_eq!(size_on(&a), None, "no terminal");
 }
 
 #[test]

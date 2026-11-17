@@ -336,9 +336,24 @@ pub(crate) fn login_overview_drags(qmp: &mut Qmp, session: &mut Session, st: &mu
     session
         .expect(&format!("desktop-shell: drop window {term_id} to {},{} {resized_w}x{resized_h}", work.0, work.1))?;
     session.expect(&format!("nxterm: resized to {resized_w}x{resized_h}, grid "))?;
+    let grid = session.rest_of_line()?;
     session
         .expect(&format!("desktop-shell: window {term_id} geometry {},{} {resized_w}x{resized_h}", work.0, work.1))?;
     println!("  ok: the terminal was dragged smaller by its corner, and committed it");
+
+    // **And a stage is answered the new grid**, which a session's terminal does not log: it comes out
+    // as desktop 2's name. A click in the grid first, as the corner's press moved the focus.
+    let cols = grid.split('x').next().unwrap_or_default().to_string();
+    click_at(qmp, session, work.0 + resized_w as i32 / 2, work.1 + resized_h as i32 / 2)?;
+    type_at_terminal(qmp, "desktop name 2 (terminal | sum columns)")?;
+    session.expect(&format!("desktop-shell: served Name {cols}"))?;
+    let named = session.matched_line()?;
+    if !named.ends_with(&format!("served Name {cols}")) {
+        return Err(format!("`terminal` on a {grid} grid named the desktop: {named:?}").into());
+    }
+    type_at_terminal(qmp, "desktop name 2 cli")?;
+    session.expect("desktop-shell: served Name cli")?;
+    println!("  ok: `terminal` in the refitted window answered its {cols} columns");
 
     // 6k. **A window thrown at the left edge snaps to half the work area.** **Asserted against the
     //     work area, not the screen**: a table from `screen_h` would put the window under the bars.

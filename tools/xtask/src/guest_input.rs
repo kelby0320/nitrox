@@ -122,34 +122,22 @@ pub(crate) fn burst_holds_its_position(
 /// terminal's echo goes into its grid, rendered under `test-harness` only, and a dropped PS/2 batch
 /// eats a keystroke.
 pub(crate) fn type_at_terminal(qmp: &mut Qmp, line: &str) -> R<()> {
-    const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
     // **A bare Enter first**: `ESC` is the meta prefix and eats the next byte, and an Escape
     // pressed to dismiss a menu reaches the terminal when no popup is open (`desktop` becomes
     // `esktop`).
     std::thread::sleep(PER_KEY);
     press(qmp, "ret")?;
-    // **The wait comes before each key, including the first**: the first character after a click
-    // that repaints was swallowed.
-    for c in line.chars() {
-        std::thread::sleep(PER_KEY);
-        let (qcode, shift) = qcode_for(c)?;
-        if shift {
-            qmp.send_key("shift", true)?;
-        }
-        press(qmp, &qcode)?;
-        if shift {
-            qmp.send_key("shift", false)?;
-        }
-    }
+    type_text(qmp, line)?;
     std::thread::sleep(PER_KEY);
     press(qmp, "ret")?;
     Ok(())
 }
 
-/// **Type an answer at a prompt a program is waiting at, then Enter**, like [`type_at_terminal`]
-/// but with no leading Enter, which at a prompt would be an empty answer.
-pub(crate) fn type_answer(qmp: &mut Qmp, text: &str) -> R<()> {
-    const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
+const PER_KEY: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// Type `text` and nothing else. **The wait comes before each key, including the first**: the
+/// first character after a click that repaints was swallowed.
+pub(crate) fn type_text(qmp: &mut Qmp, text: &str) -> R<()> {
     for c in text.chars() {
         std::thread::sleep(PER_KEY);
         let (qcode, shift) = qcode_for(c)?;
@@ -161,6 +149,13 @@ pub(crate) fn type_answer(qmp: &mut Qmp, text: &str) -> R<()> {
             qmp.send_key("shift", false)?;
         }
     }
+    Ok(())
+}
+
+/// **Type an answer at a prompt a program is waiting at, then Enter**, like [`type_at_terminal`]
+/// but with no leading Enter, which at a prompt would be an empty answer.
+pub(crate) fn type_answer(qmp: &mut Qmp, text: &str) -> R<()> {
+    type_text(qmp, text)?;
     std::thread::sleep(PER_KEY);
     press(qmp, "ret")?;
     Ok(())
@@ -279,6 +274,7 @@ pub(crate) fn qcode_for(c: char) -> R<(String, bool)> {
         '\'' => s("apostrophe", false),
         '(' => s("9", true),
         ')' => s("0", true),
+        '|' => s("backslash", true),
         other => Err(format!(
             "no qcode for {other:?} — add one to `qcode_for` rather than letting a command line \
              lose a character"

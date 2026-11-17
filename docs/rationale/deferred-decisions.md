@@ -1684,23 +1684,46 @@ missing — `History::search_back` already returns indices and can enumerate eve
 
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
 
-**A line that fills its row is edited wrong — `TODO(tty-size)`.**
-The prompt's editing (`libline::Discipline`, which `nxsh` links) redraws as a dumb terminal
-would, with Backspace and text, so it needs no terminal width. That holds for a line shorter than
-its row:
+**A serial line's size is unknown — `TODO(serial-size)`.** The console backend answers `Tty::Size`
+with `0×0`: nothing on a serial line tells the tty server the far terminal's size, as a window's
+emulator tells it its grid. So `nxsh` on the serial console edits as a dumb terminal, with
+Backspace and text, and a line that fills its row is drawn wrong there as it always was: at
+exactly a full row a Backspace lands a column left of the line's end on xterm, which holds a wrap
+pending, and past a full row Backspace cannot climb back across the wrap. The completion listing
+and `man` draw to 80 columns. The server could ask the far terminal, which a real one answers
+(`CSI 18 t`, or the cursor moved far and its report read back) and a log never does, so it would
+need a deadline. Trigger: a person who uses the serial console as their terminal.
 
-- **At exactly a full row**, `libterm` holds the cursor on the last column with a wrap pending, as
-  xterm and Linux's console do, so a Backspace lands a column left of the line's end
-  (`userspace/libterm/src/grid.rs`); `fbcon` parks past the end and lands right.
-- **Past a full row**, a Backspace stops at the row's start in both, so moving back across a wrap
-  draws wrong.
+**A canonical read draws as a dumb terminal — `TODO(canonical-wrap)`.** `Tty::ReadLine` runs the
+line discipline in the tty server with no width, so an answer wider than its row is drawn wrong as
+on serial, in a window too. The server knows the window's size, but not where its client's prompt
+left the cursor; it would have to follow every byte written to the backend to know. The reads are
+the login and the prompts `with`, `account` and `nxinstall` put, whose passwords are not echoed and
+whose other answers are short. Trigger: a prompt whose answer, echoed, can be wider than a row: a
+path, say.
 
-Backspace alone was always wrong there; cursor keys make the case reachable mid-line. The
-completion listing is wrapped at 80 columns for the same reason (`userspace/nxsh/src/complete.rs`),
-and so is every page `man` prints (`userspace/coreutils/src/bin/man.rs`).
+**A line taller than its window is edited short of its rows — `TODO(tall-line)`.** The discipline
+moves the cursor by relative steps, and `CSI A` stops at the screen's top, so once a line's first
+rows have scrolled away an edit lands on a row too low and the redraw shifts what is shown. At
+`nxterm`'s first size, 80 by 20, no line reaches it: 1,600 cells hold the 1,024 bytes of
+`LINE_MAX`. A window refitted below that, 60 by 16 say, and a long paste do. `Tty::Size` carries
+the rows, so the discipline could see it coming and draw the line afresh below. Trigger: a person
+who edits a line longer than their window.
 
-Trigger: a terminal size on the tty protocol. With one, the shell knows when the cursor reaches the
-last column and can step across a wrap.
+**A size asked, then a prompt, loses a `Ctrl-C` between — `TODO(size-then-prompt)`.**
+`libprompt::size_on` steps over an `Interrupt` and does not keep it, as the shell has its own. A
+program that asked the size and then prompted would take a `Ctrl-C` typed between for an empty
+answer: the server answers the next `ReadLine` empty, and the `Interrupt` that marks it was the
+size's. `man` and `terminal` ask and never prompt. Trigger: a program that does both; then
+`libprompt` keeps the flag per terminal, or its prompts take one.
+
+**A refit's size can trail a key typed after it — `TODO(resize-unsent)`.** `nxterm` sends a
+`Resize` each frame the grid has changed and its input after it, on one backend channel. A send
+refused by a full ring is tried next frame, but the frame's input goes regardless, so if the server
+drained a slot between the two, a key reaches the shell before the size it was typed at, and its
+echo is drawn to the old width. Not seen: it needs the ring full at one send and not the next. A
+fix holds the input back while the size is unsent. Trigger: a probe that fills the ring shows it,
+or a line drawn to the wrong width after a refit.
 
 **A shell reading a file through a mapping is suspended when the fill fails — `TODO(mapped-read-faults)`.**
 `nxsh` reads a file by mapping it: `read_file` for a script, a `use` and `open`, and `read_head`
@@ -2576,6 +2599,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| A line that fills its row edited wrong (`tty-size`) | 2026-11-17 | **Pre-Phase-7 G.2**: a window's emulator tells the tty server its grid with the attach and at every refit, and `Tty::Size` answers it. `nxsh` asks after every read and its line discipline draws by row and column where the width is known, a write that fills a row exactly ending at the next row's start, so Backspace and the cursor keys cross a wrap; the completion listing and `man` draw to the width. Where it is unknown nothing changed: `TODO(serial-size)`, and canonical reads, `TODO(canonical-wrap)`. |
 | libos written to the surface Part E ends with, over the calls before it (`surface-shape`) | 2026-11-15 | **Pre-Phase-7 E.7 to E.10**: the flushes became a resolve and an `io_submit` (E.7), `Spawn` read a file image into memory first (E.8), entropy became a node read through the caller's namespace, so `entropy::fill` takes it, libos holding none (E.9), and a stop and a clock set became writes to the power and clock nodes (E.10): every caller kept its shape but `entropy::fill`'s. |
 | A direct bind, a copy that needed no `DUPLICATE` (`direct-bind-copy`) | 2026-11-13 | **Pre-Phase-7 E.9**: `sys_ns_bind` asks `TRANSFER` and `DUPLICATE` of a direct handle, once every in-tree direct bind was checked: five now ask their source for `DUPLICATE` too, `libsession`'s console, generator, `/session/user` and a disk's info leaf, and the view broker's kernel log. A binding so carries `DUPLICATE`, which grants a resolver nothing a second resolve would not. |
 | A copy of a file over 8 MiB (`copy-limit`) | 2026-11-13 | **Pre-Phase-7 E.8**: a copy is `sys_io_submit(destination, Write, buffer = source file)`, a window of 16 MiB at a time with `IO_NOCACHE`, which lets each window's pages go once it is on the device, so `libfs` copies a file of any size the wire carries, 4 GiB less a byte, holding two windows at most. `check-copy` copies 512 MiB in a machine of 256 MiB. Widening the 32-bit size is a change of its own: a 5 GiB file answers `TooLarge` at the destination's create. |

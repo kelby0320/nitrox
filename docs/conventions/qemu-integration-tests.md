@@ -420,7 +420,7 @@ each time.
 | `test-qemu` | `harness` | 125 / 33 | The self-test boot adjudicated whole by `isa-debug-exit`; USB enumeration and hot-plug, a disk written past 2 TiB, the I/O counters, AHCI claimed over MSI. |
 | `check-terminal` | `harness` | 54 | The compositor-to-shell round trip — a click, keys to `nxsh`, the answer rendered — `OSC 7` back to `nxterm`, and the PS/2 locks and lights read from QEMU's trace. |
 | `check-fbcon` | `harness` | 35 | A machine with no serial port: the boot and a panic read off the screen with the kernel's own glyphs. |
-| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 49 steps through the real `login()` and `tty` layer, a Ctrl-C at `nitrox login:` among them. |
+| `test-interactive` | `release` | 120 / 32 | The release image's serial login and shell, its 56 steps through the real `login()` and `tty` layer, a Ctrl-C at `nitrox login:` among them. |
 | `check-login` | `release` | 61 | The graphical greeter on PS/2, then the desktop driven step by step: menus, windows, the overview, Files, the editor, the clipboard, dialogs, and Files' and the editor's context menus. |
 | `check-login --usb` | `release` | 70 | The greeter and that session on a machine with no i8042, every key and click USB's. |
 | `check-logout` | `release-live` | 140 / 56 | Ending a session: log out past the editor's question, restart and shut down, in three boots. |
@@ -471,9 +471,10 @@ reads its metadata once. A file the build put there reads back as written in at 
 each fill reading up to 31 pages ahead.
 
 `cargo xtask test-interactive` is the serial column's gate on the **release image**. It types at
-the real prompt over the serial console and matches on what comes back — 49 steps,
+the real prompt over the serial console and matches on what comes back — 56 steps,
 expect-driven rather than sleep-driven. Since Phase 6 Part H.2 one of them is `nxsh`'s `time`: its
-line, of its shape, before the value it passes through.
+line, of its shape, before the value it passes through. Since pre-Phase-7 Part G.2 one is
+`terminal` on serial, whose size it reports null, as a serial line cannot say it.
 
 **Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
 a fixed script under `test-harness`, so the `login:` prompt, the typed password, the real shell
@@ -513,6 +514,10 @@ Since pre-Phase-7 Part F.5 it **right-clicks the grid**: Find's selection surviv
 context menu's Copy copies it and its Paste types it at the shell, and the Menu key opens the
 menu. It waits for `nxterm: selected 4 chars` before the click, as a pointer event can overtake
 keys still on their way.
+Since pre-Phase-7 Part G.2 it holds the **terminal's size**: `terminal`, typed in the window,
+answers the grid `nxterm` logged at its start (`nxterm: started, grid CxR`), which went to the tty
+server with the attach and comes back through a stage's sibling terminal. The grid is read with
+`line_since`, as earlier waits have scanned past it.
 
 `cargo xtask check-login` is the **graphical login gate**, on the release image as
 `test-interactive` and `check-logout` are. It drives the greeter with the PS/2 injection

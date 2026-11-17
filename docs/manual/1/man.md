@@ -35,7 +35,8 @@ man | filter section == 1
 
 ## Output
 
-Listing, `Table<{name: String, section: Int, summary: String}>`. A page is text, 80 columns wide.
+Listing, `Table<{name: String, section: Int, summary: String}>`. A page is text, as wide as the
+terminal, or 80 columns where it cannot say its size, as a serial line cannot.
 
 ## Exit status
 

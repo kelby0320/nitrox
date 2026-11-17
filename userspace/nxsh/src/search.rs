@@ -2,12 +2,9 @@
 
 use crate::history::History;
 use alloc::string::String;
-use alloc::vec::Vec;
 
-/// Reverse-search state: the query, the current match, and what is on screen.
-///
-/// The shell tracks its own display length: `replace_line` erases as many characters as the line
-/// buffer holds, and a search displays more, which leaves debris on a dumb terminal.
+/// Reverse-search state: the query and the current match. What it shows is the line discipline's
+/// line while it lasts, so drawing and erasing it are the discipline's, across a wrap too.
 pub struct Search {
     query: String,
     /// The history entry the query matches, or empty.
@@ -15,8 +12,6 @@ pub struct Search {
     at: Option<usize>,
     /// The line as it was when the search began, restored by a cancel.
     pub original: String,
-    /// How many characters are currently displayed, so they can be erased exactly.
-    shown: usize,
 }
 
 /// What a key did to a search.
@@ -37,35 +32,21 @@ pub enum SearchStep {
 impl Search {
     /// A search begun from `original`, the line as typed so far.
     pub fn new(original: String) -> Search {
-        Search { query: String::new(), matched: String::new(), at: None, original, shown: 0 }
+        Search { query: String::new(), matched: String::new(), at: None, original }
     }
 
-    /// The bytes that erase what the search shows.
-    pub fn erase(&mut self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.shown * 3);
-        for _ in 0..self.shown {
-            out.extend_from_slice(b"\x08 \x08");
-        }
-        self.shown = 0;
-        out
-    }
-
-    /// Erase and redraw the search line, returning the bytes to write.
+    /// What the search shows in the line's place.
     ///
     /// The query is quoted and an arrow separates it from the match, so a colon in the query is not
     /// ambiguous. A query with no match says so, rather than looking like a search in progress.
-    pub fn redraw(&mut self) -> Vec<u8> {
-        let mut out = self.erase();
-        let text = if self.query.is_empty() {
+    pub fn display(&self) -> String {
+        if self.query.is_empty() {
             String::from("search '' -> ")
         } else if self.matched.is_empty() {
             alloc::format!("search '{}' -> (no match)", self.query)
         } else {
             alloc::format!("search '{}' -> {}", self.query, self.matched)
-        };
-        out.extend_from_slice(text.as_bytes());
-        self.shown = text.chars().count();
-        out
+        }
     }
 
     /// The line a [`Keep`](SearchStep::Keep) leaves: the match, or the original line if there is
@@ -110,6 +91,7 @@ pub fn search_key(st: &mut Search, b: u8, history: &History) -> SearchStep {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::vec::Vec;
 
     fn history(lines: &[&str]) -> History {
         let mut h = History::new();
@@ -163,23 +145,19 @@ mod tests {
     }
 
     #[test]
-    fn redraw_erases_exactly_what_it_showed_last() {
+    fn the_search_shows_its_query_and_its_match() {
         let h = history(&["caf\u{e9}"]);
         let mut st = Search::new(String::new());
-        assert_eq!(st.redraw(), b"search '' -> ");
+        assert_eq!(st.display(), "search '' -> ");
         search_key(&mut st, b'c', &h);
-        let shown = "search 'c' -> caf\u{e9}";
-        // The query's own redraw erases the 13 characters of the empty one first.
-        assert_eq!(st.redraw(), [b"\x08 \x08".repeat(13), shown.as_bytes().to_vec()].concat());
-        assert_eq!(st.erase(), b"\x08 \x08".repeat(shown.chars().count()), "characters, not bytes");
-        assert_eq!(st.erase(), b"", "nothing is left to erase");
+        assert_eq!(st.display(), "search 'c' -> caf\u{e9}");
     }
 
     #[test]
     fn a_query_with_no_match_says_so() {
         let mut st = Search::new(String::new());
         search_key(&mut st, b'z', &History::new());
-        assert_eq!(st.redraw(), b"search 'z' -> (no match)");
+        assert_eq!(st.display(), "search 'z' -> (no match)");
     }
 
     #[test]

@@ -107,8 +107,11 @@ question inside it was **what a selection is across a reflow**.
 The answer is that a **logical line's text is invariant** across a rewrap — that is exactly what
 `Line::wrapped` was added for in M9 Part D — so a position expressed as an offset into a logical
 line survives, and re-dividing that offset by the new width is the whole mapping. `Reflow::map_position`
-does it, and the cursor's own remap goes through the same function, so the two cannot disagree about
-where a character went.
+does it, and the cursor's own remap divides the same offset, so the two cannot disagree about where a
+character went. Only the cursor is not held to its line's text: past it is where the next character
+goes, so its line is given the rows to reach it (pre-Phase-7 G.2). The text is what was printed,
+**blanks included** — a space typed at a prompt is text — and not cells never written or since
+erased, so an idle screen's empty columns do not wrap into rows.
 
 The alternative was to **clear the selection on resize**, which several real terminals do. It was not
 taken because the mechanism already existed: the scrolled-back viewport's anchor had to survive a

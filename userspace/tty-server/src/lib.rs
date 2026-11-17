@@ -18,6 +18,7 @@ pub mod routing {
 
     // The real definitions, not copies: a copy of `PeerClosed` was wrong and no test could see it.
     use libkern::error::KError;
+    use librsproto::tty::Size;
     use librsproto::{
         OP_TTY_INTERRUPT as OP_INTERRUPT, OP_TTY_READ as OP_READ, OP_TTY_READ_LINE as OP_READ_LINE,
         OP_TTY_SET_MODE as OP_SET_MODE, OP_TTY_WRITE as OP_WRITE,
@@ -79,6 +80,7 @@ pub mod routing {
         pub id: u32,
         /// Where this backend's bytes come from and go to.
         pub sink: Sink,
+        size: Size,
         pending: VecDeque<u8>,
     }
 
@@ -113,7 +115,13 @@ pub mod routing {
         /// A registry holding only the console backend.
         pub fn new() -> Registry {
             Registry {
-                backends: alloc::vec![Backend { id: CONSOLE, sink: Sink::Console, pending: VecDeque::new() }],
+                backends: alloc::vec![Backend {
+                    id: CONSOLE,
+                    sink: Sink::Console,
+                    // A serial line does not say its far end's size (`TODO(serial-size)`).
+                    size: Size::UNKNOWN,
+                    pending: VecDeque::new(),
+                }],
                 ttys: Vec::new(),
                 next_backend: CONSOLE + 1,
             }
@@ -152,6 +160,23 @@ pub mod routing {
             self.ttys.iter().find(|t| t.ch == ch).map(|t| t.backend)
         }
 
+        /// Terminal `ch`'s size, its backend's, if it exists.
+        pub fn size_of(&self, ch: u64) -> Option<Size> {
+            let t = self.ttys.iter().find(|t| t.ch == ch)?;
+            self.backends.iter().find(|b| b.id == t.backend).map(|b| b.size)
+        }
+
+        /// Backend `id`'s grid is now `size`; `false` for none, or the console, whose no emulator says.
+        pub fn resize(&mut self, id: u32, size: Size) -> bool {
+            match self.backends.iter_mut().find(|b| b.id == id && b.id != CONSOLE) {
+                Some(b) => {
+                    b.size = size;
+                    true
+                }
+                None => false,
+            }
+        }
+
         /// Where terminal `ch` writes, if it exists.
         pub fn sink_of(&self, ch: u64) -> Option<Sink> {
             let t = self.ttys.iter().find(|t| t.ch == ch)?;
@@ -162,6 +187,7 @@ pub mod routing {
         pub fn open(&mut self, ch: u64) {
             self.ttys.push(Tty {
                 ch,
+                // No width: where the client's prompt left the cursor is unknown (`TODO(canonical-wrap)`).
                 disc: Discipline::new(),
                 waiting: None,
                 interrupt_pending: false,
@@ -333,12 +359,12 @@ pub mod routing {
         /// an outstanding read is kept. Its channel comes back to the caller, because closing
         /// it is how the previous emulator learns its terminal has ended; dropping it would
         /// leak a handle and leave that emulator waiting for a `PeerClosed`.
-        pub fn attach_backend(&mut self, ch: u64, handle: u64) -> Option<(u32, Option<u64>)> {
+        pub fn attach_backend(&mut self, ch: u64, handle: u64, size: Size) -> Option<(u32, Option<u64>)> {
             let i = self.ttys.iter().position(|t| t.ch == ch)?;
             let old = self.ttys[i].backend;
             let id = self.next_backend;
             self.next_backend += 1;
-            self.backends.push(Backend { id, sink: Sink::Channel(handle), pending: VecDeque::new() });
+            self.backends.push(Backend { id, sink: Sink::Channel(handle), size, pending: VecDeque::new() });
             self.ttys[i].backend = id;
             Some((id, self.retire(old)))
         }
@@ -541,7 +567,7 @@ pub mod tokens {
             assert_eq!(reg.backend_of_terminal(12), None, "no such terminal");
             // A terminal given a backend of its own — a window's — names a different one.
             reg.open(20);
-            let (window, _) = reg.attach_backend(20, 99).expect("terminal 20 exists");
+            let (window, _) = reg.attach_backend(20, 99, librsproto::tty::Size::UNKNOWN).expect("terminal 20 exists");
             assert_eq!(reg.backend_of_terminal(20), Some(window));
             assert_ne!(reg.backend_of_terminal(20), reg.backend_of_terminal(10));
         }
@@ -552,6 +578,7 @@ pub mod tokens {
 mod routing_tests {
     use super::routing::*;
     use alloc::vec::Vec;
+    use librsproto::tty::Size;
     use librsproto::{OP_TTY_INTERRUPT, OP_TTY_READ, OP_TTY_READ_LINE};
 
     /// A registry with `n` terminals on the console, channels 1..=n.
@@ -617,7 +644,7 @@ mod routing_tests {
     #[test]
     fn input_from_one_backend_never_reaches_a_terminal_on_another() {
         let mut r = console_ttys(2);
-        let (other, _) = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
+        let (other, _) = r.attach_backend(2, 0xBEEF, Size::UNKNOWN).expect("terminal 2 exists");
         assert_ne!(other, CONSOLE);
 
         // Terminal 2 is the only one reading, and the bytes arrive on the *console*.
@@ -634,7 +661,7 @@ mod routing_tests {
     #[test]
     fn an_interrupt_reaches_every_terminal_on_its_backend_and_no_others() {
         let mut r = console_ttys(2);
-        let (win, _) = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
+        let (win, _) = r.attach_backend(2, 0xBEEF, Size::UNKNOWN).expect("terminal 2 exists");
 
         let acts = r.feed(CONSOLE, &[0x03]);
         assert_eq!(replies_to(&acts, 1), [(OP_TTY_INTERRUPT, Vec::new())], "the console terminal");
@@ -670,7 +697,7 @@ mod routing_tests {
     #[test]
     fn a_terminals_output_goes_to_its_own_backend() {
         let mut r = console_ttys(2);
-        r.attach_backend(2, 0xBEEF);
+        r.attach_backend(2, 0xBEEF, Size::UNKNOWN);
         assert_eq!(r.sink_of(1), Some(Sink::Console));
         assert_eq!(r.sink_of(2), Some(Sink::Channel(0xBEEF)));
 
@@ -684,7 +711,7 @@ mod routing_tests {
         // The discipline generates echo, not the client; a fixed sink would show a window's
         // password on the console.
         let mut r = console_ttys(1);
-        let (win, _) = r.attach_backend(1, 0xF00D).expect("terminal 1 exists");
+        let (win, _) = r.attach_backend(1, 0xF00D, Size::UNKNOWN).expect("terminal 1 exists");
         r.read(1, 1, ReadKind::Line);
         let acts = r.feed(win, b"ab");
         assert_eq!(written(&acts, Sink::Channel(0xF00D)), b"ab");
@@ -731,10 +758,10 @@ mod routing_tests {
         // Closing that channel is how the previous emulator learns its terminal has ended
         // (`rsproto-tty-ops.md` § Lifetime).
         let mut r = console_ttys(1);
-        let (_first, orphan) = r.attach_backend(1, 0xAAA).expect("terminal 1 exists");
+        let (_first, orphan) = r.attach_backend(1, 0xAAA, Size::UNKNOWN).expect("terminal 1 exists");
         assert_eq!(orphan, None, "there was no channel backend before this one");
 
-        let (second, orphan) = r.attach_backend(1, 0xBBB).expect("terminal 1 exists");
+        let (second, orphan) = r.attach_backend(1, 0xBBB, Size::UNKNOWN).expect("terminal 1 exists");
         assert_eq!(orphan, Some(0xAAA), "the channel it left was not handed back");
         assert_eq!(r.backend_channels().collect::<Vec<_>>(), [0xBBB]);
         assert_eq!(r.sink_of(1), Some(Sink::Channel(0xBBB)));
@@ -747,7 +774,7 @@ mod routing_tests {
     #[test]
     fn a_backend_with_another_terminal_left_on_it_is_not_handed_back() {
         let mut r = console_ttys(2);
-        let (id, _) = r.attach_backend(1, 0xC0DE).expect("terminal 1 exists");
+        let (id, _) = r.attach_backend(1, 0xC0DE, Size::UNKNOWN).expect("terminal 1 exists");
         r.move_to(2, id);
         assert_eq!(r.close_and_retire(1), Vec::<u64>::new(), "the channel was closed too early");
         assert_eq!(r.sink_of(2), Some(Sink::Channel(0xC0DE)));
@@ -768,7 +795,7 @@ mod routing_tests {
     /// A shell in a window (terminal 1 on backend `0xAB`) and a stage's sibling terminal (2).
     fn shell_and_stage_in_a_window() -> (Registry, u32) {
         let mut r = console_ttys(1);
-        let (win, _) = r.attach_backend(1, 0xAB).expect("terminal 1 exists");
+        let (win, _) = r.attach_backend(1, 0xAB, Size::UNKNOWN).expect("terminal 1 exists");
         assert!(r.open_sibling(2, 1), "terminal 1 exists");
         (r, win)
     }
@@ -826,5 +853,47 @@ mod routing_tests {
         let mut r = console_ttys(1);
         assert!(!r.open_sibling(2, 99));
         assert_eq!(r.len(), 1, "a terminal was added anyway");
+    }
+
+    const WINDOW: Size = Size { cols: 100, rows: 30 };
+
+    #[test]
+    fn a_terminal_answers_its_backends_size_and_the_console_none() {
+        let mut r = console_ttys(2);
+        assert_eq!(r.size_of(1), Some(Size::UNKNOWN));
+        let (_, _) = r.attach_backend(2, 0xBEEF, WINDOW).expect("terminal 2 exists");
+        assert_eq!(r.size_of(2), Some(WINDOW), "the size the attach carried");
+        assert_eq!(r.size_of(1), Some(Size::UNKNOWN), "the console's terminal is not the window's");
+        assert_eq!(r.size_of(99), None);
+    }
+
+    #[test]
+    fn a_resize_reaches_every_terminal_on_its_backend_and_no_other() {
+        let (mut r, win) = shell_and_stage_in_a_window();
+        r.open(30);
+        let (other, _) = r.attach_backend(30, 0xD00D, WINDOW).expect("terminal 30 exists");
+        let smaller = Size { cols: 40, rows: 12 };
+        assert!(r.resize(win, smaller));
+        assert_eq!((r.size_of(1), r.size_of(2)), (Some(smaller), Some(smaller)), "the shell and its stage");
+        assert_eq!(r.size_of(30), Some(WINDOW), "another window kept its own");
+        assert!(r.resize(other, Size::UNKNOWN));
+        assert_eq!(r.size_of(30), Some(Size::UNKNOWN));
+    }
+
+    #[test]
+    fn the_consoles_size_cannot_be_set_nor_a_gone_backends() {
+        let mut r = console_ttys(1);
+        assert!(!r.resize(CONSOLE, WINDOW));
+        assert_eq!(r.size_of(1), Some(Size::UNKNOWN));
+        assert!(!r.resize(77, WINDOW), "no backend 77");
+    }
+
+    #[test]
+    fn a_re_pointed_terminal_takes_its_new_backends_size() {
+        let mut r = console_ttys(1);
+        r.attach_backend(1, 0xAAA, WINDOW).expect("terminal 1 exists");
+        let narrow = Size { cols: 20, rows: 5 };
+        r.attach_backend(1, 0xBBB, narrow).expect("terminal 1 exists");
+        assert_eq!(r.size_of(1), Some(narrow));
     }
 }

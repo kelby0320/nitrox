@@ -6,11 +6,17 @@ use librsproto::{OP_TTY_ATTACH_BACKEND, OP_TTY_WRITE};
 
 const TERMINAL: Rights = Rights::from_bits(libkern::RIGHT_SEND | libkern::RIGHT_RECV | libkern::RIGHT_WAIT);
 
-/// Send `op` on terminal `tty`, moving `handles`, and answer its reply's error, `0` for none.
-/// `None` if it would not send or no reply came within 5 s; a handle not sent is closed.
-fn request<'a>(tty: impl Into<Ref<'a, Channel, Only>>, op: u16, request_id: u64, handles: Carried) -> Option<i32> {
+/// Send `op` with `body` on terminal `tty`, moving `handles`, and answer its reply's error, `0` for
+/// none. `None` if it would not send or no reply came within 5 s; a handle not sent is closed.
+fn request<'a>(
+    tty: impl Into<Ref<'a, Channel, Only>>,
+    op: u16,
+    request_id: u64,
+    body: &[u8],
+    handles: Carried,
+) -> Option<i32> {
     let tty = tty.into();
-    if !rs_send(tty, op, request_id, &[], handles) {
+    if !rs_send(tty, op, request_id, body, handles) {
         return None;
     }
     let deadline = clock_ns() + 5_000 * MS;
@@ -26,21 +32,22 @@ fn request<'a>(tty: impl Into<Ref<'a, Channel, Only>>, op: u16, request_id: u64,
     }
 }
 
-/// Attach a fresh channel end restricted to `rights` to terminal `tty`: the reply's error, and
-/// whether the end was closed by the server. `None` if no reply came.
-fn attach_restricted(tty: &Handle<Channel, Only>, rights: Rights, request_id: u64) -> Option<(i32, bool)> {
+/// Attach a fresh channel end restricted to `rights` to terminal `tty`, `body` beside it: the
+/// reply's error, and whether the end was closed by the server. `None` if no reply came.
+fn attach_restricted(tty: &Handle<Channel, Only>, rights: Rights, body: &[u8], request_id: u64) -> Option<(i32, bool)> {
     let (ours, theirs) = channel()?;
     if !refused::restrict::narrow(&theirs, rights) {
         return None;
     }
-    let answer = request(tty, OP_TTY_ATTACH_BACKEND, request_id, carry(theirs));
+    let answer = request(tty, OP_TTY_ATTACH_BACKEND, request_id, body, carry(theirs));
     let closed = answer.is_some_and(|e| e != 0) && peer_gone_by(&ours, clock_ns() + 2_000 * MS);
     answer.map(|e| (e, closed))
 }
 
 /// **A terminal refuses a backend it could not wait on, and closes it**: a memory object, or a
 /// channel end without `WAIT`, fails every wait of the server's loop, so it would serve no
-/// terminal again. One without `INSPECT` cannot be told from either, so it is refused too.
+/// terminal again. One without `INSPECT` cannot be told from either, so it is refused too, and so
+/// is a good end sent with a body too short to be a size.
 pub(super) fn tty_refuses_a_backend_it_cannot_wait_on_test(root: Root<'_>) -> bool {
     let fail = |why: &[u8]| {
         Line::new().s(b"boot-probe: tty backend refused FAIL: ").s(why).end();
@@ -52,10 +59,14 @@ pub(super) fn tty_refuses_a_backend_it_cannot_wait_on_test(root: Root<'_>) -> bo
     use libkern::KError;
     let memory = Handle::<Memory, MapReadWrite>::create(PAGE as usize)
         .ok()
-        .and_then(|mem| request(&tty, OP_TTY_ATTACH_BACKEND, 0x6176, carry(mem)));
-    let unwaitable = attach_restricted(&tty, Rights::SEND | Rights::RECV | Rights::TRANSFER | Rights::INSPECT, 0x6177);
-    let uninspectable = attach_restricted(&tty, Rights::SEND | Rights::RECV | Rights::WAIT | Rights::TRANSFER, 0x6179);
-    let serving = request(&tty, OP_TTY_WRITE, 0x6178, Carried::new()) == Some(0);
+        .and_then(|mem| request(&tty, OP_TTY_ATTACH_BACKEND, 0x6176, &[], carry(mem)));
+    let unwaitable =
+        attach_restricted(&tty, Rights::SEND | Rights::RECV | Rights::TRANSFER | Rights::INSPECT, &[], 0x6177);
+    let uninspectable =
+        attach_restricted(&tty, Rights::SEND | Rights::RECV | Rights::WAIT | Rights::TRANSFER, &[], 0x6179);
+    let every = Rights::SEND | Rights::RECV | Rights::WAIT | Rights::TRANSFER | Rights::INSPECT;
+    let malformed = attach_restricted(&tty, every, &[80, 0, 24], 0x617c);
+    let serving = request(&tty, OP_TTY_WRITE, 0x6178, &[], Carried::new()) == Some(0);
     drop(tty);
     if memory != Some(KError::InvalidArgument.as_i32()) {
         return fail(b"a memory object was not refused InvalidArgument");
@@ -66,7 +77,10 @@ pub(super) fn tty_refuses_a_backend_it_cannot_wait_on_test(root: Root<'_>) -> bo
     if uninspectable.map(|r| r.0) != Some(KError::NoAccess.as_i32()) {
         return fail(b"a channel end without INSPECT was not refused NoAccess");
     }
-    if !unwaitable.is_some_and(|r| r.1) || !uninspectable.is_some_and(|r| r.1) {
+    if malformed.map(|r| r.0) != Some(KError::InvalidArgument.as_i32()) {
+        return fail(b"a body too short to be a size was not refused InvalidArgument");
+    }
+    if ![unwaitable, uninspectable, malformed].iter().all(|r| r.is_some_and(|r| r.1)) {
         return fail(b"it kept a backend it refused");
     }
     if !serving {
@@ -87,9 +101,9 @@ pub(super) fn tty_reattach_closes_the_old_backend_test(root: Root<'_>) -> bool {
     let (Some((a, a_far)), Some((b, b_far))) = (channel(), channel()) else {
         return fail(b"no channels");
     };
-    let first = tty.as_ref().is_ok_and(|tty| request(tty, OP_TTY_ATTACH_BACKEND, 0x617b, carry(a_far)) == Some(0));
-    let second =
-        first && tty.as_ref().is_ok_and(|tty| request(tty, OP_TTY_ATTACH_BACKEND, 0x617a, carry(b_far)) == Some(0));
+    let first = tty.as_ref().is_ok_and(|tty| request(tty, OP_TTY_ATTACH_BACKEND, 0x617b, &[], carry(a_far)) == Some(0));
+    let second = first
+        && tty.as_ref().is_ok_and(|tty| request(tty, OP_TTY_ATTACH_BACKEND, 0x617a, &[], carry(b_far)) == Some(0));
     let old_closed = second && peer_gone_by(&a, clock_ns() + 2_000 * MS);
     let new_open = second && !peer_gone_by(&b, clock_ns());
     if !second {
