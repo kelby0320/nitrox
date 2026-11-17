@@ -26,7 +26,8 @@ pub(crate) const COREUTILS: &[&str] = &[
     // Stopping or restarting the machine, through the `power` grant that the seeded policy gives
     // everyone.
     "shutdown", // Reading the service log back, through the `logs` grant.
-    "log",
+    "log",      // The manual, read from `/system/manual`.
+    "man",
 ];
 
 /// The system services, packaged into the store like any other program.
