@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -285,6 +285,40 @@ Part G is done when G.7 has merged and what Miri reports is triaged.
 - [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md);
 - `deferred-decisions.md`, for `tty-size`;
 - [`console-and-tty.md`](../architecture/console-and-tty.md).
+
+**Built 2026-11-17** (`26a000a9`, `105cb684`), with the editing the maintainer added to it.
+- **The size**: `Tty::Size` and `Tty::Resize`, a backend's size in `tty-server`'s registry, the
+  grid sent with `AttachBackend` and at every refit, and `librsproto::tty::Size`.
+- **Asked by** `libprompt::size_on`, `Stage::terminal_size` and `nxsh`, which asks after every
+  read; `man` renders to the width, and the completion listing fits it.
+- **The editing**: `libline` draws by row and column where the width is known, from the prompt's
+  width `nxsh` gives it, and a search's line goes through it.
+- **`libline`** decodes Page Up and Page Down.
+
+**Departures, for the maintainer's eye:**
+- **`terminal`, a new coreutil**, printing the size, which the gate asks: the plan said
+  `check-terminal` asks without saying how, and its grid is 80 wide, the fallback every program
+  uses.
+- **The size goes with the attach**, the plan's "on attaching" made a body rather than a message:
+  the shell spawned next could ask before a separate one arrived.
+- **Canonical reads still draw as a dumb terminal** (`TODO(canonical-wrap)`), and a serial line's
+  size is unknown (`TODO(serial-size)`).
+- **The discipline's tests moved** to `discipline/tests.rs` first, the file being at its cap.
+
+**Tests**: the size's encoding; the registry's size per backend, through a resize and a re-point;
+`size_on` and `terminal_size` against a far end, a refusal's four bytes included; the listing at a
+width and the editor's; the prompt's width; a search drawn and accepted through the line; the page
+keys; and **ten screens in `libterm`**, the discipline's output drawn in a grid: a wrap crossed by
+Backspace and the cursor keys, a row filled exactly, an insert and a delete across rows, recalls
+long to short, of several rows, over a long line and replaced, Enter mid-line, and a refit.
+**Controls**: 27 mutations, each failing its test; with the width withheld from the discipline,
+`check-terminal` fails at the wrapped row.
+
+**The gates**:
+- **`check-terminal`**: `terminal` answers the grid `nxterm` logged, and a line wider than the grid
+  is edited across its wrap;
+- **`check-login`**: after the drag, `terminal` in the session's window answers the new width;
+- **`test-interactive`**: on serial, `terminal` says the size is unknown.
 
 ### G.3 The pager
 
