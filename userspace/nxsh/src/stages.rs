@@ -127,11 +127,11 @@ impl Sys for Stages<'_> {
         Some(self.keep(h))
     }
 
-    fn send_setup(&mut self, stage: usize, setup: u64, streams: Streams, terminal: Option<u64>) -> bool {
+    fn send_setup(&mut self, stage: usize, setup: u64, streams: Streams, terminal: Option<u64>, shown: bool) -> bool {
         let argv: Vec<&str> = self.argvs[stage].iter().map(|s| s.as_str()).collect();
         let mut own = |key: Option<u64>| key.and_then(|k| self.take_channel(k));
-        let streams =
-            StageStreams { stdin: own(streams.stdin), stdout: own(streams.stdout), stderr: own(streams.stderr) };
+        let (stdin, stdout, stderr) = (own(streams.stdin), own(streams.stdout), own(streams.stderr));
+        let streams = StageStreams { stdin, stdout, stderr, shown };
         let terminal = own(terminal);
         let Some(setup) = self.channel(setup) else { return false };
         // The same environment to every stage, arguments as written.

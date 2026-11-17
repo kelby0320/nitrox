@@ -153,6 +153,8 @@ pub struct Interp {
     mode: Mode,
     /// Whether the statement currently executing is inside a `strict { }` block (§1).
     strict: bool,
+    /// [`crate::repl::shown`], taken by the first pipeline to run: the statement's, not an argument's.
+    shown: bool,
     /// The most recent pipeline's `PipelineStatus`, for `$last.status` (§11d).
     ///
     /// A private field, not a `__status` binding: that was a name a user could type and was dropped
@@ -187,6 +189,7 @@ impl Interp {
             host,
             mode,
             strict: false,
+            shown: false,
             last_status: None,
             iteration_limit: MAX_ITERATIONS,
             loading: Vec::new(),
@@ -303,7 +306,10 @@ impl Interp {
             // **Anything `exec_block` does to a list of statements, `run_line` owes them too**
             // (`nxsh/CLAUDE.md`): the interrupt checkpoint between statements lived only there.
             self.check_interrupt()?;
-            let value = boundary_value(self.exec(stmt)?)?;
+            self.shown = crate::repl::shown(stmt);
+            let ran = self.exec(stmt);
+            self.shown = false;
+            let value = boundary_value(ran?)?;
             self.bind_last(&value)?;
             if crate::repl::should_display(stmt) && !value.is_null() {
                 let styled = self.host.styled();
@@ -1660,6 +1666,7 @@ impl Interp {
     /// with real backpressure, so the shell must not run one stage at a time. Between runs an
     /// in-process operator materialises the value (§5c).
     fn pipeline(&mut self, stages: &[Expr]) -> Result<Val> {
+        let shown = core::mem::take(&mut self.shown);
         let mut carried: Option<Val> = None;
         let mut statuses: Vec<StageStatus> = Vec::new();
         let mut i = 0usize;
@@ -1681,8 +1688,8 @@ impl Interp {
                     Some(v) => Some(encode_stream(&v)?),
                     None => None,
                 };
-                let strict = self.strict;
-                let outcome = self.host.run(&run, input.as_deref(), strict, &self.env).map_err(EvalError::new)?;
+                let (strict, last) = (self.strict, shown && i == stages.len());
+                let outcome = self.host.run(&run, input.as_deref(), strict, last, &self.env).map_err(EvalError::new)?;
                 carried = decode_output(&outcome)?;
                 statuses.extend(outcome.stages.iter().cloned());
                 continue;

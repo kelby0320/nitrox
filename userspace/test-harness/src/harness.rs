@@ -171,7 +171,7 @@ fn stage_spawn_demo(root: &Root, notif: &Notif) {
     };
     drop(img);
 
-    let streams = StageStreams { stdin: Some(stage_stdin), stdout: None, stderr: None };
+    let streams = StageStreams { stdin: Some(stage_stdin), stdout: None, stderr: None, shown: false };
     if send_stage_setup(&setup_shell, streams, None, &["stage", "500"], &Record::default(), Deadline::NEVER).is_err() {
         log::write(b"test-harness: stage send_setup FAIL\n");
         exit(1);
@@ -890,11 +890,8 @@ fn run_coreutil_capture_in(
     let Some(_proc) = spawn_stage(&img, child_ns, setup_stage) else { return_fail(b"test-harness: list spawn FAIL\n") };
     drop(img);
 
-    let streams = StageStreams {
-        stdin: None, // a source stage: its input is the filesystem, not a pipe
-        stdout: Some(list_stdout),
-        stderr: None,
-    };
+    // A source stage: its input is the filesystem, not a pipe.
+    let streams = StageStreams { stdin: None, stdout: Some(list_stdout), stderr: None, shown: false };
     if send_stage_setup(&setup_shell, streams, None, argv, &Record::default(), Deadline::NEVER).is_err() {
         return_fail(b"test-harness: list send_setup FAIL\n");
     }
@@ -995,7 +992,7 @@ fn dead_stage_closes_its_pipe_demo(root: &Root, notif: &Notif) {
         return_fail(b"test-harness: dead-stage spawn FAIL\n")
     };
     drop(img);
-    let streams = StageStreams { stdin: None, stdout: Some(stdout), stderr: None };
+    let streams = StageStreams { stdin: None, stdout: Some(stdout), stderr: None, shown: false };
     let argv = ["list", "/nx-no-such-directory"];
     if send_stage_setup(&setup_shell, streams, None, &argv, &Record::default(), Deadline::NEVER).is_err() {
         return_fail(b"test-harness: dead-stage send_setup FAIL\n");
@@ -1836,7 +1833,7 @@ fn run_coreutil_in(
         return_fail(b"test-harness: coreutil spawn FAIL\n")
     };
     drop(img);
-    let streams = StageStreams { stdin: None, stdout: Some(stdout), stderr: None };
+    let streams = StageStreams { stdin: None, stdout: Some(stdout), stderr: None, shown: false };
     if send_stage_setup(&setup_shell, streams, None, argv, &Record::default(), Deadline::NEVER).is_err() {
         return_fail(b"test-harness: copy send_setup FAIL\n");
     }
