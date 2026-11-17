@@ -8,7 +8,7 @@
 
 use alloc::string::String;
 
-use crate::ast::{Expr, Stmt};
+use crate::ast::{CallKind, Expr, Stmt};
 use crate::lex::{Lexer, Mode, Tok};
 
 /// Why a typed line is not yet complete, or [`Continue::No`] if it is.
@@ -75,7 +75,12 @@ pub fn should_display(stmt: &Stmt) -> bool {
 /// Whether a statement's displayed value is a stage's `stdout` as it comes, so its last stage is
 /// told it is shown (`pipeline-stdio.md` § Payload): a pipeline, a command or a bare name.
 pub fn shown(stmt: &Stmt) -> bool {
-    should_display(stmt) && matches!(stmt, Stmt::Expr(Expr::Pipeline(_) | Expr::Call(_) | Expr::Ident(_)))
+    should_display(stmt)
+        && match stmt {
+            Stmt::Expr(Expr::Pipeline(_) | Expr::Ident(_)) => true,
+            Stmt::Expr(Expr::Call(c)) => c.kind == CallKind::External,
+            _ => false,
+        }
 }
 
 /// The longest line the REPL will accept, matching the tty server's own limit.

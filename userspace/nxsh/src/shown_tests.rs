@@ -39,6 +39,7 @@ fn a_value_assigned_piped_on_or_computed_with_is_not() {
     assert_eq!(shown(&["man ls | count"]), [false], "an operator takes it");
     assert_eq!(shown(&["man ls | display"]), [false], "displayed by the operator, as text");
     assert_eq!(shown(&["(man ls) + 1"]), [false], "an expression's operand");
+    assert_eq!(shown(&["format(\"{}\", man)"]), [false], "an operator's argument");
 }
 
 /// The statement's own pipeline takes the flag before its arguments run.
