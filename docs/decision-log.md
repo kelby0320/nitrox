@@ -38532,3 +38532,27 @@ F.4 merged, #449. F.5, `context-menus.md` § F.5, built on `pre-phase-7/part-f5-
   boundary next to one. **A cut is its own undo step**, one the clipboard cannot hold deletes
   nothing, and one it refuses is undone; the raw deletion in `TextAreaState` is private, so no
   caller can delete without an undo step.
+
+## 2026-11-17 — Before Phase 7, Part G detailed, and G.1: `man`
+
+Part F merged, #450, and its Miri run is clean: `compositor`, `librsproto`, `libsurface`,
+`desktop-shell` and `libui`. Part G, `manual.md`, detailed the same day. G.1, `manual.md` § G.1,
+built on `pre-phase-7/part-g1-man`.
+
+- **The maintainer's calls**:
+  - the shell first, its syntax especially;
+  - a guide to the system and the services that start at boot, for programmers to come;
+  - the syscall interface;
+  - the desktop;
+  - terminal only, with a pager, an alternate screen and tables in it;
+  - the specs staged as pages, as they are, "to start";
+  - the written pages in `docs/manual`;
+  - **`--help` not the page**, a short overview as Unix's is;
+  - no `libman`: the renderer has one user and the pager two, both coreutils.
+- **`man` reads `/system/manual/<section>/<name>.md`** (`76e795ad`, `89a1853f`). The pages are `docs/manual`'s and
+  31 specs; the format is `docs/spec/manual-page.md`, a spec staged as `manual-page(5)`. `man`
+  alone lists the pages as a table, so the shell's operators narrow it.
+- **`/system/manual` is a namespace member**, `bind_manual`, in both columns and every application:
+  read-only public pages, and a terminal window's shell runs in its application's namespace.
+- **`docs/manual/` describes current behaviour**, as `spec/` does.
+

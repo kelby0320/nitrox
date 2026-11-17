@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -143,7 +143,7 @@ section is its directory's number:
 
 The renderer is `man`'s, in the coreutils library. The exact rules are a contract between the
 pages, the renderer and the checks, written in
-`docs/spec/manual-page.md` with G.1. <!-- check-docs: allow-missing -->
+`docs/spec/manual-page.md` with G.1.
 
 **Where pages come from**:
 - `docs/manual/<section>/<name>.md`, the written pages; <!-- check-docs: allow-missing -->
@@ -179,7 +179,7 @@ Part G is done when G.7 has merged and what Miri reports is triaged.
   blocks and renders them to a width, styled or plain.
 - **`man`**, a coreutil:
   - **`man`** emits every page as a table, `Table<{name, section, summary}>`, so
-    `man | where section == 1` is a list of commands;
+    `man | filter section == 1` is a list of commands;
   - **`man NAME`** and **`man SECTION NAME`** print a page as text, at 80 columns until G.2;
   - **`man -k WORD`** lists the pages whose name or summary holds the word.
 - **Staging**: `stage_rootfs` writes `/system/manual` from `docs/manual` and the list of staged
@@ -201,7 +201,44 @@ Part G is done when G.7 has merged and what Miri reports is triaged.
 **Docs**:
 - [`documentation.md`](../conventions/documentation.md) and the root `CLAUDE.md` name `manual/`
   as current behaviour;
-- `docs/spec/manual-page.md`. <!-- check-docs: allow-missing -->
+- `docs/spec/manual-page.md`.
+
+**Built 2026-11-17** (`76e795ad`, `89a1853f`).
+- **The renderer** is `coreutils::manual`, with `inline` for a line's markup; **`man`** is a coreutil,
+  as planned.
+- **The staging** is `tools/xtask/src/manual.rs`: `docs/manual`, and 31 specs by `STAGED_SPECS`,
+  33 pages in all. Three specs are not pages, the kernel's own: the module ABI hash, the IRP
+  layout and user-memory access. A test holds every spec to one list or the other.
+- **`/system/manual` is a new namespace member, `bind_manual`**, set in both columns and every
+  application.
+
+**Departures, for the maintainer's eye:**
+- **The manual is bound into applications too**, not only sessions: a terminal window's shell runs
+  in its application's namespace, and would find no pages.
+- **`man | filter section == 1`**, where the plan wrote `where`: the shell has no `where`.
+- **The root `CLAUDE.md` names `docs/manual`** within its 200 lines: the status paragraph loses its
+  list of the work before Phase 7, which had gone stale.
+- **Two defects the shell spec found in the parser**, fixed with tests:
+  - a line beginning `|` with no table under it sent the parser round a loop that never moved;
+  - a table or a fence indented under a list item was read as the item's text.
+
+**Twenty-two tests**:
+- **The renderer, eighteen**: a heading's margin and its body's indent; wrapping, and a long word
+  broken; lists, numbered and nested; code left whole; a table in columns, squeezed and as records;
+  links, HTML and placeholders; styles; asterisks; pipes in cells; a summary; a `|` line with no
+  table; a table and a fence under a list item; a name's page; a keyword; and **every page and
+  spec at 80 columns**, each under a watchdog.
+- **The staging, two**: every spec staged or said not to be, and every page in a section `man`
+  reads.
+- **The namespace's two**, extended: the manual bound where asked, and not where not.
+
+**Controls**:
+- fourteen mutations each fail a test, two of them after their tests were made to tell them
+  apart: an asterisk inside a word, and a service before an overview;
+- a spec left off both lists fails the staging test;
+- `test-interactive` fails at `man man` with the serial session's bind removed.
+
+**The gate**: `test-interactive` prints `man(1)` and `manual-page(5)`, and counts the 33 pages.
 
 ### G.2 The terminal's size
 
@@ -294,7 +331,7 @@ The four parallel lists become questions asked of the table.
 - the examples;
 - `help`'s two forms.
 
-**The gate**: `test-interactive` runs `help where` over serial.
+**The gate**: `test-interactive` runs `help filter` over serial.
 
 **Docs**: [`shell-language.md`](../spec/shell-language.md), whose §10b points at the table.
 
@@ -303,7 +340,7 @@ The four parallel lists become questions asked of the table.
 **`shell(7)`, a tour in a person's register.** Each example is a fenced `nxsh` block followed by
 its output. It covers:
 - running a command, and a pipeline of typed streams;
-- tables: `where`, `select`, `sort`, `take`;
+- tables: `filter`, `select`, `sort`, `take`;
 - values and their types, strings and quoting, variables;
 - blocks and control flow;
 - errors and `try`;

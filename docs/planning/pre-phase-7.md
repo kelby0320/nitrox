@@ -16,7 +16,7 @@ built by 2026-11-05; Part J detailed 2026-11-05, J.1 to J.5 built 2026-11-06, J.
 J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6 to E.9 built
 2026-11-13, E.10 and E.11 2026-11-15, and the whole suite under Miri the same day; Part E done
 2026-11-16, #444 merged; Part F detailed 2026-11-16, and F.1 to F.5 built the same day; Part G
-detailed 2026-11-17.** Each later
+detailed 2026-11-17, and G.1 built the same day.** Each later
 part gets its detail pass when it is next. Ten parts, A–J, in the order below: Part I between D
 and E, and **Part J between Part E's two halves** (the maintainer's call, 2026-11-02). Part E is
 the syscall-surface consolidation, planned separately in
