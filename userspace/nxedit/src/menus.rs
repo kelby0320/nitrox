@@ -130,12 +130,12 @@ impl App {
         if !pressed && !dragging && !context {
             return false;
         }
-        let (line, col) = self.buf().text.at_point(p.x, p.y, ROW_H, width);
+        let (line, col) = self.buf().text.at_point(p.x, p.y, ROW_H, &width);
         // The menu's rows act on the selection as it stands after the press, so Cut never takes
-        // text away from where the click was.
+        // text away from where the click was: the press is inside only on a selected character.
         if context {
-            let at = (line, col);
-            if !self.buf().text.selection().is_some_and(|(from, to)| from <= at && at <= to) {
+            let on = self.buf().text.char_at(p.x, p.y, ROW_H, &width);
+            if !self.buf().text.selection().is_some_and(|(from, to)| on.is_some_and(|c| from <= c && c < to)) {
                 self.buf_mut().text.place(line, col);
             }
             if let Some((x, y)) = self.context.area {

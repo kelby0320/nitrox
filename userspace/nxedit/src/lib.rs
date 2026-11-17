@@ -36,6 +36,7 @@ use libui::widget::{
     status_separator, status_text, tab_strip, text_area, text_field, title_bar, window_frame_with_grip,
 };
 
+mod clip;
 mod menus;
 
 /// The status bar's height in pixels: `libui`'s `status_bar`, along the window's foot.
@@ -301,6 +302,8 @@ pub struct App {
     save_requested: Option<u64>,
     /// What the editor owes the clipboard — see [`ClipRequest`].
     clip_request: Option<ClipRequest>,
+    /// The tab and the revision a cut left, which a refused copy undoes if they still stand.
+    cut_at: Option<(u64, u64)>,
     /// The paste a cycle would continue, or `None`. See [`Cycling`].
     cycling: Option<Cycling>,
     /// A title-bar button was pressed, and the binary owes the compositor a `RequestState`.
@@ -593,6 +596,7 @@ impl App {
             maximized: false,
             save_requested: None,
             clip_request: None,
+            cut_at: None,
             cycling: None,
             state_requested: None,
             move_requested: false,
@@ -746,22 +750,6 @@ impl App {
     /// Whether this buffer refuses to be written, and why.
     pub fn refusal(&self) -> Option<&str> {
         self.buf().blocked.as_deref()
-    }
-
-    /// Copy the selection onto the ring, deleting it as well when `cut`. Nothing selected is not a
-    /// request: an empty entry would move the ring's serial under a client mid-cycle.
-    fn copy(&mut self, cut: bool) {
-        let Some(text) = self.buf().text.selected_text() else {
-            self.status = String::from(if cut { "nothing to cut" } else { "nothing to copy" });
-            return;
-        };
-        if cut {
-            self.buf_mut().text.delete_selection();
-            // A cut is a complete edit, so the next keystroke is a separate undo step.
-            self.buf_mut().text.end_group();
-        }
-        self.status = String::from(if cut { "cut" } else { "copied" });
-        self.clip_request = Some(ClipRequest::Copy(text));
     }
 
     /// What the editor owes the clipboard, taken exactly once.

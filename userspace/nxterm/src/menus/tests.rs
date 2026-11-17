@@ -150,3 +150,16 @@ fn the_gate_finds_copy_and_paste_where_it_looks() {
     let at = |want: &str| m.items.iter().position(|it| matches!(it, Item::Action { label, .. } if label == want));
     assert_eq!((at("Copy"), at("Paste")), (Some(0), Some(1)), "MENU_ROW_KEY + 0 and + 1");
 }
+
+#[test]
+fn a_right_release_opens_no_second_menu() {
+    let mut a = app();
+    a.feed(b"hello");
+    let h = a.metrics.cell_h as i32;
+    a.update(Msg::GridPointer(ptr(BTN_RIGHT, POINTER_BUTTON, 2, POINTER_PRESSED, 3, h / 2)));
+    let opened = a.menus.shown();
+    assert!(opened.is_some(), "precondition: the press opened it");
+    a.update(Msg::GridPointer(ptr(BTN_RIGHT, POINTER_BUTTON, 0, 0, 3, h / 2)));
+    a.update(Msg::GridPointer(ptr(BTN_RIGHT, POINTER_MOTION, 2, 0, 9, h / 2)));
+    assert_eq!(a.menus.shown(), opened, "a release or a drag with the right button opened it again");
+}

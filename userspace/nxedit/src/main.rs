@@ -567,7 +567,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
                     nxedit::ClipRequest::Copy(text) => match clip_copy(root, text.as_bytes()) {
                         // A count, never the text: the serial console is a log file.
                         Ok(()) => Line::new().s(b"nxedit: copied ").u(text.len() as u64).s(b" bytes").end(),
-                        Err(why) => Line::new().s(b"nxedit: the copy failed: ").s(why.as_bytes()).end(),
+                        Err(why) => {
+                            app.copy_refused();
+                            Line::new().s(b"nxedit: the copy failed: ").s(why.as_bytes()).end();
+                        }
                     },
                     nxedit::ClipRequest::Paste => {
                         let mut got = [0u8; MAX_CLIP_BYTES];

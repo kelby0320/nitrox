@@ -183,11 +183,26 @@ impl TextAreaState {
         self.anchor = Some(from);
     }
 
+    /// Delete the selection as an edit of its own, one undo step: what a cut does. `false` if there
+    /// was none.
+    pub fn cut_selection(&mut self) -> bool {
+        if !self.has_selection() {
+            return false;
+        }
+        // Closed either side, so neither the edits before nor the typing after joins the step.
+        self.group = None;
+        self.begin(EditKind::Deleting);
+        self.delete_selection();
+        self.group = None;
+        true
+    }
+
     /// Delete the selection, leaving the cursor at where it started. `false` if there was none.
     ///
     /// The anchor is dropped either way: one the cursor has walked back onto indexes text this
-    /// call is about to shorten. Every edit funnels through here.
-    pub fn delete_selection(&mut self) -> bool {
+    /// call is about to shorten. Every edit funnels through here, **after opening its undo step**:
+    /// private, so no caller outside can delete without one.
+    fn delete_selection(&mut self) -> bool {
         let Some(((sl, sc), (el, ec))) = self.selection() else {
             self.anchor = None;
             return false;
@@ -268,6 +283,21 @@ impl TextAreaState {
             }
         }
         (line, best.0)
+    }
+
+    /// The character under widget-local `(x, y)`: its line and the column it starts at, a point past
+    /// a line's end being on its end. `None` below the last line.
+    ///
+    /// **What a press is on**, where [`at_point`](Self::at_point) answers the nearest boundary: a
+    /// press on the right half of a character is at the boundary after it, but on the character.
+    pub fn char_at(&self, x: i32, y: i32, row_height: u32, width: impl Fn(&str) -> u32) -> Option<(usize, usize)> {
+        let y = y - FIELD_PAD.top as i32;
+        let row = (y.max(0) as u32).checked_div(row_height).unwrap_or(0) as usize;
+        let line = self.offset + row;
+        let text = self.lines.get(line)?;
+        let x = (x - FIELD_PAD.left as i32).max(0) as u32;
+        let on = text.char_indices().find(|&(i, c)| x < width(&text[..i + c.len_utf8()]));
+        Some((line, on.map_or(text.len(), |(i, _)| i)))
     }
 
     /// This buffer as a scrollbar's state, for `visible` lines on screen.
