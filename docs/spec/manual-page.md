@@ -5,7 +5,9 @@ and the checks that hold every page to it.
 
 ## Where a page is
 
-A page is `/system/manual/<section>/<name>.md`. The build stages two kinds
+A page is `/system/manual/<name>.<section>.md`, as `man.1.md` and `init.toml.5.md` are: the <!-- check-docs: allow-missing -->
+profile server's projection of each package's `manual/`, flat as its projections are, which no
+session can change. The build stages two kinds, into the coreutils package beside `man`
 (`tools/xtask/src/manual.rs`):
 
 - **The written pages**, from `docs/manual/<section>/<name>.md` in the repository; <!-- check-docs: allow-missing -->
@@ -27,21 +29,21 @@ section is named.
 ## Its first line
 
 `# name — what it is in a few words`. What follows the dash is the page's summary, which `man`
-lists and `man --keyword` searches. A page whose first heading has no dash, as a spec's, is
-summarised by the whole heading.
+lists and `man --keyword` searches. A page whose first heading does not name it before a dash, as
+a spec's, is summarised by the whole heading.
 
 ## The blocks
 
 | Block | Written | Drawn |
 |---|---|---|
-| Heading | `#` to `######`, then a space | At the margin, in bold |
+| Heading | `#` to `######`, then a space; a closing run of `#` after a space is dropped | At the margin, in bold |
 | Paragraph | Lines run together until a blank line or another block | Wrapped, four columns in |
 | List | `-`, `*` or `+`, or a number and a dot; a second level indented under an item | Its lines hung under its text; the second level two columns further in |
-| Code | Between two lines of three backticks, or three tildes | Eight columns in, **never wrapped** |
+| Code | From a line of three or more backticks or tildes to a line of as many or more of the same and nothing else | Eight columns in, **never wrapped**, a tab four spaces |
 | Table | A row of cells between `\|`, a separator row of dashes, then rows | See below |
 | Quote | Lines beginning `>` | One paragraph, each line led by `\| ` |
 | Rule | Three or more `-`, `*` or `_` alone | A line of dashes |
-| Comment | `<!--` to `-->`, over any lines | Nothing |
+| Comment | `<!--` to `-->`, over any lines | Nothing; text after a one-line comment is the line's |
 
 A table or a code block indented under a list item ends the list, and is drawn as a block of its
 own.
@@ -49,13 +51,17 @@ own.
 ## Inside a line
 
 - `` `code` ``, in as many backticks as it needs: drawn in cyan.
-- `**bold**`: drawn bold. `*emphasis*`: underlined. A `*` with a space either side is an asterisk.
-- `[text](address)` and `[text][ref]`: the text alone. `![text](image)`: the text.
+- `**bold**`: drawn bold. `*emphasis*`: underlined. An asterisk, or a pair, that does not open
+  before a word and close after one later in the line is itself: `a * b`, `*.md`, `2 ** 3`.
+- `[text](address)`: the text alone. `![text](image)`: the text. `[text][ref]` is as written: a
+  page has no reference definitions.
 - `<https://…>`: the address.
 - The HTML tags `a`, `br`, `sup`, `sub`, `kbd`, `span`, `div`, `details`, `summary` and `img`, and
   comments: nothing. Any other `<…>` is text, as a placeholder such as `<name>` is meant.
 - `&amp;`, `&lt;`, `&gt;`, `&quot;` and `&nbsp;`: the character.
 - A backslash before punctuation: that character, as itself.
+- A tab: a space. **Any other control character is dropped**, an escape among them, so a page
+  cannot move the cursor, clear the screen or retitle the terminal it is read in.
 
 ## A table
 
@@ -64,8 +70,9 @@ A table's columns are as wide as their widest cell, the header's included, two c
   within its own, down to ten columns each.
 - **Too wide even then**, the table is drawn **one record per row**: each cell on its own line,
   after its column's name, rows a blank line apart.
-- **A cell is split** at each `|` outside a code span; `\|` is a `|` in a cell, in a code span or
-  not.
+- **A cell is split** at each `|` outside a code span, which a run of as many backticks as opened
+  it closes; `\|` is a `|` in a cell, in a code span or not.
+- **A row with more cells than the header** widens the table, the extra column unnamed.
 
 ## Width and style
 

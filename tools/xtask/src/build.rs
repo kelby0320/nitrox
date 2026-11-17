@@ -25,8 +25,12 @@ pub(crate) const COREUTILS: &[&str] = &[
     "service",
     // Stopping or restarting the machine, through the `power` grant that the seeded policy gives
     // everyone.
-    "shutdown", // Reading the service log back, through the `logs` grant.
-    "log",      // The manual, read from `/system/manual`.
+    "shutdown",
+    // Reading the service log back, through the `logs` grant: the log service's client, typed at a
+    // shell like the rest of these.
+    "log",
+    // The manual, read from `/system/manual`, where the profile server projects each package's
+    // pages.
     "man",
 ];
 

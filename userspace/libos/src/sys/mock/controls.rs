@@ -33,6 +33,11 @@ pub fn fail_next_bind(status: i32) {
     with(|m| m.fail_bind = Some(status));
 }
 
+/// Refuse the next `ns_bind` at `path` with `status`, letting every other bind through.
+pub fn fail_bind_at(path: &str, status: i32) {
+    with(|m| m.fail_bind_at = Some((path.as_bytes().to_vec(), status)));
+}
+
 /// Complete the next file's or mount's flush with `status`.
 pub fn fail_next_sync(status: i32) {
     with(|m| m.fail_sync = Some(status));

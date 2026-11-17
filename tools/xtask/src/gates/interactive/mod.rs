@@ -313,14 +313,27 @@ fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> 
 fn interactive_manual(s: &mut Session) -> R<usize> {
     quietly(s, "man man", "prints the page named NAME")?;
     s.expect("/home>")?;
+    // No session can add a page or take one away: the count below says neither landed.
+    s.send("touch /system/manual/zz.1.md")?;
+    s.expect("touch: cannot create file")?;
+    s.expect("/home>")?;
+    s.send("remove /system/manual/man.1.md")?;
+    s.expect("remove: cannot remove file")?;
+    s.expect("/home>")?;
     // Wrapped, as the count alone would match a digit anywhere in the log.
     let pages = manual::pages()?.len();
     quietly(s, "format(\"pages={}\", man | count)", &format!("pages={pages}"))?;
     s.expect("/home>")?;
     quietly(s, "man 5 manual-page", "The contract between a page")?;
     s.expect("/home>")?;
-    println!("  ok: man printed its own page and a staged spec, and listed all {pages}");
-    Ok(3)
+    // The keyword's filter, which only `man` runs: one page is named so.
+    quietly(s, "let kw = man --keyword rsproto-auth | count", "/home>")?;
+    quietly(s, "format(\"kw={}\", kw)", "kw=1")?;
+    s.expect("/home>")?;
+    println!(
+        "  ok: man printed its own page and a staged spec, listed all {pages}, found one by keyword, and none changed"
+    );
+    Ok(6)
 }
 
 /// `test-interactive`'s steps 19d-1 to 19d-5: editing the line being typed, with the keys a serial

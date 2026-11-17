@@ -205,14 +205,18 @@ impl Stage {
     /// **Bytes that are not UTF-8 are shown replaced, not dropped**: an empty row in place of a
     /// body that did not decode would print a blank line and call it the answer.
     pub fn text_out(&self, text: &[u8]) -> bool {
+        self.text(text).unwrap_or(false)
+    }
+
+    /// [`text_out`](Self::text_out), saying why it did not write: `Ok(false)` with no `stdout`,
+    /// and the stream's error, `PeerClosed` for a reader that has gone, when the write failed.
+    pub fn text(&self, text: &[u8]) -> libstream::wire::Result<bool> {
         let text = String::from_utf8_lossy(text);
         let text: &str = &text;
-        self.stdout().is_some_and(|port| {
-            use libstream::channel::ChannelSink;
-            let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
-            let mut sink = ChannelSink::new(port, libkern::abi::IPC_PAYLOAD_SIZE);
-            libstream::table::write_text_fallback(&mut sink, &lines, 0).and_then(|()| sink.finish()).is_ok()
-        })
+        let Some(port) = self.stdout() else { return Ok(false) };
+        let lines: Vec<&str> = text.strip_suffix('\n').unwrap_or(text).split('\n').collect();
+        let mut sink = libstream::channel::ChannelSink::new(port, libkern::abi::IPC_PAYLOAD_SIZE);
+        libstream::table::write_text_fallback(&mut sink, &lines, 0).and_then(|()| sink.finish()).map(|()| true)
     }
 
     /// **`--help` and `--version`: the text, as what was asked for**, and exit 0. It goes to
@@ -371,6 +375,15 @@ mod tests {
         let (stage, (_, out_far), ..) = shell_stage(&[]);
         assert!(stage.text_out(b"a\nb\xff\n"));
         assert_eq!(rows(&out_far), ["a", "b\u{fffd}"]);
+    }
+
+    #[test]
+    fn text_to_a_reader_that_has_gone_says_so_and_writes_nothing_else() {
+        let (stage, (_, out_far), (err_far, _), _) = shell_stage(&[]);
+        drop(out_far);
+        assert_eq!(stage.text(b"a page\n"), Err(libstream::wire::WireError::PeerClosed));
+        let mut msg = libos::Msg::new();
+        assert!(err_far.recv(&mut msg).is_err(), "nothing went to stderr in its place");
     }
 
     #[test]

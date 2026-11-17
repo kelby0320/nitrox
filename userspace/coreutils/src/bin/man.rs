@@ -13,7 +13,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::manual;
+use coreutils::manual::{self, Found, Request};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
@@ -25,7 +25,8 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// The width a page is rendered at: a terminal's size is not known to a program yet.
+/// The width a page is rendered at, assumed while a program cannot learn its terminal's,
+/// `TODO(tty-size)`.
 const WIDTH: usize = 80;
 
 const FLAGS: [Flag; 1] =
@@ -43,13 +44,6 @@ const HELP: &[u8] = b"usage: man [SECTION] NAME\n       man [--keyword WORD]\n\
 
 const VERSION: &[u8] = b"man (nitrox coreutils) 0.1.0\n";
 
-/// One page found under [`manual::ROOT`].
-struct Page {
-    section: u8,
-    name: String,
-    text: String,
-}
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
@@ -66,59 +60,49 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     if args.version() {
         stage.answer(VERSION);
     }
-    let pages = pages(&stage);
-    if pages.is_empty() {
-        stage.die(b"man: no manual here (/system/manual is empty or not bound)\n", EXIT_FAILURE);
-    }
-
     let ops: Vec<&str> = args.operands.iter().map(String::as_str).collect();
-    if args.has("keyword") {
-        let [word] = ops.as_slice() else { stage.die(b"man: --keyword takes one WORD (try --help)\n", EXIT_USAGE) };
-        let found: Vec<&Page> =
-            pages.iter().filter(|p| manual::mentions(&p.name, &manual::summary(&p.text), word)).collect();
-        list(&stage, &found);
+    let request = manual::request(&ops, args.has("keyword")).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_USAGE));
+    let pages = pages(&stage).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_FAILURE));
+    if pages.is_empty() {
+        stage.die(b"man: no manual here (/system/manual holds no page)\n", EXIT_FAILURE);
     }
-    let (section, name) = match ops.as_slice() {
-        [] => list(&stage, &pages.iter().collect::<Vec<_>>()),
-        [name] => (None, *name),
-        [section, name] => match section.parse::<u8>() {
-            Ok(s) => (Some(s), *name),
-            Err(_) => stage.die(b"man: SECTION is a number (try --help)\n", EXIT_USAGE),
-        },
-        _ => stage.die(b"man: too many operands (try --help)\n", EXIT_USAGE),
+    let (section, name) = match request {
+        Request::List => list(&stage, &pages.iter().collect::<Vec<_>>()),
+        Request::Keyword(word) => {
+            list(&stage, &pages.iter().filter(|p| manual::mentions(&p.name, &p.summary(), word)).collect::<Vec<_>>())
+        }
+        Request::Page(section, name) => (section, name),
     };
-    let names: Vec<(u8, String)> = pages.iter().map(|p| (p.section, p.name.clone())).collect();
-    let Some(i) = manual::choose(&names, section, name) else {
-        let mut msg = String::from("man: no manual page for ");
-        msg.push_str(name);
-        msg.push('\n');
-        stage.die(msg.as_bytes(), EXIT_FAILURE);
-    };
-    stage.answer(manual::render(&pages[i].text, WIDTH, false).as_bytes())
+    let page = manual::answer(&pages, section, name, WIDTH).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_FAILURE));
+    // A reader that has gone wanted no more; any other failure is one.
+    match stage.text(page.as_bytes()) {
+        Ok(true) | Err(libstream::wire::WireError::PeerClosed) => {}
+        Ok(false) => log::write(page.as_bytes()),
+        Err(_) => stage.die(b"man: write failed\n", EXIT_FAILURE),
+    }
+    exit(EXIT_OK)
 }
 
-/// Every page under [`manual::ROOT`], by section and then by name.
-fn pages(stage: &Stage) -> Vec<Page> {
+/// Every page under [`manual::ROOT`], by name: one that cannot be read is kept, with why, so it is
+/// reported as such rather than as absent. `Err` says why the directory could not be listed.
+fn pages(stage: &Stage) -> Result<Vec<Found>, String> {
     let mut out = Vec::new();
-    let Ok(mut sections) = libfs::list_directory(&stage.namespace, manual::ROOT) else { return out };
-    sections.sort_by(|a, b| a.name().cmp(b.name()));
-    for s in &sections {
-        let Some(section) = core::str::from_utf8(s.name()).ok().and_then(|n| n.parse::<u8>().ok()) else { continue };
-        let dir = libfs::join(manual::ROOT.as_bytes(), s.name());
-        let Ok(mut files) = libfs::list_directory(&stage.namespace, &dir) else { continue };
-        files.sort_by(|a, b| a.name().cmp(b.name()));
-        for f in &files {
-            let Some(name) = core::str::from_utf8(f.name()).ok().and_then(|n| n.strip_suffix(".md")) else { continue };
-            let Ok(bytes) = libfs::read(&stage.namespace, &libfs::join(dir.as_bytes(), f.name())) else { continue };
-            let text = String::from_utf8_lossy(libfs::unpadded(&bytes)).into_owned();
-            out.push(Page { section, name: String::from(name), text });
-        }
+    let mut files = libfs::list_directory(&stage.namespace, manual::ROOT)
+        .map_err(|e| alloc::format!("man: cannot list {}: {e:?}\n", manual::ROOT))?;
+    files.sort_by(|a, b| a.name().cmp(b.name()));
+    for f in &files {
+        let Some((name, section)) = core::str::from_utf8(f.name()).ok().and_then(manual::page_of) else { continue };
+        let text = match libfs::read(&stage.namespace, &libfs::join(manual::ROOT.as_bytes(), f.name())) {
+            Ok(bytes) => Ok(String::from_utf8_lossy(libfs::unpadded(&bytes)).into_owned()),
+            Err(e) => Err(alloc::format!("{e:?}")),
+        };
+        out.push(Found { section, name, text });
     }
-    out
+    Ok(out)
 }
 
 /// Emit `pages` as the table `man` lists, and exit.
-fn list(stage: &Stage, pages: &[&Page]) -> ! {
+fn list(stage: &Stage, pages: &[&Found]) -> ! {
     let Some(port) = stage.stdout() else {
         for p in pages {
             let mut line = p.name.clone();
@@ -131,7 +115,7 @@ fn list(stage: &Stage, pages: &[&Page]) -> ! {
     exit(EXIT_OK)
 }
 
-fn emit(stage: &Stage, stdout: Port<'_>, pages: &[&Page]) {
+fn emit(stage: &Stage, stdout: Port<'_>, pages: &[&Found]) {
     let schema = Schema::new()
         .field("name", TypeTag::String, TypeModifiers::NONE)
         .field("section", TypeTag::Int, TypeModifiers::NONE)
@@ -139,8 +123,7 @@ fn emit(stage: &Stage, stdout: Port<'_>, pages: &[&Page]) {
     let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
     let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
         for p in pages {
-            let row =
-                [Value::Str(p.name.clone()), Value::Int(i64::from(p.section)), Value::Str(manual::summary(&p.text))];
+            let row = [Value::Str(p.name.clone()), Value::Int(i64::from(p.section)), Value::Str(p.summary())];
             tw.write_row(&row)?;
         }
         tw.finish_with_status(0)

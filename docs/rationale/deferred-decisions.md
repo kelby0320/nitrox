@@ -1534,6 +1534,18 @@ writable by others, which needs authority on the binding rather than the server.
 so `profile-server` strips the rights that write a file from every lookup it forwards, which keeps
 a program read-only through `/bin` and `/applications`; a process holding the root namespace, as a
 service spawned with it does, can still resolve `/store/...` with `MAP_WRITE` and map it so.
+`/system/manual` is a third projection of the same server (2026-11-17), for the reason below.
+
+**Every session can write `/system/fonts` — `TODO(writable-fonts)`.** `libsession` binds the root
+filesystem's server into each session scoped to `/system/fonts`, and the root's one mount is
+writable, so a session can add, replace or remove a font that every client of the compositor, in
+every session, then draws with: the case above, reached by every session. The manual's pages were
+bound the same way until they moved into a store package that `profile-server` projects at
+`/system/manual` (2026-11-17), where nothing can write them. The fonts were left as they were, to
+keep that change to the manual, though nothing stops them following it: `libdraw::load_font` looks
+a font up for `MAP_READ | INSPECT` and maps it, rights a projection passes, as it does a
+program's. Either fix closes it: the fonts in a store package projected the same way, or
+authority on the binding. Trigger: the next change to how fonts are staged or found.
 
 **Per-stage attribution in `PipelineStatus` — `TODO(pipeline-stage-attribution)`.**
 §1 makes `PipelineStatus` a headline: a composite exit status with one `StageStatus` per stage, in
@@ -1684,7 +1696,8 @@ its row:
   draws wrong.
 
 Backspace alone was always wrong there; cursor keys make the case reachable mid-line. The
-completion listing is wrapped at 80 columns for the same reason (`userspace/nxsh/src/complete.rs`).
+completion listing is wrapped at 80 columns for the same reason (`userspace/nxsh/src/complete.rs`),
+and so is every page `man` prints (`userspace/coreutils/src/bin/man.rs`).
 
 Trigger: a terminal size on the tty protocol. With one, the shell knows when the cursor reaches the
 last column and can step across a wrap.

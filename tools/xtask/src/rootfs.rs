@@ -108,6 +108,8 @@ pub(crate) fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         .map_err(|e| format!("stage the {exec} desktop entry: {e}"))?;
     }
     println!("xtask: store package {cu_store}/applications/ ({} entries)", GRAPHICAL_APPLICATIONS.len());
+    // **The manual's pages**, beside `man` in its package, projected read-only at `/system/manual`.
+    stage_manual(&staging.join(cu_store.trim_start_matches('/')).join("manual"))?;
 
     let sys_store = store_path_for_all(SYSTEM_SERVICES, "system", "0.1.0")?;
     let sys_bin = staging.join(sys_store.trim_start_matches('/')).join("bin");
@@ -157,8 +159,6 @@ pub(crate) fn stage_rootfs(staging: &Path, mode: BuildMode) -> R<()> {
         }
         println!("xtask: seeded /system/fonts ({} files, {total} bytes)", faces.len());
     }
-
-    stage_manual(staging)?;
 
     // `/system/licenses`: each crates.io crate's licence texts, which ask that a copy of the
     // software carry them, and the project's own.

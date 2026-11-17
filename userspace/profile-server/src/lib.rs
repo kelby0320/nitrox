@@ -17,7 +17,7 @@ pub mod projection {
     ///
     /// A fixed list, so a store package's contents never decide what appears in a namespace:
     /// a package is data, not policy.
-    pub const PROJECTED: [&str; 2] = ["bin", "applications"];
+    pub const PROJECTED: [&str; 3] = ["bin", "applications", "manual"];
 
     /// Split a resolve suffix into the projection it names and the entry within it, or `None` if it
     /// names no projection this server offers.
@@ -48,6 +48,8 @@ pub mod projection {
             assert_eq!(split_suffix("bin/list"), Some(("bin", "list")));
             assert_eq!(split_suffix("applications"), Some(("applications", "")));
             assert_eq!(split_suffix("applications/nxterm.toml"), Some(("applications", "nxterm.toml")));
+            assert_eq!(split_suffix("manual"), Some(("manual", "")));
+            assert_eq!(split_suffix("manual/man.1.md"), Some(("manual", "man.1.md")));
 
             // A program *called* `applications`.
             assert_eq!(split_suffix("bin/applications"), Some(("bin", "applications")));

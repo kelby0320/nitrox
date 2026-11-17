@@ -121,9 +121,18 @@ fn a_pipe_in_code_or_escaped_stays_in_its_cell() {
 
 #[test]
 fn a_summary_is_what_the_first_heading_says_after_its_dash() {
-    assert_eq!(summary("# man — read the **manual**\n\nbody"), "read the manual");
-    assert_eq!(summary("# Syscall ABI\n"), "Syscall ABI");
-    assert_eq!(summary("no heading"), "");
+    assert_eq!(summary("# man — read the **manual**\n\nbody", "man"), "read the manual");
+    assert_eq!(summary("# Syscall ABI\n", "syscalls"), "Syscall ABI");
+    assert_eq!(summary("no heading", "x"), "");
+}
+
+/// A spec's heading names its subject before the dash, not the page: all of it is the summary, so
+/// a search for its subject finds it.
+#[test]
+fn a_heading_that_does_not_name_its_page_is_its_whole_summary() {
+    let page = "# RS Protocol — Auth operations\n\nbody";
+    assert_eq!(summary(page, "rsproto-auth"), "RS Protocol — Auth operations");
+    assert!(mentions("rsproto-auth", &summary(page, "rsproto-auth"), "protocol"));
 }
 
 /// Every page this system stages, at the width a terminal is assumed to have: no line wider, but
@@ -194,12 +203,95 @@ fn a_name_means_the_page_in_its_section_or_the_first_in_order() {
     assert_eq!(choose(&pages, Some(8), "services"), Some(3), "or the one named");
     assert_eq!(choose(&pages, Some(1), "shell"), None, "not in that section");
     assert_eq!(choose(&pages, None, "storage"), Some(6), "a service before an overview");
+    // The rest of the order, a pair at a time: 8 before 2, 2 before 5, 5 before 7.
+    let pair = |a: u8, b: u8| [(a, String::from("x")), (b, String::from("x"))];
+    assert_eq!(choose(&pair(2, 8), None, "x"), Some(1), "8 before 2");
+    assert_eq!(choose(&pair(5, 2), None, "x"), Some(1), "2 before 5");
+    assert_eq!(choose(&pair(7, 5), None, "x"), Some(1), "5 before 7");
     assert_eq!(choose(&pages, None, "nothing"), None);
 }
 
 #[test]
 fn a_keyword_is_looked_for_in_the_name_and_the_summary_case_aside() {
     assert!(mentions("list", "a directory as a table", "TABLE"));
+    assert!(mentions("list", "A Directory as a TABLE", "table"), "the summary's case aside too");
     assert!(mentions("Init.toml", "", "init"));
     assert!(!mentions("list", "a directory", "file"));
+}
+
+#[test]
+fn a_page_file_names_its_page_and_its_section() {
+    assert_eq!(page_of("man.1.md"), Some((String::from("man"), 1)));
+    assert_eq!(page_of("init.toml.5.md"), Some((String::from("init.toml"), 5)), "a name with a dot");
+    for not in ["man.md", "man.x.md", ".1.md", "man.1.txt", "man.1"] {
+        assert_eq!(page_of(not), None, "{not}");
+    }
+}
+
+#[test]
+fn a_request_is_read_from_the_operands_or_refused() {
+    assert_eq!(request(&[], false), Ok(Request::List));
+    assert_eq!(request(&["list"], false), Ok(Request::Page(None, "list")));
+    assert_eq!(request(&["5", "init.toml"], false), Ok(Request::Page(Some(5), "init.toml")));
+    assert_eq!(request(&["table"], true), Ok(Request::Keyword("table")));
+    assert!(request(&["x", "list"], false).is_err_and(|e| e.contains("SECTION is a number")));
+    assert!(request(&["1", "2", "3"], false).is_err_and(|e| e.contains("too many")));
+    for ops in [&[][..], &["a", "b"][..]] {
+        assert!(request(ops, true).is_err_and(|e| e.contains("one WORD")), "{ops:?}");
+    }
+}
+
+#[test]
+fn a_page_that_cannot_be_read_says_so_rather_than_that_it_is_not_there() {
+    let found = |section, name: &str, text: Result<&str, &str>| Found {
+        section,
+        name: String::from(name),
+        text: text.map(String::from).map_err(String::from),
+    };
+    let pages = [found(1, "list", Ok("# list — a directory\n\nBody.\n")), found(2, "syscalls", Err("TooLarge"))];
+    assert!(answer(&pages, None, "list", 80).is_ok_and(|p| p.contains("Body.")));
+    assert_eq!(
+        answer(&pages, None, "syscalls", 80),
+        Err(String::from("man: syscalls(2) could not be read: TooLarge\n"))
+    );
+    assert_eq!(answer(&pages, None, "nothing", 80), Err(String::from("man: no manual page for nothing\n")));
+    assert_eq!(pages[1].summary(), "(could not be read: TooLarge)", "and listed as such");
+    assert_eq!(pages[0].summary(), "a directory");
+}
+
+/// Markdown the renderer does not model is drawn as the text it is, not dropped.
+#[test]
+fn what_is_not_markup_is_kept_as_text() {
+    let one = |page: &str| plain(page, 80).join("\n");
+    assert_eq!(one("Glob *.md and *.rs files.\n"), "    Glob *.md and *.rs files.");
+    assert_eq!(one("Raise 2 ** 3 here.\n"), "    Raise 2 ** 3 here.");
+    assert_eq!(one("# Using C#\n"), "Using C#");
+    assert_eq!(one("# Closed ##\n"), "Closed");
+    assert_eq!(one("Index [1, 2][0] here.\n"), "    Index [1, 2][0] here.");
+    assert_eq!(one("Hello![x and more.\n"), "    Hello![x and more.");
+    assert_eq!(one("<!-- note --> Text after.\n"), "    Text after.");
+    let table = plain("| A | B |\n|---|---|\n| 1 | 2 | 3 |\n| ``a | b`` | x |\n", 80);
+    assert!(table.iter().any(|l| l.trim_end().ends_with('3')), "an extra cell: {table:?}");
+    assert!(table.iter().any(|l| l.contains("a | b")), "a pipe in a double-backtick span: {table:?}");
+    let fenced = render_lines("````\n```\ninside\n````\n", 80, false);
+    assert_eq!(fenced.iter().filter(|l| l.code).count(), 2, "a shorter fence inside a longer one: {fenced:?}");
+}
+
+/// A page is text: what a terminal would act on rather than draw never reaches it.
+#[test]
+fn a_page_carries_no_control_character_to_the_terminal() {
+    let page = "Hello \x1b[2J\x1b]0;title\x07 there `\x1b[31mred` x.\n\n```\ncode\x1b[H\there\n```\n";
+    for styled in [false, true] {
+        let out = render(page, 80, styled);
+        let stray: String = out.replace("\x1b[0m", "").replace("\x1b[36m", "");
+        assert!(!stray.chars().any(|c| c.is_control() && c != '\n'), "styled {styled}: {out:?}");
+    }
+    assert!(render(page, 80, false).contains("code[H    here"), "a tab is spaces and the rest is drawn");
+}
+
+/// A word made of several runs, as `(`a/b.rs`)` is, moves to the next line whole.
+#[test]
+fn a_line_never_breaks_inside_a_word_made_of_runs() {
+    let lines = plain("Some words then (`x/y/z.rs`) and more.\n", 4 + 20);
+    assert_eq!(lines, ["    Some words then", "    (x/y/z.rs) and more."], "{lines:?}");
 }

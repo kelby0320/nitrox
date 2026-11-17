@@ -31,10 +31,12 @@ pub struct Members<'a> {
     pub home: &'a str,
     /// The user's name, snapshotted at `/session/user`.
     pub user: &'a [u8],
-    /// Bind `/system/fonts` read-only; **a flag** because a member bound for nothing is still
-    /// authority held (`session-mgr/CLAUDE.md`).
+    /// Bind `/system/fonts`, which the session can write, `TODO(writable-fonts)`; **a flag** because
+    /// a member bound for nothing is still authority held (`session-mgr/CLAUDE.md`).
     pub bind_fonts: bool,
-    /// Bind `/system/manual` read-only, the pages `man` shows: for whoever has a shell to run it.
+    /// Bind `/system/manual`, the pages `man` shows, for whoever has a shell to run it: the profile
+    /// server's projection of each package's `manual/`, **read-only by that server**, which hands
+    /// out no write right and refuses every change.
     pub bind_manual: bool,
     /// Bind `/dev/console`. **False for a graphical session** (`graphical-session.md`, governing
     /// decision 3); the serial column binds it as its terminal.
@@ -230,7 +232,8 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
         log::write(b"libsession: /dev/services bind FAIL (no service list in this session)\n");
     }
 
-    // `/system/fonts` → the fs-server scoped to that subtree. Read-only: no writable handle.
+    // `/system/fonts` → the root's fs-server scoped to that subtree, which every session can write
+    // through, `TODO(writable-fonts)`.
     if bind_fonts
         && let Some(fs) = fs_endpoint
         && ns.bind_server("/system/fonts", fs, "/system/fonts").is_err()
@@ -238,10 +241,12 @@ pub fn build_namespace(members: &Members<'_>) -> Option<Constructed> {
         log::write(b"libsession: /system/fonts bind FAIL (clients cannot render text)\n");
     }
 
-    // `/system/manual` → the same, scoped to the manual's subtree.
+    // `/system/manual` → the profile server's projection, not the filesystem's subtree: the kernel
+    // does not narrow a forwarded resolve's rights (`TODO(mount-write-authority)`), and a subtree of
+    // the root's server could be written by every session.
     if bind_manual
-        && let Some(fs) = fs_endpoint
-        && ns.bind_server("/system/manual", fs, "/system/manual").is_err()
+        && let Some(profile) = profile_endpoint
+        && ns.bind_server("/system/manual", profile, "/manual").is_err()
     {
         log::write(b"libsession: /system/manual bind FAIL (man finds no pages)\n");
     }

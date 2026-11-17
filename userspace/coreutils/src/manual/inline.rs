@@ -55,8 +55,9 @@ pub fn runs(text: &str) -> Vec<Run> {
     let mut cur = String::new();
     let mut i = 0;
     let flush = |out: &mut Vec<Run>, cur: &mut String, style: Style| {
-        if !cur.is_empty() {
-            out.push(Run { text: core::mem::take(cur), style });
+        let text = printable(&core::mem::take(cur));
+        if !text.is_empty() {
+            out.push(Run { text, style });
         }
     };
     while i < chars.len() {
@@ -72,7 +73,7 @@ pub fn runs(text: &str) -> Vec<Run> {
                     Some(end) => {
                         flush(&mut out, &mut cur, style);
                         let code: String = chars[i + ticks..end].iter().collect();
-                        out.push(Run { text: String::from(code.trim()), style: style.with(CODE) });
+                        out.push(Run { text: printable(code.trim()), style: style.with(CODE) });
                         i = end + ticks;
                     }
                     None => {
@@ -81,17 +82,21 @@ pub fn runs(text: &str) -> Vec<Run> {
                     }
                 }
             }
-            '*' if chars.get(i + 1) == Some(&'*') => {
+            '*' if chars.get(i + 1) == Some(&'*') && delimits(&chars, i, 2, style.bold) => {
                 flush(&mut out, &mut cur, style);
                 style.bold = !style.bold;
                 i += 2;
             }
-            '*' if emphasis_marker(&chars, i, style.emph) => {
+            '*' if chars.get(i + 1) == Some(&'*') => {
+                cur.push_str("**");
+                i += 2;
+            }
+            '*' if delimits(&chars, i, 1, style.emph) => {
                 flush(&mut out, &mut cur, style);
                 style.emph = !style.emph;
                 i += 1;
             }
-            '!' if chars.get(i + 1) == Some(&'[') => i += 1,
+            '!' if chars.get(i + 1) == Some(&'[') && link(&chars, i + 1).is_some() => i += 1,
             '[' => match link(&chars, i) {
                 Some((label, end)) => {
                     flush(&mut out, &mut cur, style);
@@ -156,20 +161,33 @@ fn find_ticks(chars: &[char], from: usize, n: usize) -> Option<usize> {
     None
 }
 
-/// Whether the `*` at `i` opens or closes emphasis, rather than being an asterisk, as in `a * b`.
-fn emphasis_marker(chars: &[char], i: usize, open: bool) -> bool {
+/// Whether the `n` asterisks at `i` close the style that is `open`, or open it, rather than being
+/// asterisks, as in `a * b`, `*.md and *.rs` or `2 ** 3`. One opens with a word after it, at a
+/// word's start, and only if a closer follows: `n` asterisks with a word before them.
+fn delimits(chars: &[char], i: usize, n: usize, open: bool) -> bool {
     let before = i.checked_sub(1).map(|j| chars[j]);
-    let after = chars.get(i + 1).copied();
+    let after = chars.get(i + n).copied();
+    let closes_at = |j: usize| {
+        chars[j..].iter().take(n).all(|&c| c == '*')
+            && chars.get(j + n) != Some(&'*')
+            && j.checked_sub(1).is_some_and(|k| !chars[k].is_whitespace() && chars[k] != '*')
+    };
     if open {
-        before.is_some_and(|c| !c.is_whitespace())
-    } else {
-        after.is_some_and(|c| !c.is_whitespace() && c != '*')
-            && before.is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation())
-            && chars[i + 1..].contains(&'*')
+        return closes_at(i);
     }
+    after.is_some_and(|c| !c.is_whitespace() && c != '*')
+        && before.is_none_or(|c| c.is_whitespace() || c.is_ascii_punctuation())
+        && (i + n + 1..chars.len()).any(closes_at)
 }
 
-/// A link at `i`, `[label](url)` or `[label][ref]`: its label, and where it ends.
+/// `s` with what a terminal would act on rather than draw taken out: a page is text, and a page
+/// that carried an escape could clear or redraw the reader's terminal. A tab is a space.
+pub fn printable(s: &str) -> String {
+    s.chars().filter_map(|c| if c == '\t' { Some(' ') } else { (!c.is_control()).then_some(c) }).collect()
+}
+
+/// A link at `i`, `[label](address)`: its label, and where it ends. `[label][ref]` is text, as it is
+/// to Markdown with no definition of `ref`, and no page has one.
 fn link(chars: &[char], i: usize) -> Option<(String, usize)> {
     let mut depth = 0;
     let mut close = None;
@@ -187,12 +205,10 @@ fn link(chars: &[char], i: usize) -> Option<(String, usize)> {
         }
     }
     let close = close?;
-    let end = match chars.get(close + 1)? {
-        '(' => ')',
-        '[' => ']',
-        _ => return None,
-    };
-    let stop = chars[close + 2..].iter().position(|&c| c == end)? + close + 2;
+    if chars.get(close + 1) != Some(&'(') {
+        return None;
+    }
+    let stop = chars[close + 2..].iter().position(|&c| c == ')')? + close + 2;
     Some((chars[i + 1..close].iter().collect(), stop + 1))
 }
 

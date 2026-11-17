@@ -71,8 +71,9 @@ pattern as [supervisor-mediated registration](../rationale/why-supervisor-regist
 userspace server's reply carries (`TODO(mount-write-authority)`), and the root filesystem is one
 writable mount, so `profile-server` strips the rights that write a file from every lookup it
 forwards ([`profiles-and-namespace-projection.md`](profiles-and-namespace-projection.md)). That
-keeps a program read-only through `/bin` and `/applications`; a process holding the root
-namespace can still resolve a store path writable. The design below is what the deferral builds:
+keeps a program read-only through `/bin` and `/applications`, and a page through
+`/system/manual`; a process holding the root namespace can still resolve a store path writable.
+The design below is what the deferral builds:
 
 - **Every normal process's namespace binds `/store` with `LOOKUP | READ | MAP_READ`
   — but not `WRITE` or `MAP_WRITE`.** The kernel attenuates rights at lookup time

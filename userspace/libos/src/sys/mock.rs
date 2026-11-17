@@ -174,6 +174,7 @@ struct Mock {
     fail_wait: Option<i64>,
     fail_submit: Option<i32>,
     fail_bind: Option<i32>,
+    fail_bind_at: Option<(Vec<u8>, i32)>,
     fail_sync: Option<i32>,
     fail_thread: Option<i32>,
     fail_recv: Option<i32>,
@@ -774,6 +775,9 @@ fn plain_lookup(ns: u64, path: &[u8], rights: u64) -> i64 {
 pub fn ns_bind(ns: u64, path: &[u8], resource: u64, base: &[u8]) -> i64 {
     with(|m| {
         if let Some(status) = m.fail_bind.take() {
+            return status as i64;
+        }
+        if let Some((_, status)) = m.fail_bind_at.take_if(|(at, _)| at.as_slice() == path) {
             return status as i64;
         }
         let ns = match m.namespace(ns, Rights::BIND) {

@@ -1,5 +1,6 @@
-//! The manual staged onto the root, at `/system/manual/<section>/<name>.md`: `docs/manual`'s
-//! pages, and the specs that are pages too.
+//! The manual staged into the coreutils package's `manual/`, as `<name>.<section>.md`: `docs/manual`'s
+//! pages, and the specs that are pages too. The profile server projects it, read-only, at
+//! `/system/manual`.
 
 use crate::*;
 
@@ -68,16 +69,26 @@ pub(crate) fn pages() -> R<Vec<(u8, String, PathBuf)>> {
     Ok(out)
 }
 
-/// Stage every page under `staging`'s `/system/manual`.
-pub(crate) fn stage_manual(staging: &Path) -> R<()> {
-    let root = staging.join("system").join("manual");
-    let pages = pages()?;
-    for (section, name, from) in &pages {
-        let dir = root.join(section.to_string());
-        fs::create_dir_all(&dir)?;
-        fs::copy(from, dir.join(format!("{name}.md"))).map_err(|e| format!("stage {}: {e}", from.display()))?;
+/// Every page's staged name and text, for the hash of the package that carries them.
+pub(crate) fn manual_bytes() -> R<Vec<u8>> {
+    let mut out = Vec::new();
+    for (section, name, from) in pages()? {
+        out.extend(format!("{name}.{section}.md\0").bytes());
+        out.extend(fs::read(&from).map_err(|e| format!("read {}: {e}", from.display()))?);
     }
-    println!("xtask: seeded /system/manual ({} pages)", pages.len());
+    Ok(out)
+}
+
+/// Stage every page into `dir`, a package's `manual/`, flat: the profile server's projections hold
+/// no directories.
+pub(crate) fn stage_manual(dir: &Path) -> R<()> {
+    let pages = pages()?;
+    fs::create_dir_all(dir)?;
+    for (section, name, from) in &pages {
+        let to = dir.join(format!("{name}.{section}.md"));
+        fs::copy(from, to).map_err(|e| format!("stage {}: {e}", from.display()))?;
+    }
+    println!("xtask: store package {} ({} pages)", dir.display(), pages.len());
     Ok(())
 }
 
@@ -108,6 +119,38 @@ mod tests {
         for (spec, _, _) in STAGED_SPECS {
             assert!(repo_root().join("docs/spec").join(spec).exists(), "{spec} is gone");
         }
+    }
+
+    /// One flat directory of `<name>.<section>.md`, as the profile server projects and `man` reads.
+    #[test]
+    fn the_pages_are_staged_flat_by_name_and_section() {
+        let dir = std::env::temp_dir().join(format!("xtask-manual-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        stage_manual(&dir).unwrap();
+        let mut names: Vec<String> =
+            fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names.len(), pages().unwrap().len(), "one file a page, and no directory");
+        for want in ["man.1.md", "init.toml.5.md", "syscalls.2.md", "intro.7.md"] {
+            assert!(names.iter().any(|n| n == want), "{want} in {names:?}");
+        }
+        assert_eq!(
+            fs::read(dir.join("man.1.md")).unwrap(),
+            fs::read(repo_root().join("docs/manual/1/man.md")).unwrap()
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A changed page moves the package that carries it, and only that one.
+    #[test]
+    fn the_manual_is_hashed_into_the_package_that_ships_man() {
+        let elf = |b: &str| -> R<Vec<u8>> { Ok(format!("ELF {b}").into_bytes()) };
+        let page = fs::read(repo_root().join("docs/manual/1/man.md")).unwrap();
+        let has = |bytes: &[u8], what: &[u8]| bytes.windows(what.len()).any(|w| w == what);
+        let with_man = package_bytes(&["list", "man"], &elf).unwrap();
+        assert!(has(&with_man, &page) && has(&with_man, b"man.1.md\0"), "a page's text and its name");
+        let without = package_bytes(&["list", "nxsh"], &elf).unwrap();
+        assert!(!has(&without, b"man.1.md\0"), "not a package without man");
     }
 
     #[test]

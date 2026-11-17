@@ -8,7 +8,7 @@ use alloc::vec::Vec;
 
 mod inline;
 
-use inline::{Run, Style, runs};
+use inline::{Run, Style, printable, runs};
 
 /// How far a page's body sits in from its headings.
 pub const BODY_INDENT: usize = 4;
@@ -58,8 +58,17 @@ pub struct Line {
     pub code: bool,
 }
 
-/// Where the pages are: `<section>/<name>.md` under it.
+/// Where the pages are, each `<name>.<section>.md`: the profile server's projection of each
+/// package's `manual/`, which no session can write.
 pub const ROOT: &str = "/system/manual";
+
+/// A page file's name and section, from `<name>.<section>.md`; a name may hold dots of its own, as
+/// `init.toml.5.md` does.
+pub fn page_of(file: &str) -> Option<(String, u8)> {
+    let (name, section) = file.strip_suffix(".md")?.rsplit_once('.')?;
+    let section = section.parse::<u8>().ok()?;
+    (!name.is_empty()).then(|| (String::from(name), section))
+}
 
 /// The sections a name is looked for in, in order, when none is named: commands, then services,
 /// then the rest by number.
@@ -81,14 +90,74 @@ pub fn mentions(name: &str, summary: &str, word: &str) -> bool {
     name.to_lowercase().contains(&word) || summary.to_lowercase().contains(&word)
 }
 
-/// What a page's first heading says it is: `# name — what it is` gives the part after the dash,
-/// and a heading with no dash is its own summary.
-pub fn summary(page: &str) -> String {
+/// What page `name`'s first heading says it is: `# name — what it is` gives the part after the
+/// dash; any other heading, as a spec's `# RS Protocol — Auth operations`, is its own summary.
+pub fn summary(page: &str, name: &str) -> String {
     let first = page.lines().find_map(|l| l.strip_prefix("# ")).unwrap_or("");
     let plain = plain_text(first);
     match plain.split_once(" — ") {
-        Some((_, what)) => what.trim().to_string(),
-        None => plain.trim().to_string(),
+        Some((named, what)) if named.trim() == name => what.trim().to_string(),
+        _ => plain.trim().to_string(),
+    }
+}
+
+/// What `man` was asked, from its operands and whether `--keyword` was given.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Request<'a> {
+    /// Every page.
+    List,
+    /// The pages mentioning a word.
+    Keyword(&'a str),
+    /// A page, in a section or the first of that name.
+    Page(Option<u8>, &'a str),
+}
+
+/// `man`'s operands as a [`Request`], or the usage error to print.
+pub fn request<'a>(operands: &[&'a str], keyword: bool) -> Result<Request<'a>, &'static str> {
+    match (keyword, operands) {
+        (true, [word]) => Ok(Request::Keyword(word)),
+        (true, _) => Err("man: --keyword takes one WORD (try --help)\n"),
+        (false, []) => Ok(Request::List),
+        (false, [name]) => Ok(Request::Page(None, name)),
+        (false, [section, name]) => match section.parse::<u8>() {
+            Ok(s) => Ok(Request::Page(Some(s), name)),
+            Err(_) => Err("man: SECTION is a number (try --help)\n"),
+        },
+        _ => Err("man: too many operands (try --help)\n"),
+    }
+}
+
+/// One page found under [`ROOT`]: its text, or why it could not be read.
+#[derive(Debug, PartialEq)]
+pub struct Found {
+    /// Its section.
+    pub section: u8,
+    /// Its name.
+    pub name: String,
+    /// Its text, or what reading it said.
+    pub text: Result<String, String>,
+}
+
+impl Found {
+    /// What `man`'s listing says of it: its summary, or that it could not be read.
+    pub fn summary(&self) -> String {
+        match &self.text {
+            Ok(text) => summary(text, &self.name),
+            Err(why) => alloc::format!("(could not be read: {why})"),
+        }
+    }
+}
+
+/// Page `name`, in `section` or the first of that name, rendered at `width`; or what to say
+/// instead: that there is no such page, or that there is and it could not be read.
+pub fn answer(pages: &[Found], section: Option<u8>, name: &str, width: usize) -> Result<String, String> {
+    let names: Vec<(u8, String)> = pages.iter().map(|p| (p.section, p.name.clone())).collect();
+    let Some(i) = choose(&names, section, name) else {
+        return Err(alloc::format!("man: no manual page for {name}\n"));
+    };
+    match &pages[i].text {
+        Ok(text) => Ok(render(text, width, false)),
+        Err(why) => Err(alloc::format!("man: {name}({}) could not be read: {why}\n", pages[i].section)),
     }
 }
 
@@ -146,7 +215,7 @@ fn lay_out(block: &Block, width: usize, styled: bool, out: &mut Vec<Line>) {
         Block::Code(lines) => {
             for l in lines {
                 let mut s = " ".repeat(BODY_INDENT * 2);
-                s.push_str(l);
+                s.push_str(&printable(&l.replace('\t', "    ")));
                 out.push(Line { text: s, code: true });
             }
         }
@@ -180,7 +249,8 @@ fn list(items: &[Item], indent: usize, width: usize, styled: bool, out: &mut Vec
 }
 
 fn table(head: &[String], rows: &[Vec<String>], width: usize, styled: bool, out: &mut Vec<Line>) {
-    let n = head.len();
+    // As many columns as the widest row: a cell past the header's is drawn under an empty name.
+    let n = rows.iter().map(Vec::len).chain([head.len()]).max().unwrap_or(0);
     let cells = |row: &[String], i: usize| row.get(i).map(|c| runs(c)).unwrap_or_default();
     let natural: Vec<usize> = (0..n)
         .map(|i| {
@@ -300,15 +370,14 @@ fn visible_str(s: &str) -> usize {
 /// A word longer than a line is broken, so no line is wider than asked.
 fn wrap(r: &[Run], width: usize, first: usize, rest: usize, styled: bool) -> Vec<String> {
     let mut w = Wrapper { width: width.max(1), rest, lines: Vec::new(), line: String::new(), used: 0, indent: first };
-    for (word, style, space_before) in words(r) {
-        let mut word: Vec<char> = word.chars().collect();
+    for (mut word, space_before) in words(r) {
         loop {
             let gap = usize::from(w.used > 0 && space_before);
             if w.used + gap + word.len() <= w.width {
                 if gap == 1 {
                     w.line.push(' ');
                 }
-                paint(&mut w.line, &word.iter().collect::<String>(), style, styled);
+                paint_word(&mut w.line, &word, styled);
                 w.used += gap + word.len();
                 break;
             }
@@ -317,8 +386,8 @@ fn wrap(r: &[Run], width: usize, first: usize, rest: usize, styled: bool) -> Vec
                 continue;
             }
             // A word wider than a whole line is broken where the line ends.
-            let tail: Vec<char> = word.split_off(w.width);
-            paint(&mut w.line, &word.iter().collect::<String>(), style, styled);
+            let tail = word.split_off(w.width);
+            paint_word(&mut w.line, &word, styled);
             w.used = w.width;
             w.flush();
             word = tail;
@@ -328,6 +397,17 @@ fn wrap(r: &[Run], width: usize, first: usize, rest: usize, styled: bool) -> Vec
         w.flush();
     }
     w.lines
+}
+
+/// Paint `word`, each run of one style in it as that style.
+fn paint_word(line: &mut String, word: &[(char, Style)], styled: bool) {
+    let mut i = 0;
+    while i < word.len() {
+        let style = word[i].1;
+        let end = word[i..].iter().position(|c| c.1 != style).map_or(word.len(), |n| i + n);
+        paint(line, &word[i..end].iter().map(|c| c.0).collect::<String>(), style, styled);
+        i = end;
+    }
 }
 
 /// [`wrap`]'s state: the lines so far, and the one being filled.
@@ -363,34 +443,42 @@ fn paint(line: &mut String, text: &str, style: Style, styled: bool) {
     }
 }
 
-/// `r`'s words: each with its style, and whether a space came before it. A word split across
-/// runs, as in `**bold**ing`, is one word with no space between its parts.
-fn words(r: &[Run]) -> Vec<(String, Style, bool)> {
+/// `r`'s words, each a character at a time with its style, and whether a space came before it. A
+/// word split across runs, as `**bold**ing` or `(`code`)` is, is one word: a line never breaks
+/// between its parts.
+fn words(r: &[Run]) -> Vec<(Vec<(char, Style)>, bool)> {
     let mut out = Vec::new();
-    let mut space = false;
-    for run in r {
-        let mut word = String::new();
-        for c in run.text.chars() {
-            if c.is_whitespace() {
-                if !word.is_empty() {
-                    out.push((core::mem::take(&mut word), run.style, space));
-                }
-                space = true;
-            } else {
-                word.push(c);
+    let mut word = Vec::new();
+    let (mut space, mut space_before) = (false, false);
+    for c in r.iter().flat_map(|run| run.text.chars().map(move |c| (c, run.style))) {
+        if c.0.is_whitespace() {
+            if !word.is_empty() {
+                out.push((core::mem::take(&mut word), space_before));
             }
+            space = true;
+        } else {
+            if word.is_empty() {
+                space_before = core::mem::take(&mut space);
+            }
+            word.push(c);
         }
-        if !word.is_empty() {
-            out.push((word, run.style, space));
-            space = false;
-        }
+    }
+    if !word.is_empty() {
+        out.push((word, space_before));
     }
     out
 }
 
 /// `page` as blocks.
 fn parse(page: &str) -> Vec<Block> {
-    let lines: Vec<&str> = page.lines().collect();
+    // A comment closed on its own line with text after it gives the line that text.
+    let lines: Vec<&str> = page
+        .lines()
+        .map(|l| match l.trim_start().strip_prefix("<!--").and_then(|r| r.split_once("-->")) {
+            Some((_, after)) if !after.trim().is_empty() => after,
+            _ => l,
+        })
+        .collect();
     let mut blocks = Vec::new();
     let mut i = 0;
     while i < lines.len() {
@@ -407,7 +495,7 @@ fn parse(page: &str) -> Vec<Block> {
         } else if let Some(fence) = fence(t) {
             let mut code = Vec::new();
             i += 1;
-            while i < lines.len() && !lines[i].trim_start().starts_with(fence) {
+            while i < lines.len() && !closes(lines[i], fence) {
                 code.push(String::from(lines[i]));
                 i += 1;
             }
@@ -537,15 +625,29 @@ fn marker(line: &str) -> Option<(String, &str)> {
     None
 }
 
-fn fence(t: &str) -> Option<&'static str> {
-    [("```", "```"), ("~~~", "~~~")].into_iter().find(|(open, _)| t.starts_with(open)).map(|(_, close)| close)
+/// A fence opening a code block: its character and how many, three or more.
+fn fence(t: &str) -> Option<(char, usize)> {
+    let c = t.chars().next().filter(|&c| c == '`' || c == '~')?;
+    let n = t.chars().take_while(|&x| x == c).count();
+    (n >= 3).then_some((c, n))
+}
+
+/// Whether `line` closes the block `open` opened: as many of its character or more, and nothing
+/// else.
+fn closes(line: &str, open: (char, usize)) -> bool {
+    let t = line.trim();
+    t.chars().count() >= open.1 && t.chars().all(|c| c == open.0)
 }
 
 fn heading(t: &str) -> Option<(usize, &str)> {
     let level = t.chars().take_while(|&c| c == '#').count();
     let rest = t.get(level..)?;
     (1..=6).contains(&level).then_some(())?;
-    rest.strip_prefix(' ').map(|text| (level, text.trim().trim_end_matches('#').trim_end()))
+    let text = rest.strip_prefix(' ')?.trim();
+    // A closing run of `#` only after a space, so `# Using C#` keeps its own.
+    let bare = text.trim_end_matches('#');
+    let text = if bare.is_empty() || bare.ends_with(' ') { bare.trim_end() } else { text };
+    Some((level, text))
 }
 
 fn is_rule(t: &str) -> bool {
@@ -579,7 +681,8 @@ fn cells(row: &str) -> Vec<String> {
     let row = row.strip_suffix('|').filter(|r| !r.ends_with('\\')).unwrap_or(row);
     let mut out = Vec::new();
     let mut cell = String::new();
-    let mut in_code = false;
+    // The length of the backtick run that opened the code span the cell is in, if it is in one.
+    let mut code: Option<usize> = None;
     let mut chars = row.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
@@ -588,10 +691,19 @@ fn cells(row: &str) -> Vec<String> {
                 chars.next();
             }
             '`' => {
-                in_code = !in_code;
-                cell.push(c);
+                let mut run = 1;
+                while chars.peek() == Some(&'`') {
+                    chars.next();
+                    run += 1;
+                }
+                code = match code {
+                    None => Some(run),
+                    Some(open) if open == run => None,
+                    still => still,
+                };
+                cell.push_str(&"`".repeat(run));
             }
-            '|' if !in_code => out.push(String::from(core::mem::take(&mut cell).trim())),
+            '|' if code.is_none() => out.push(String::from(core::mem::take(&mut cell).trim())),
             _ => cell.push(c),
         }
     }

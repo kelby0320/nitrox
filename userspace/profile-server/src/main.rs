@@ -1,4 +1,5 @@
-//! `profile-server` — projects the content-addressed store into `/bin` and `/applications`.
+//! `profile-server` — projects the content-addressed store into `/bin`, `/applications` and
+//! `/system/manual`.
 //!
 //! Bound by a supervisor (init), it answers forwarded `Namespace::Resolve` lookups by
 //! finding the first package in manifest order that provides the name, and re-exporting

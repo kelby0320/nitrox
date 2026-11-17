@@ -37,9 +37,18 @@ man | filter section == 1
 
 Listing, `Table<{name: String, section: Int, summary: String}>`. A page is text, 80 columns wide.
 
+## Exit status
+
+0 when the page or the listing was written, or its reader went away first. 1 when there is no
+such page, a page could not be read, or the write failed; a page that could not be read is
+listed with why, and asking for it says so rather than that it is not there. 2 for operands it
+cannot take.
+
 ## Files
 
-Each page is `/system/manual/<section>/<name>.md`, in the format `manual-page(5)` describes.
+Each page is `/system/manual/<name>.<section>.md`, as `man.1.md` is, in the format <!-- check-docs: allow-missing -->
+`manual-page(5)` describes. No session can change one: the directory is the system profile's,
+which serves each package's pages read-only.
 
 ## See also
 
