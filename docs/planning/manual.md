@@ -435,6 +435,24 @@ never set.
 - **`test-interactive`**: `man man` paged at 80 by 24 and turned, `man 5 manual-page` paged and
   left, and a table far over a page passed through `page` to `count` (57 steps).
 
+**After review** (#453, fourteen findings: nine fixed, two deferred, one the maintainer's call
+written down, one declined, one refuted; `b1260430`, `47315438`):
+- **`n` goes on from the page shown**: from the line last found only while the page shows it, so
+  moving back above a match no longer skips every match before it.
+- **A raw read takes a count** (`rsproto-tty-ops.md` § Read): the pager reads a byte at a time, so
+  what is typed after `q` stays queued for the shell. **It turns no echo off**: the server echoes a
+  canonical read only, which a routing test now holds; `libprompt::set_echo_on` went.
+- **An escape sequence is dropped whole**, so a coloured cell shows its text, not `[31m`.
+- **What a program paged is not kept**, the maintainer's call, written into the shell spec's
+  `$last` and both pages.
+- **Deferred**: a diagnostic the shell draws while a page is up (`TODO(diag-on-alternate)`), and a
+  stage that ends on the alternate screen (`TODO(alt-screen-crash)`). **Declined**: a host test for
+  the shell's own `send_setup`, in its binary, which `check-terminal` holds. **Refuted**: the gates'
+  paging waits, each failing where a broken Space should fail them.
+- **Tests**: the terminate request and `show`'s guard driven through a stage built from a setup
+  message; a refit's clamp and an empty search; the alternate screen's selection, damage, crop and
+  cursor, against a grid's invariants; the raw read's count, its rest, and its echo.
+
 ### G.4 The shell's operators, and `help`
 
 **Moves first**: the operator lists out of `parse.rs`, into a new `nxsh/src/operators.rs`. It
