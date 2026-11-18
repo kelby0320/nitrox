@@ -353,11 +353,22 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     s.expect("[{ n: 5 }, { n: 9 }]")?;
     s.expect("`man shell-operators`")?;
     s.expect("/home>")?;
+    // One of `shell(7)`'s examples that runs a program, whose answer is the same on any machine:
+    // each of its lines, in order.
+    let mut answer = GUIDE_EXAMPLE.1.lines();
+    quietly(s, GUIDE_EXAMPLE.0, answer.next().unwrap_or_default())?;
+    for line in answer {
+        s.expect(line)?;
+    }
+    s.expect("/home>")?;
     println!(
-        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry"
+        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry; the guide's example ran"
     );
-    Ok(9)
+    Ok(10)
 }
+
+/// The example of `shell(7)`'s that `interactive_manual` types, and what it prints.
+const GUIDE_EXAMPLE: (&str, &str) = ("list /bin | filter name == \"man\" | select name kind", "name  kind\nman   file");
 
 /// `test-interactive`'s steps 19d-1 to 19d-5: editing the line being typed, with the keys a serial
 /// terminal sends, and a line too long for one write. Each edited line only runs `whoami` if its
@@ -749,4 +760,15 @@ fn interactive_clipboard_and_completion(s: &mut Session) -> R<usize> {
     steps += 1;
 
     Ok(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    /// The example the gate types is the guide's, with the output the guide shows for it.
+    #[test]
+    fn the_example_the_gate_types_is_the_guides() {
+        let guide = include_str!("../../../../../docs/manual/7/shell.md");
+        let (example, output) = super::GUIDE_EXAMPLE;
+        assert!(guide.contains(&format!("```nxsh\n> {example}\n```\n\n```\n{output}\n```")), "{example}");
+    }
 }

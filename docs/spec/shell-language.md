@@ -139,7 +139,9 @@ visibility over bash's common failure mode of errors disappearing into `| grep f
 
 **Default pipeline policy:** fail loud, don't fail silent. A non-zero or crashed stage anywhere
 makes the overall pipeline report as failed by default. This does **not** mean downstream stages
-get torn down — a later stage still finishes processing whatever data it already received.
+get torn down — a later stage still finishes processing whatever data it already received. **A
+program that failed and sent nothing ends the pipeline there**: an operator after it has no value
+to work on, and its missing operand would hide the failure that is the answer.
 
 **Eager-abort opt-in — `strict { ... }` block, not a global flag.** Deliberately local and
 visible rather than a bash-`pipefail`-style ambient mode switch, consistent with the no-implicit-
@@ -1521,6 +1523,11 @@ original rule.
 ([`pipeline-stdio.md`](pipeline-stdio.md) § Payload), as `man` and `page` are, draws a long output
 on the terminal a page at a time and writes nothing, so `$last.value` is null after it, as after a
 program that writes nothing. What one screen holds it writes as ever, and that is kept.
+
+**`$last` is the last line that succeeded**, bound whole once the line has, so its value and its
+status are one line's: `status` is that line's pipelines', and null when it ran none, where it had
+kept an earlier line's. A failed line leaves `$last` as it was; its stages reach a `catch` as
+`e.stages` (§2).
 
 ### 11e. Top-level auto-display — deliberately different defaults in REPL vs. script
 

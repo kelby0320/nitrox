@@ -130,17 +130,34 @@ fn run_copy_steps(s: &mut Session) -> R<()> {
     let started = std::time::Instant::now();
     let at = s.transcript().len();
     s.send(&format!("copy {from} {to}"))?;
-    // The first line naming the copy with something after it: the table's row, its bytes, or an
-    // error. The typed line names it last.
-    let rest = s.line_since(at, &to, |rest| !rest.is_empty(), std::time::Duration::from_secs(600))?;
-    if rest != (BIG_MIB << 20).to_string() {
-        return Err(format!("the copy failed: {to}{rest}").into());
+    if !s.expect_within("/home>", std::time::Duration::from_secs(600))? {
+        return Err(format!("no prompt after the copy:\n{}", &s.transcript()[at..]).into());
     }
-    s.expect("/home>")?;
+    let answer = {
+        let t = s.transcript();
+        let tail = &t[at.min(t.len())..];
+        tail[..tail.find("/home>").unwrap_or(tail.len())].to_string()
+    };
+    if !copied_whole(&answer, BIG_MIB << 20) {
+        return Err(format!("the copy failed:\n{answer}").into());
+    }
     println!("  ok: copied {BIG_MIB} MiB in {:.1} s", started.elapsed().as_secs_f64());
     eject_stick(s, &[COPY_LABEL])?;
     println!("  ok: ejected, the stick left clean");
     Ok(())
+}
+
+/// Whether `answer`, what the serial column showed between the copy's line and the next prompt,
+/// holds its row's count of `bytes` and no diagnostic. **A service's log line can land anywhere in
+/// the row**, before the count or after it, so the count is found as a whole number, not as the text
+/// after the copy's name.
+fn copied_whole(answer: &str, bytes: u64) -> bool {
+    let count = bytes.to_string();
+    let whole = |(i, _): (usize, &str)| {
+        let before = answer[..i].chars().next_back().is_none_or(|c| !c.is_ascii_digit());
+        before && answer[i + count.len()..].chars().next().is_none_or(|c| !c.is_ascii_digit())
+    };
+    !answer.contains("\x1b[91m") && answer.match_indices(&count).any(whole)
 }
 
 /// The stick once the machine has stopped: clean, and [`BIG_COPY`] the source's size with every
@@ -163,4 +180,36 @@ fn check_copy_stick(stick: &Path) -> R<()> {
     }
     println!("  ok: the copy is {BIG_MIB} MiB, every mark in its place, the holes zero");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::copied_whole;
+
+    const ROW: &str = "/storage/nxcopy/big  /storage/nxcopy/big-copy  ";
+
+    /// The count is found wherever a log line lands in the row: before it, or after it.
+    #[test]
+    fn the_count_is_found_past_a_log_line_in_the_row() {
+        let log = "logging-service: typed stream from heartbeat [seq, uptime_ns, healthy]\r\n";
+        for answer in [
+            format!("{ROW}536870912\r\n"),
+            format!("/storage/nxcopy/big-copy{log}  536870912\r\n"),
+            format!("{ROW}536870912[158 t=30164591157] system/heartbeat.typed INFO: seq=98\r\n"),
+        ] {
+            assert!(copied_whole(&answer, 536_870_912), "{answer:?}");
+        }
+    }
+
+    /// A count of something else, a longer number holding it, or a refusal is not the copy.
+    #[test]
+    fn a_short_copy_or_a_refusal_is_not_the_count() {
+        for answer in [
+            format!("{ROW}268435456\r\n"),
+            "uptime_ns=1536870912\r\n".to_string(),
+            format!("\x1b[91mcopy: no space left\x1b[0m\r\n{ROW}536870912\r\n"),
+        ] {
+            assert!(!copied_whole(&answer, 536_870_912), "{answer:?}");
+        }
+    }
 }

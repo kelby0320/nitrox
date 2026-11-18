@@ -24,7 +24,9 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
   its arguments read, and its entry), `builtins` (the same for `cd`, `exit` and `help`) and `help`
   (the keywords' entries, and the `help` builtin). **An operator or a builtin is added to its
   table**, which the parser asks; a test holds the evaluator's arms to the tables, runs every
-  example, and holds `shell-operators(7)` to the operators. **No syscalls.** Host-tested
+  example, and holds `shell-operators(7)` to the operators. `guide_tests` types `shell(7)`'s
+  examples at one prompt in order, so one may use what an earlier one bound: an edit to the page is
+  held by it. **No syscalls.** Host-tested
   (`cargo test -p nxsh --lib --target x86_64-unknown-linux-gnu`) in a second rather than through a
   90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console

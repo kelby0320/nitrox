@@ -14,7 +14,9 @@ This is Nitrox's manual. `man` lists its pages, and `man NAME` prints one; `man 
 
 ## What it holds
 
-- `man(1)`, its reader.
+- `man(1)`, its reader, and `page(1)`, which shows a long output a page at a time.
+- The shell: `shell(7)`, a tour of it, where to start; `shell-operators(7)`, every operator with an
+  example; and `shell-language(7)`, its rules.
 - The system's specifications, as they are:
   - in section 2, what a program calls: `syscalls(2)`, `handles(2)`, `io(2)` and the rest;
   - in section 5, what a program reads and writes: `init.toml(5)`, `services.toml(5)`,

@@ -307,6 +307,8 @@ impl Interp {
             // (`nxsh/CLAUDE.md`): the interrupt checkpoint between statements lived only there.
             self.check_interrupt()?;
             self.shown = crate::repl::shown(stmt);
+            // `$last` pairs a line's value with its own pipelines' status, or with none.
+            self.last_status = None;
             let ran = self.exec(stmt);
             self.shown = false;
             let value = boundary_value(ran?)?;
@@ -1692,6 +1694,11 @@ impl Interp {
                 let outcome = self.host.run(&run, input.as_deref(), strict, last, &self.env).map_err(EvalError::new)?;
                 carried = decode_output(&outcome)?;
                 statuses.extend(outcome.stages.iter().cloned());
+                // A program that failed and sent nothing leaves the stages after it nothing to work
+                // on: its failure is the answer, not their missing operand.
+                if carried.is_none() && outcome.stages.iter().any(|s| !s.succeeded()) {
+                    break;
+                }
                 continue;
             }
 

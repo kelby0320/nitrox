@@ -425,4 +425,4 @@ Show a value, a table in columns, as the prompt shows what is left.
 
 ## See also
 
-`shell-language(7)`, the language whole.
+`shell(7)`, a tour of the shell; `shell-language(7)`, the language whole.
