@@ -263,7 +263,7 @@ impl Interp {
             let commands = self.host.commands();
             let names = keywords
                 .chain(crate::parse::BUILTINS.iter().copied())
-                .chain(crate::parse::OPERATORS.iter().copied())
+                .chain(crate::operators::OPERATORS.iter().map(|o| o.name))
                 .chain(self.functions.iter().map(|(n, _)| n.as_str()))
                 .chain(commands.iter().map(alloc::string::String::as_str));
             return Completion { start: w.start, candidates: matching_names(w.text, names) };

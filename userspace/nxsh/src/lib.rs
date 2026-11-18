@@ -18,6 +18,7 @@ pub mod exec;
 pub mod history;
 pub mod host;
 pub mod lex;
+pub mod operators;
 pub mod ops;
 pub mod parse;
 pub mod paths;

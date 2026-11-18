@@ -25,7 +25,7 @@
 "userspace/nxfiles/src/tests.rs" = 2275
 "userspace/nxsh/src/eval.rs" = 4144
 "userspace/nxsh/src/lex.rs" = 1089
-"userspace/nxsh/src/parse.rs" = 1867
+"userspace/nxsh/src/parse.rs" = 1840
 "userspace/nxterm/src/lib.rs" = 2209
 "userspace/service-mgr/src/main.rs" = 1855
 "userspace/storage-service/src/main.rs" = 1161

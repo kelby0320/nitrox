@@ -86,14 +86,11 @@ pub fn shown(stmt: &Stmt) -> bool {
 /// The longest line the REPL will accept, matching the tty server's own limit.
 pub const LINE_MAX: usize = 1024;
 
-/// Operators that consume a value and end the chain, so the REPL must not add another.
-const TERMINAL_OPERATORS: &[&str] = &["display", "save"];
-
 fn ends_in_terminal_operator(e: &Expr) -> bool {
     match e {
         Expr::Pipeline(stages) => stages.last().is_some_and(ends_in_terminal_operator),
         Expr::Time(timed) => ends_in_terminal_operator(timed),
-        Expr::Call(c) => TERMINAL_OPERATORS.contains(&c.name.as_str()),
+        Expr::Call(c) => crate::operators::find(&c.name).is_some_and(|o| o.terminal),
         _ => false,
     }
 }
