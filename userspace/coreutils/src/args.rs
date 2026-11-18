@@ -12,6 +12,7 @@
 //! Parsing is **declarative**: a program lists the flags it accepts, and anything else is
 //! an error rather than a silently ignored argument (the fail-loud default, §1).
 
+use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -22,6 +23,9 @@ pub struct Flag {
     pub long: &'static str,
     /// The short name, without `-`, or `'\0'` for a long-only flag.
     pub short: char,
+    /// What follows it on the command line, for `--help` (`DEVICE [LABEL]`); the operands are
+    /// parsed as operands.
+    pub args: &'static str,
     /// One-line help text.
     pub help: &'static str,
 }
@@ -29,12 +33,64 @@ pub struct Flag {
 impl Flag {
     /// A flag with both a long and a short spelling.
     pub const fn new(long: &'static str, short: char, help: &'static str) -> Flag {
-        Flag { long, short, help }
+        Flag { long, short, args: "", help }
     }
     /// A long-only flag.
     pub const fn long_only(long: &'static str, help: &'static str) -> Flag {
-        Flag { long, short: '\0', help }
+        Flag { long, short: '\0', args: "", help }
     }
+    /// This flag, `args` following it.
+    pub const fn with_args(self, args: &'static str) -> Flag {
+        Flag { args, ..self }
+    }
+
+    /// How it is written in `--help`: `-r, --recursive`, or `    --mount DEVICE`.
+    fn spelled(&self) -> String {
+        let short = if self.short == '\0' { String::from("    ") } else { format!("-{}, ", self.short) };
+        let args = if self.args.is_empty() { String::new() } else { format!(" {}", self.args) };
+        format!("{short}--{}{args}", self.long)
+    }
+}
+
+/// The widest a flag's spelling is lined up to; a wider one has its help on the line below.
+const SPELLING: usize = 28;
+
+/// Lines of `--help` are broken before this column.
+const WIDTH: usize = 80;
+
+/// `--help`: `about`, the program's usage line and a sentence, then every flag it parses, from
+/// `flags`, and `--help` and `--version`, each with its line of help.
+pub fn help(about: &str, flags: &[Flag]) -> String {
+    let all: Vec<&Flag> = flags.iter().chain(UNIVERSAL_FLAGS.iter()).collect();
+    let column = all.iter().map(|f| f.spelled().len()).filter(|&n| n <= SPELLING).max().unwrap_or(0);
+    let mut out = format!("{}\n\n", about.trim_end());
+    for f in all {
+        let spelled = f.spelled();
+        out.push_str("  ");
+        out.push_str(&spelled);
+        let indent = 2 + column + 2;
+        if spelled.len() > column {
+            out.push('\n');
+            out.extend(core::iter::repeat_n(' ', indent));
+        } else {
+            out.extend(core::iter::repeat_n(' ', column - spelled.len() + 2));
+        }
+        let mut at = indent;
+        for (i, word) in f.help.split(' ').enumerate() {
+            if i > 0 && at + 1 + word.len() > WIDTH {
+                out.push('\n');
+                out.extend(core::iter::repeat_n(' ', indent));
+                at = indent;
+            } else if i > 0 {
+                out.push(' ');
+                at += 1;
+            }
+            out.push_str(word);
+            at += word.len();
+        }
+        out.push('\n');
+    }
+    out
 }
 
 /// Why parsing failed. Each carries enough to render a specific message — "unknown flag

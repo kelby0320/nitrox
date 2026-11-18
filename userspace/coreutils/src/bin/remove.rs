@@ -21,8 +21,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::REMOVE;
 use libfs::TreeError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -35,21 +35,6 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-const RECURSIVE: Flag = Flag::new("recursive", 'r', "remove directories and their contents");
-const FORCE: Flag = Flag::new("force", 'f', "ignore paths that do not exist");
-
-const HELP: &[u8] = b"usage: remove [--recursive] [--force] PATH...\n\
-    \n\
-    Remove files and directories.\n\
-    Emits Table<{path: String, kind: String}> on stdout.\n\
-    \n\
-      -r, --recursive remove directories and everything under them\n\
-      -f, --force     a path that does not exist is not an error\n\
-          --help      show this help and exit\n\
-          --version   show version information and exit\n";
-
-const VERSION: &[u8] = b"remove (nitrox coreutils) 0.1.0\n";
 
 struct Removed {
     path: String,
@@ -68,15 +53,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[RECURSIVE, FORCE]) {
+    let args = match REMOVE.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"remove: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(REMOVE.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(REMOVE.version().as_bytes());
     }
     if args.operands.is_empty() {
         stage.die(b"remove: need at least one path (try --help)\n", EXIT_USAGE);

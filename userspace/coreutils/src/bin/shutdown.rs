@@ -18,8 +18,8 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::usage::SHUTDOWN;
 use libkern::Rights;
 use libkern::error::KError;
 use libos::boot::Start;
@@ -34,35 +34,20 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Where the `power` grant binds `service-mgr`'s power endpoint.
 const POWER: &str = "/dev/power";
 
-const FLAGS: [Flag; 1] = [Flag::long_only("reboot", "restart the machine rather than halting it")];
-
-const HELP: &[u8] = b"usage: shutdown [--reboot]\n\
-    \n\
-    Ask every session and service to stop, write back and unmount every filesystem, and stop the\n\
-    machine: with nothing, halt, saying when it is safe to turn it off; with --reboot, restart.\n\
-    \n\
-    It needs the power grant: run it as `with power shutdown`.\n\
-    \n\
-    \x20     --reboot  restart the machine rather than halting it\n\
-    \x20     --help    show this help and exit\n\
-    \x20     --version show version information and exit\n";
-
-const VERSION: &[u8] = b"shutdown (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
-    let args = match parse(&stage.argv, &FLAGS) {
+    let args = match SHUTDOWN.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"shutdown: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(SHUTDOWN.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(SHUTDOWN.version().as_bytes());
     }
     if !args.operands.is_empty() {
         stage.die(b"shutdown: takes no operands (try --help)\n", EXIT_USAGE);

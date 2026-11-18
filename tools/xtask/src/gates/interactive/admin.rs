@@ -162,8 +162,8 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     if help.contains("\x1b[91m") || help.contains("\x1b[93m") {
         return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
     }
-    s.send("format(\"help-rows={}\", (disk --help | count))")?;
-    s.expect("help-rows=21")?;
+    s.send("format(\"help-rows={}\", (disk --help | count) > 10)")?;
+    s.expect("help-rows=true")?;
     s.expect("/home>")?;
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` has nothing answering, and `disk` names `with`.

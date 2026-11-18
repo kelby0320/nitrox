@@ -121,6 +121,16 @@ mod tests {
         }
     }
 
+    /// Every program in `/bin` has a page in section 1, where a person who ran it looks. No service
+    /// is in `/bin`; one there would be described on the services' page instead.
+    #[test]
+    fn every_program_in_bin_has_a_page() {
+        let programs = crate::profile_programs();
+        let missing: Vec<&str> =
+            programs.iter().copied().filter(|p| !repo_root().join(format!("docs/manual/1/{p}.md")).exists()).collect();
+        assert!(programs.len() > 20 && missing.is_empty(), "no page in section 1: {missing:?}");
+    }
+
     /// One flat directory of `<name>.<section>.md`, as the profile server projects and `man` reads.
     #[test]
     fn the_pages_are_staged_flat_by_name_and_section() {

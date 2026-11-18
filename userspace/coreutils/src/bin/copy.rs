@@ -27,8 +27,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::COPY;
 use libfs::{FileError, TreeError};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
@@ -40,19 +40,6 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-const FORCE: Flag = Flag::new("force", 'f', "overwrite an existing destination");
-
-const HELP: &[u8] = b"usage: copy [--force] SOURCE... DEST\n\
-    \n\
-    Copy files and directories. Directories are copied recursively.\n\
-    Emits Table<{source: String, destination: String, bytes: Int}> on stdout.\n\
-    \n\
-      -f, --force   overwrite an existing destination\n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"copy (nitrox coreutils) 0.1.0\n";
 
 struct Copied {
     source: String,
@@ -66,15 +53,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[FORCE]) {
+    let args = match COPY.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"copy: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(COPY.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(COPY.version().as_bytes());
     }
     if args.operands.len() < 2 {
         stage.die(b"copy: need a source and a destination (try --help)\n", EXIT_USAGE);

@@ -56,6 +56,15 @@ const EXIT_USAGE: i64 = 64;
 /// session namespace binds `/initramfs`.
 const PROGRAM_DIRS: &[&str] = &["/bin/"];
 
+/// What `--help` prints.
+const HELP: &str = "usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]\n\
+    \n\
+    The shell. With nothing, a prompt; with SCRIPT, its lines; with -c, SOURCE;\n\
+    each with the ARGs after it as $args. `man shell` is a tour of it.\n\
+    \n\
+    \x20 -c SOURCE    run SOURCE, a line or several\n\
+    \x20 -h, --help   show this help and exit\n";
+
 /// Cap on a captured stage output, so a spawned program cannot run the shell out of memory.
 const MAX_CAPTURE: usize = 1 << 20;
 
@@ -513,10 +522,8 @@ fn run(
             // On the terminal it was handed: script mode keeps none for the host, and the kernel
             // log reaches nobody on a machine with no serial port.
             match terminal {
-                Some(t) => {
-                    Tty::new(t, host.notices.clone()).write_crlf("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]")
-                }
-                None => host.out("usage: nxsh [SCRIPT [ARG...] | -c SOURCE [ARG...]]\n"),
+                Some(t) => Tty::new(t, host.notices.clone()).write_crlf(HELP.trim_end()),
+                None => host.out(HELP),
             }
             return EXIT_OK;
         }

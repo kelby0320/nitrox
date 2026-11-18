@@ -29,8 +29,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::LOG;
 use libkern::Rights;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -50,41 +50,20 @@ const LOGS: &str = "/dev/logs";
 /// Where the `kernel-log` grant binds a snapshot of the kernel's log.
 const KERNEL_LOG: &str = "/dev/log";
 
-const FLAGS: &[Flag] = &[Flag::long_only("kernel", "read the kernel's log instead of the service log")];
-
-const HELP: &[u8] = b"usage: log [PRINCIPAL]\n\
-    \x20      log --kernel\n\
-    \n\
-    Read a log back, oldest first. With no option, the service log: every record the logging\n\
-    service still holds, or PRINCIPAL's alone. With --kernel, the kernel's log, a row a line.\n\
-    Emits Table<{sequence: Int, time: Int?, principal: String, tier: String?, level: String?,\n\
-    message: String}> on stdout. `time` is Unix epoch seconds, and null for a record taken while\n\
-    the clock was not set. A kernel row's principal is `kernel`, its sequence its line's place,\n\
-    and its time, tier and level null.\n\
-    \n\
-    The service log needs the logs grant and the kernel's the kernel-log grant: run it as\n\
-    `with admin log`.\n\
-    \n\
-    \x20     --kernel  read the kernel's log instead of the service log\n\
-    \x20     --help    show this help and exit\n\
-    \x20     --version show version information and exit\n";
-
-const VERSION: &[u8] = b"log (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
-    let args = match parse(&stage.argv, FLAGS) {
+    let args = match LOG.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"log: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(LOG.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(LOG.version().as_bytes());
     }
     if args.has("kernel") {
         if !args.operands.is_empty() {

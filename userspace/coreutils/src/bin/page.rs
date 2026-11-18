@@ -7,9 +7,9 @@
 extern crate alloc;
 
 use alloc::string::String;
-use coreutils::args::parse;
 use coreutils::pager::{self, Shown};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::usage::PAGE;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
 use libos::exit;
@@ -23,34 +23,21 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// The most input read, the shell's own capture cap.
 const MAX_INPUT: usize = 1 << 20;
 
-const HELP: &[u8] = b"usage: page\n\
-    \n\
-    Show stdin a page at a time on this stage's terminal, as the shell would show it,\n\
-    when that is where it goes. Space, f or Page Down a page on; b or Page Up a page\n\
-    back; j, Down or Enter a line on; k or Up a line back; g or Home the top; G or End\n\
-    the end; /word the next line holding it, n the one after; q quits.\n\
-    Input one page holds, or that goes on down a pipeline, passes on unchanged.\n\
-    \n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"page (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[]) {
+    let args = match PAGE.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"page: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(PAGE.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(PAGE.version().as_bytes());
     }
     if !args.operands.is_empty() {
         stage.die(b"page: takes no operands; it pages its input (try --help)\n", EXIT_USAGE);

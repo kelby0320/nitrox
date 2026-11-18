@@ -133,6 +133,25 @@ impl<P: MsgPort> ChannelReceiver<P> {
 
 #[cfg(feature = "io")]
 pub use self::io_port::{IpcPort, IpcPortRef};
+
+/// When `argv` asks for `--help`: `lines` written as text, a stream a shell prints a line a row, to
+/// the `stdout` that `take` hands over, and the program ended. `take` runs only then, so a program
+/// that goes on keeps its `stdout` open.
+#[cfg(feature = "io")]
+pub fn answer_help(
+    argv: &[alloc::string::String],
+    take: impl FnOnce() -> Option<libos::Handle<libos::Channel, libos::Only>>,
+    lines: &[&str],
+) {
+    if argv.get(1).is_none_or(|a| a != "--help") {
+        return;
+    }
+    if let Some(stdout) = take() {
+        let mut sink = ChannelSink::new(IpcPort::owning(stdout), libkern::IPC_PAYLOAD_SIZE);
+        let _ = crate::table::write_text_fallback(&mut sink, lines, 0).and_then(|()| sink.finish());
+    }
+    libos::exit(0)
+}
 #[cfg(feature = "io")]
 pub(crate) use self::io_port::{recv_msg, send_msg};
 

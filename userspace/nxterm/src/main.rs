@@ -40,6 +40,16 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Buffers shared with the compositor; two lets a frame be drawn while the other is on screen.
 const BUFFERS: usize = 2;
 
+/// What `--help` prints, a line each, on `stdout`.
+const HELP: &[&str] = &[
+    "usage: nxterm",
+    "",
+    "A terminal window, running the shell. Started from the Applications menu,",
+    "or by `nxterm` at a prompt. `man nxterm` says what its menus and keys do.",
+    "",
+    "      --help  show this help and exit",
+];
+
 /// The terminal's size in cells at startup; a `Configure` changes it.
 const COLS: usize = 80;
 const ROWS: usize = 20;
@@ -161,13 +171,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
     // Its own setup message, so the shell it hosts gets a real environment. Absent is normal (a
     // Tier-0 spawn has none): an empty `Record`. Its streams and terminal stay open for the run:
     // closing one would tell its far end.
-    let (env, _held) = match setup_channel.as_ref().filter(|_| libstream::setup::setup_is_pending(start.arg0)) {
+    let (argv, env, mut _held) = match setup_channel.as_ref().filter(|_| libstream::setup::setup_is_pending(start.arg0))
+    {
         Some(ch) => match receive_setup(ch, Deadline::NEVER) {
-            Ok(Some(s)) => (s.env, Some((s.streams, s.terminal))),
-            _ => (libstream::wire::Record::default(), None),
+            Ok(Some(s)) => (s.argv, s.env, Some((s.streams, s.terminal))),
+            _ => (alloc::vec::Vec::new(), libstream::wire::Record::default(), None),
         },
-        None => (libstream::wire::Record::default(), None),
+        None => (alloc::vec::Vec::new(), libstream::wire::Record::default(), None),
     };
+    libstream::channel::answer_help(&argv, || _held.take().and_then(|(s, _)| s.stdout), HELP);
 
     // Read here, before anything is sized with it: the grid's cells are built from `font_px`.
     let theme = theme_of(&env);

@@ -27,8 +27,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::usage::CLIP;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
 use libos::log;
@@ -47,40 +47,21 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// Cap on the upstream stream read before rendering; the same as nxsh's capture cap.
 const MAX_CAPTURE: usize = 1 << 20;
 
-const COPY: Flag = Flag::new("copy", 'c', "read stdin and push it onto the ring");
-const LIST: Flag = Flag::new("list", 'l', "describe the ring: index, kind, length");
-
-const HELP: &[u8] = b"usage: clip [INDEX]\n\
-           clip --copy\n\
-           clip --list\n\
-    \n\
-    Read and write the clipboard (/dev/clipboard).\n\
-    \n\
-    With no operand, writes the newest entry to stdout as a text stream.\n\
-    INDEX reaches further back: 0 is the newest, 1 the one before it.\n\
-    \n\
-      -c, --copy    read stdin and push its text onto the ring\n\
-      -l, --list    emit Table<{index: Int, kind: Int, bytes: Int}>\n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"clip (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[COPY, LIST]) {
+    let args = match CLIP.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"clip: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(CLIP.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(CLIP.version().as_bytes());
     }
     let (copying, listing) = (args.has("copy"), args.has("list"));
     if copying && listing {

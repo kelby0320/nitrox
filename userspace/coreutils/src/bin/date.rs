@@ -21,9 +21,9 @@
 
 extern crate alloc;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use coreutils::time::{civil_from_unix, format_civil, parse_utc};
+use coreutils::usage::DATE;
 use libkern::Rights;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -37,42 +37,21 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const UNIX: Flag = Flag::new("unix", 'u', "report the bare epoch value only");
-const SET: Flag = Flag::long_only("set", "set the clock to TIME, in UTC (needs the clock grant)");
-
-const HELP: &[u8] = b"usage: date [--unix]\n\
-    \x20      date --set TIME [--unix]\n\
-    \n\
-    Report the current wall-clock time (UTC).\n\
-    Emits Table<{unix: Int, year: Int, month: Int, day: Int,\n\
-                 hour: Int, minute: Int, second: Int}> on stdout.\n\
-    \n\
-    With --set, first set the clock, and the machine's hardware clock, to TIME: UTC, as\n\
-    2026-09-28T14:30:00Z, from 2000 to 2099. That needs the clock grant:\n\
-    `with admin date --set TIME`.\n\
-    \n\
-      -u, --unix    report the bare epoch value only\n\
-          --set     set the clock to TIME first (needs the clock grant)\n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"date (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[UNIX, SET]) {
+    let args = match DATE.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"date: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(DATE.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(DATE.version().as_bytes());
     }
     if args.has("set") {
         let [time] = args.operands.as_slice() else {

@@ -22,8 +22,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::MKDIR;
 use libfs::TreeError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -38,20 +38,6 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const PARENTS: Flag = Flag::new("parents", 'p', "create missing parents; existing is not an error");
-
-const HELP: &[u8] = b"usage: mkdir [--parents] PATH...\n\
-    \n\
-    Create directories.\n\
-    Emits Table<{path: String, created: Bool}> on stdout.\n\
-    \n\
-      -p, --parents create missing parent directories, and treat an\n\
-                    existing PATH as success rather than an error\n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"mkdir (nitrox coreutils) 0.1.0\n";
-
 struct Made {
     path: String,
     created: bool,
@@ -63,15 +49,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[PARENTS]) {
+    let args = match MKDIR.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"mkdir: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(MKDIR.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(MKDIR.version().as_bytes());
     }
     if args.operands.is_empty() {
         stage.die(b"mkdir: need at least one path (try --help)\n", EXIT_USAGE);

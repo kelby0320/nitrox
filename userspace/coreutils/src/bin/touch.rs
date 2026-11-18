@@ -20,8 +20,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::TOUCH;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
 use libos::log;
@@ -34,20 +34,6 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const NO_CREATE: Flag = Flag::new("no-create", 'c', "stamp only; do not create a missing path");
-
-const HELP: &[u8] = b"usage: touch [--no-create] PATH...\n\
-    \n\
-    Create each PATH if absent, and stamp its modification time.\n\
-    The time is the filesystem's own clock; it cannot be supplied.\n\
-    Emits Table<{path: String, created: Bool}> on stdout.\n\
-    \n\
-      -c, --no-create stamp only; skip a PATH that does not exist\n\
-          --help      show this help and exit\n\
-          --version   show version information and exit\n";
-
-const VERSION: &[u8] = b"touch (nitrox coreutils) 0.1.0\n";
-
 struct Touched {
     path: String,
     created: bool,
@@ -59,15 +45,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[NO_CREATE]) {
+    let args = match TOUCH.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"touch: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(TOUCH.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(TOUCH.version().as_bytes());
     }
     if args.operands.is_empty() {
         stage.die(b"touch: need at least one path (try --help)\n", EXIT_USAGE);

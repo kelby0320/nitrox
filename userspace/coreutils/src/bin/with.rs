@@ -29,6 +29,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::usage::WITH;
 use libkern::abi::{IPC_PAYLOAD_SIZE, KIND_TERMINATE_REQUESTED};
 use libkern::{Rights, scrub};
 use libos::boot::Start;
@@ -47,28 +48,6 @@ use libviews::{Handed, REQUEST_ID};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-const HELP: &[u8] = b"usage: with VIEW PROGRAM [ARG...]\n\
-    \x20      with --forget\n\
-    \x20      with --list\n\
-    \x20      with --check FILE\n\
-    \x20      with --show [FILE]\n\
-    \x20      with --install FILE\n\
-    \n\
-    Run PROGRAM in VIEW: this session's namespace plus what the view grants,\n\
-    when /system/views.toml says you may. Asks for your password when the\n\
-    policy does, and remembers it for five minutes on this terminal, for that\n\
-    view. PROGRAM is a bare name; its output goes where with's would.\n\
-    \n\
-    \x20     --forget   forget every password this session has remembered\n\
-    \x20     --list     the views you may use, as a table\n\
-    \x20     --check    whether FILE is a valid policy\n\
-    \x20     --show     the policy, or a copy of it written to FILE (needs the views grant)\n\
-    \x20     --install  check FILE and install it as the policy (needs the views grant)\n\
-    \x20     --help     show this help and exit\n\
-    \x20     --version  show version information and exit\n";
-
-const VERSION: &[u8] = b"with (nitrox coreutils) 0.1.0\n";
 
 /// Wrong passwords before the broker ends the request — the prompt counts them for the person.
 const TRIES: u8 = 3;
@@ -118,16 +97,16 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let words: Vec<String> = stage.argv.iter().skip(1).cloned().collect();
     let argv: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
     match argv.first().copied() {
-        Some("--help") => stage.answer(HELP),
-        Some("--version") => stage.answer(VERSION),
+        Some("--help") => stage.answer(WITH.help().as_bytes()),
+        Some("--version") => stage.answer(WITH.version().as_bytes()),
         Some("--list") if argv.len() == 1 => list(&stage),
         Some("--forget") if argv.len() == 1 => forget(&stage),
         Some("--check") if argv.len() == 2 => check(&stage, argv[1]),
         Some("--show") if argv.len() <= 2 => show(&stage, argv.get(1).copied()),
         Some("--install") if argv.len() == 2 => install(&stage, argv[1]),
-        Some(flag) if flag.starts_with("--") => stage.die(HELP, EXIT_USAGE),
+        Some(flag) if flag.starts_with("--") => stage.die(WITH.help().as_bytes(), EXIT_USAGE),
         Some(_) if argv.len() >= 2 => run(&mut stage, argv[0], argv[1], &argv[2..]),
-        _ => stage.die(HELP, EXIT_USAGE),
+        _ => stage.die(WITH.help().as_bytes(), EXIT_USAGE),
     }
 }
 

@@ -48,9 +48,9 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::format::{self, Fs, Label, Plan, Scheme};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::DISK;
 use libfsserver::BlockWriter;
 use libfsserver::disk::PartitionIo;
 use libgpt::{mbr, table};
@@ -85,58 +85,20 @@ const DEVICES: &str = "/dev/devices/all.tsm";
 /// storage service waits as long for a filesystem server's `Ready`.
 const ARRIVAL_NS: u64 = 30_000_000_000;
 
-const FLAGS: [Flag; 8] = [
-    Flag::long_only("list", "every block device, its filesystem, and where it is mounted"),
-    Flag::long_only(
-        "mount",
-        "mount DEVICE at /storage/<label>, writable if its server writes it (needs the storage grant)",
-    ),
-    Flag::long_only("unmount", "unmount the filesystem called LABEL (needs the storage grant)"),
-    Flag::long_only("eject", "unmount the removable drive at /storage/NAME, so it can be pulled"),
-    Flag::long_only("partition", "one partition spanning the removable DISK (needs with admin)"),
-    Flag::long_only("format", "a fat or ext4 filesystem on DEVICE (needs with admin)"),
-    Flag::long_only("mbr", "with --partition or --format of a disk: an MBR"),
-    Flag::long_only("gpt", "with --partition or --format of a disk: a GPT"),
-];
-
-const HELP: &[u8] = b"usage: disk --list | --mount DEVICE [LABEL] | --unmount LABEL | --eject NAME\n\
-    \x20      | --partition DISK [--mbr|--gpt] | --format DEVICE fat|ext4 [LABEL] [--mbr|--gpt]\n\
-    \n\
-    --list              every block device, what it holds, where it is mounted, and whether\n\
-    \x20                   it was left clean, as a table\n\
-    --mount DEVICE [L]  mount DEVICE (/dev/blk/N or blk-N) at /storage/L, or under the label\n\
-    \x20                   the service chooses; read-only, saying why, if its server only reads it\n\
-    --unmount LABEL     write back every file, flush the drive, and unmount; refused while a\n\
-    \x20                   file on it is open\n\
-    --eject NAME        the same for every filesystem on the removable drive holding\n\
-    \x20                   /storage/NAME, after which the drive can be pulled out\n\
-    --partition DISK    one partition spanning a removable DISK, in an MBR or a GPT, from\n\
-    \x20                   2 TiB a GPT; everything on DISK is lost\n\
-    --format DEVICE FS  a fat or ext4 filesystem on DEVICE; on a disk, its table first, an MBR\n\
-    \x20                   for fat and a GPT for ext4; everything on DEVICE is lost\n\
-    \n\
-    Mounting and unmounting need the storage grant, and partitioning and formatting the disks\n\
-    grant too: run them with `with admin`. Ejecting a removable drive does not.\n\
-    \n\
-    \x20     --help    show this help and exit\n\
-    \x20     --version show version information and exit\n";
-
-const VERSION: &[u8] = b"disk (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
-    let args = match parse(&stage.argv, &FLAGS) {
+    let args = match DISK.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"disk: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(DISK.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(DISK.version().as_bytes());
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let verbs = [

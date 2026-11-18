@@ -25,8 +25,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::SERVICE;
 use libkern::Rights;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
@@ -45,43 +45,20 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const TABLE: &str = "/dev/services/all.tsm";
 const ADMIN: &str = "/dev/services/admin";
 
-const FLAGS: [Flag; 4] = [
-    Flag::long_only("list", "every declared service, its state, and its restarts"),
-    Flag::long_only("start", "start the service NAME (needs the services grant)"),
-    Flag::long_only("stop", "ask the service NAME to stop (needs the services grant)"),
-    Flag::long_only("restart", "stop the service NAME and start it again (needs the services grant)"),
-];
-
-const HELP: &[u8] = b"usage: service --list | --start NAME | --stop NAME | --restart NAME\n\
-    \n\
-    --list            every declared service, whether it is starting, running, stopped or\n\
-    \x20                 failed, and how often it has restarted, as a table\n\
-    --start NAME      start a service that is not running, and wait until it is up\n\
-    --stop NAME       ask a running service to stop, and wait until it has\n\
-    --restart NAME    stop it and start it again\n\
-    \n\
-    Starting and stopping need the services grant: run them with `with admin`. An essential\n\
-    service cannot be stopped or restarted.\n\
-    \n\
-    \x20     --help    show this help and exit\n\
-    \x20     --version show version information and exit\n";
-
-const VERSION: &[u8] = b"service (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
-    let args = match parse(&stage.argv, &FLAGS) {
+    let args = match SERVICE.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"service: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(SERVICE.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(SERVICE.version().as_bytes());
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let verbs = [args.has("list"), args.has("start"), args.has("stop"), args.has("restart")];

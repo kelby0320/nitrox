@@ -361,10 +361,24 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
         s.expect(line)?;
     }
     s.expect("/home>")?;
+    // A command's help in its two forms: `--help`, the options from the program's own table, and
+    // its page, paged at 80 by 24 and left with `q`. An application answers `--help` too, before
+    // it opens a window.
+    quietly(s, "list --help", "usage: list [--recursive] [PATH...]")?;
+    s.expect("  -r, --recursive  list subdirectories recursively")?;
+    s.expect("/home>")?;
+    s.send("man list")?;
+    s.expect("list a directory as a table")?;
+    s.expect("lines 1-23 of ")?;
+    s.send_raw("q")?;
+    s.expect("\x1b[?1049l")?;
+    s.expect("/home>")?;
+    quietly(s, "nxedit --help", "usage: nxedit [PATH]")?;
+    s.expect("/home>")?;
     println!(
-        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry; the guide's example ran"
+        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry; the guide's example ran; list's help and page, and nxedit's help"
     );
-    Ok(10)
+    Ok(13)
 }
 
 /// The example of `shell(7)`'s that `interactive_manual` types, and what it prints.

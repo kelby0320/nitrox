@@ -19,25 +19,14 @@
 
 extern crate alloc;
 
-use coreutils::args::parse;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use coreutils::time::parse_duration;
+use coreutils::usage::SLEEP;
 use libos::boot::Start;
 use libos::{Deadline, Handle, Only, Timer, WaitSet, exit, log, time};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-const HELP: &[u8] = b"usage: sleep DURATION\n\
-    \n\
-    Wait for DURATION, then exit. A bare number is seconds; the suffixes\n\
-    ns, us, ms, s, m and h are accepted, with an optional fraction.\n\
-    Emits nothing.\n\
-    \n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"sleep (nitrox coreutils) 0.1.0\n";
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
@@ -45,15 +34,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[]) {
+    let args = match SLEEP.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"sleep: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(SLEEP.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(SLEEP.version().as_bytes());
     }
     if args.operands.len() != 1 {
         stage.die(b"sleep: need exactly one duration (try --help)\n", EXIT_USAGE);
