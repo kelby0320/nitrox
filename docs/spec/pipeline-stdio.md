@@ -103,6 +103,7 @@ message is one structured value, not a data stream:
 | `argv` | `List<String>` | Command-line arguments; `argv[0]` is the program name by convention. |
 | `env` | `Record` | The environment. Typed, not `key=value` strings. Empty when the spawner has none. |
 | `terminal` | `Int` | Non-zero: a **terminal channel** follows the stream handles. Absent or zero: none. |
+| `shown` | `Int` | Non-zero: `stdout` is the statement's value, **shown on the terminal as it comes**. Absent or zero: not. |
 
 The exact record schema is pinned in `libstream::setup` (the sender, `send_stage_setup`) and
 consumed by `receive_setup` (the receiver). **The handles a sender gives are gone on every
@@ -119,6 +120,13 @@ stage it spawns a **sibling** of its own terminal, minted with `Tty::OpenSibling
 backend (administration Part A.2). coreutils' `Stage` exposes it as `terminal`; a stage handed
 none — a script's, or one spawned when the tty server had no terminal to spare — sees `None`. This table lacked the field until
 2026-09-23, when a plan that depended on it proposed re-adding it as a bit.
+
+**`shown` is what lets a program draw on its terminal in place of its output**, as `man` pages:
+the shell sets it on the last stage of a statement the REPL displays — a pipeline, a command or a
+bare name run as one, its last stage a program — and nowhere else. A stage whose output is
+assigned (`let x = man ls`), piped on (`man | count`), an operand (`(man ls) + 1`) or a script's
+is not told, so it writes its output as ever. A spawner other than the shell sets nothing: the
+view broker does not tell a program in a view (`libstream::setup::StageStreams::shown`).
 
 **Fields are read by position, and may only be appended.** `SetupPayload::decode` takes
 `streams` and `argv` positionally and treats everything after them as optional, which is

@@ -319,7 +319,7 @@ impl Server {
                 self.links.perform(&acts);
             }
             OP_TTY_READ_LINE | OP_TTY_READ => {
-                let kind = if op == OP_TTY_READ { ReadKind::Raw } else { ReadKind::Line };
+                let kind = if op == OP_TTY_READ { ReadKind::raw(body) } else { ReadKind::Line };
                 let acts = self.reg.read(ch, request_id, kind);
                 self.links.perform(&acts);
             }

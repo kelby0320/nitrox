@@ -945,6 +945,7 @@ impl Broker {
             stdin: p.handles.stdin.take(),
             stdout: p.handles.stdout.take(),
             stderr: p.handles.stderr.take(),
+            shown: false,
         };
         // The setup message takes them, sent or closed.
         let sent = send_stage_setup(&started.setup, streams, p.handles.terminal.take(), &argv, &env, Deadline::NEVER);

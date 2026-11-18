@@ -67,11 +67,13 @@ pub trait Host {
     ///
     /// `env` goes to every stage unchanged. The shell does not pre-resolve a stage's paths: it
     /// passes the arguments as written and the same `PWD`, so both sides resolve identically.
+    /// `shown` is told to the last stage (`pipeline-stdio.md` § Payload).
     fn run(
         &mut self,
         stages: &[StageSpec],
         input: Option<&[u8]>,
         strict: bool,
+        shown: bool,
         env: &Record,
     ) -> Result<PipelineRun, String>;
 
@@ -140,6 +142,7 @@ impl Host for NullHost {
         _stages: &[StageSpec],
         _input: Option<&[u8]>,
         _strict: bool,
+        _shown: bool,
         _env: &Record,
     ) -> Result<PipelineRun, String> {
         Err(String::from("this interpreter has no host attached, so it cannot run a program"))
@@ -200,6 +203,8 @@ pub struct MockLog {
     pub output: Vec<String>,
     /// The environment handed to each run.
     pub envs: Vec<Record>,
+    /// Whether each run's last stage was told it is shown.
+    pub shown: Vec<bool>,
 }
 
 impl Default for MockHost {
@@ -307,10 +312,12 @@ impl Host for MockHost {
         stages: &[StageSpec],
         input: Option<&[u8]>,
         strict: bool,
+        shown: bool,
         env: &Record,
     ) -> Result<PipelineRun, String> {
         {
             let mut log = self.log.borrow_mut();
+            log.shown.push(shown);
             log.runs.push(stages.to_vec());
             log.inputs.push(input.map(|b| b.to_vec()));
             log.envs.push(env.clone());

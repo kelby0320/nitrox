@@ -660,7 +660,7 @@ pub fn format(template: &str, args: &[Val]) -> OpResult<String> {
 }
 
 /// Render a value for `display`: a table as aligned columns, anything else as itself. A
-/// text-fallback stream prints as text, with no header; see [`text_fallback_lines`].
+/// text-fallback stream prints as text, with no header; see [`libstream::display::table`].
 ///
 /// `styled` colours the header row and nothing else: the shell knows which row is a header, and a
 /// value is data.
@@ -670,81 +670,19 @@ pub fn display(v: &Val, styled: bool) -> String {
         s.push('\n');
         return s;
     };
-    if let Some(text) = text_fallback_lines(t) {
-        return text;
+    let laid = libstream::display::table(t);
+    let mut out = String::new();
+    if let Some(head) = &laid.header {
+        // The row's newline comes after the reset: `tty_write_crlf` makes a chunk of anything
+        // following a `\n`, so a reset after it would become a line of its own.
+        out.push_str(&crate::style::paint(styled, crate::style::HEADER, head));
+        out.push('\n');
     }
-    let headers: Vec<String> = t.schema.fields.iter().map(|f| f.name.clone()).collect();
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.chars().count()).collect();
-    let cells: Vec<Vec<String>> = t
-        .rows
-        .iter()
-        .map(|row| {
-            row.iter()
-                // A null cell is drawn blank; a null inside a list is still `[null]`.
-                .map(|c| if *c == Value::Null { String::new() } else { Val::Data(c.clone()).render() })
-                .collect::<Vec<String>>()
-        })
-        .collect();
-    for row in &cells {
-        for (i, c) in row.iter().enumerate() {
-            if i < widths.len() {
-                widths[i] = widths[i].max(c.chars().count());
-            }
-        }
-    }
-    let mut head = String::new();
-    for (i, h) in headers.iter().enumerate() {
-        pad_into(&mut head, h, widths[i], i + 1 == headers.len());
-    }
-    // The row's newline comes after the reset: `tty_write_crlf` makes a chunk of anything
-    // following a `\n`, so a reset after it would become a line of its own.
-    let mut out = crate::style::paint(styled, crate::style::HEADER, &head);
-    out.push('\n');
-    for row in &cells {
-        // A row ends at its last non-empty cell, so trailing blanks leave no padding to wrap a
-        // narrow terminal; earlier blanks are padded to keep the columns aligned.
-        let end = row.iter().rposition(|c| !c.is_empty()).map_or(0, |i| i + 1);
-        for (i, c) in row.iter().enumerate().take(end) {
-            if i < widths.len() {
-                pad_into(&mut out, c, widths[i], i + 1 == end);
-            }
-        }
+    for row in &laid.rows {
+        out.push_str(row);
         out.push('\n');
     }
     out
-}
-
-/// A text-fallback stream rendered as the text it is: one row per line, no column header, so
-/// plain text wrapped as `Table<{line: String}>` still looks like text at the end of a pipeline.
-///
-/// `None` for anything else, including a stream that claims the flag but is not one `String`
-/// column: rendering the first column of a wider table as "the text" would hide the rest.
-fn text_fallback_lines(t: &Table) -> Option<String> {
-    if !t.flags.contains(libstream::StreamFlags::TEXT_FALLBACK) {
-        return None;
-    }
-    if t.schema.fields.len() != 1 || t.schema.fields[0].ty != libstream::TypeTag::String {
-        return None;
-    }
-    let mut out = String::new();
-    for row in &t.rows {
-        if let Some(Value::Str(line)) = row.first() {
-            out.push_str(line);
-        }
-        out.push('\n');
-    }
-    Some(out)
-}
-
-fn pad_into(out: &mut String, text: &str, width: usize, last: bool) {
-    out.push_str(text);
-    if last {
-        return;
-    }
-    for _ in text.chars().count()..width {
-        out.push(' ');
-    }
-    out.push_str("  ");
 }
 
 /// Serialise for `save`. `.tsm` is the native stream; `.txt` is one rendered row per line.
@@ -811,45 +749,6 @@ mod tests {
     use libstream::wire::Table;
     use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag};
 
-    fn text_stream(flags: StreamFlags, lines: &[&str]) -> Val {
-        let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE);
-        Val::Data(Value::Table(alloc::sync::Arc::new(Table {
-            flags,
-            schema,
-            rows: lines.iter().map(|l| vec![Value::Str(String::from(*l))]).collect(),
-        })))
-    }
-
-    #[test]
-    fn a_text_fallback_stream_displays_as_text_and_a_plain_table_keeps_its_header() {
-        // `clip` is the first producer of the flag.
-        assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &["one", "two"]), false), "one\ntwo\n");
-        // The control: without the flag the same rows are a table, and have columns.
-        assert_eq!(display(&text_stream(StreamFlags::NONE, &["one", "two"]), false), "line\none\ntwo\n");
-    }
-
-    #[test]
-    fn a_flag_on_the_wrong_shape_is_not_believed() {
-        // A producer setting the bit on a table that is not one `String` column is wrong: the
-        // header comes back.
-        let schema = Schema::new().field("line", TypeTag::String, TypeModifiers::NONE).field(
-            "n",
-            TypeTag::Int,
-            TypeModifiers::NONE,
-        );
-        let v = Val::Data(Value::Table(alloc::sync::Arc::new(Table {
-            flags: StreamFlags::TEXT_FALLBACK,
-            schema,
-            rows: vec![vec![Value::Str(String::from("one")), Value::Int(1)]],
-        })));
-        assert!(display(&v, false).starts_with("line"));
-    }
-
-    #[test]
-    fn an_empty_text_fallback_stream_displays_as_nothing() {
-        // An empty `clip` ring must not print a bare `line`, a column name.
-        assert_eq!(display(&text_stream(StreamFlags::TEXT_FALLBACK, &[]), false), "");
-    }
     use alloc::vec;
 
     fn table(names: &[&str], sizes: &[i64]) -> Val {
@@ -991,45 +890,26 @@ mod tests {
     }
 
     #[test]
-    fn display_lays_a_table_out_in_columns() {
-        let t = table(&["short", "a-longer-name"], &[1, 200]);
-        let out = display(&t, false);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "name           size");
-        assert_eq!(lines[1], "short          1");
-        assert_eq!(lines[2], "a-longer-name  200");
+    fn a_styled_display_wraps_only_the_header_line() {
+        let v = table(&["a", "b"], &[1, 2]);
+        let Val::Data(Value::Table(t)) = &v else { panic!("a table") };
+        let laid = libstream::display::table(t);
+        let mut want = String::new();
+        want.push_str(crate::style::HEADER);
+        want.push_str(laid.header.as_deref().unwrap());
+        want.push_str(crate::style::RESET);
+        want.push('\n');
+        for row in &laid.rows {
+            want.push_str(row);
+            want.push('\n');
+        }
+        assert_eq!(laid.rows.len(), 2);
+        assert_eq!(display(&v, true), want);
     }
 
     #[test]
     fn display_of_a_scalar_is_just_the_value() {
         assert_eq!(display(&Val::int(5), false), "5\n");
-    }
-
-    /// A null cell is blank and keeps its column's width; a bare `null` still says so, and a null
-    /// nested in a cell's list is still part of that list.
-    #[test]
-    fn a_null_cell_is_drawn_blank_and_a_bare_null_is_not() {
-        let schema = Schema::new()
-            .field("name", TypeTag::String, TypeModifiers::NONE)
-            .field("mounted", TypeTag::String, TypeModifiers::NULLABLE)
-            .field("by", TypeTag::String, TypeModifiers::NULLABLE);
-        let rows = vec![
-            vec![Value::Str("blk-0".into()), Value::Null, Value::Null],
-            vec![Value::Str("blk-2".into()), Value::Str("/".into()), Value::Str("init".into())],
-        ];
-        let t = Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows })));
-        let out = display(&t, false);
-        let lines: Vec<&str> = out.lines().collect();
-        assert_eq!(lines[0], "name   mounted  by");
-        assert_eq!(lines[1], "blk-0", "two blank cells, and no trailing padding after the last");
-        assert_eq!(lines[2], "blk-2  /        init");
-        assert!(!out.contains("null"), "{out:?}");
-
-        assert_eq!(display(&Val::Data(Value::Null), false), "null\n", "a bare null is the answer null");
-        let schema = Schema::new().field("xs", TypeTag::List, TypeModifiers::NONE);
-        let rows = vec![vec![Value::List(Arc::from(vec![Value::Null]))]];
-        let nested = Val::Data(Value::Table(Arc::new(Table { flags: StreamFlags::NONE, schema, rows })));
-        assert!(display(&nested, false).contains("[null]"), "a null inside a cell's list stays");
     }
 
     /// A table's header row is coloured and its values are not: a version wrapping the whole

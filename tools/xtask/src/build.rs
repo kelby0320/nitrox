@@ -35,6 +35,9 @@ pub(crate) const COREUTILS: &[&str] = &[
     // The size of the terminal a stage was handed, which a window's emulator tells the tty server
     // and a serial line cannot.
     "terminal",
+    // A pager: its input a page at a time, where the shell would show it on a terminal; `man`
+    // pages through the same library.
+    "page",
 ];
 
 /// The system services, packaged into the store like any other program.

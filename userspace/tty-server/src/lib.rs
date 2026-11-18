@@ -54,8 +54,17 @@ pub mod routing {
     pub enum ReadKind {
         /// `ReadLine`: completes when the discipline finishes a line.
         Line,
-        /// `Read`: completes as soon as any byte is available, discipline not consulted.
-        Raw,
+        /// `Read`: completes as soon as any byte is available, with at most this many, discipline
+        /// not consulted.
+        Raw(usize),
+    }
+
+    impl ReadKind {
+        /// A `Read` whose body is `body`: a count in its first byte, taken as 1 to [`RAW_CHUNK`],
+        /// or none, which is that.
+        pub fn raw(body: &[u8]) -> ReadKind {
+            ReadKind::Raw(body.first().map_or(RAW_CHUNK, |&n| usize::from(n).clamp(1, RAW_CHUNK)))
+        }
     }
 
     /// One terminal: its channel, its editing state, its backend, and the request it owes.
@@ -280,12 +289,12 @@ pub mod routing {
                 let Some(i) = self.ttys.iter().position(|t| t.backend == id && t.waiting.is_some()) else {
                     return acts; // nobody on this backend is reading; hold the bytes
                 };
-                if let Some((rid, ReadKind::Raw)) = self.ttys[i].waiting {
+                if let Some((rid, ReadKind::Raw(most))) = self.ttys[i].waiting {
                     // Stop at an interrupt, or one in the same chunk as earlier keystrokes would
                     // reach the client as an ordinary byte. Bytes before it are still input.
                     let q = &mut self.backends[bi].pending;
                     let stop = q.iter().position(|&b| b == 0x03).unwrap_or(q.len());
-                    let n = stop.min(RAW_CHUNK);
+                    let n = stop.min(most);
                     if n == 0 {
                         continue; // the interrupt is at the front; the branch above handles it
                     }
@@ -338,7 +347,7 @@ pub mod routing {
                     Some((rid, kind)) => {
                         let op = match kind {
                             ReadKind::Line => OP_READ_LINE,
-                            ReadKind::Raw => OP_READ,
+                            ReadKind::Raw(_) => OP_READ,
                         };
                         acts.push(Act::Reply { ch: t.ch, op, request_id: rid, body: Vec::new() });
                     }
@@ -401,7 +410,7 @@ pub mod routing {
         pub fn read(&mut self, ch: u64, request_id: u64, kind: ReadKind) -> Vec<Act> {
             let op = match kind {
                 ReadKind::Line => OP_READ_LINE,
-                ReadKind::Raw => OP_READ,
+                ReadKind::Raw(_) => OP_READ,
             };
             let Some(i) = self.ttys.iter().position(|t| t.ch == ch) else { return Vec::new() };
             if self.ttys[i].waiting.is_some() {
@@ -413,7 +422,7 @@ pub mod routing {
                 return alloc::vec![Act::Reply { ch, op, request_id, body: Vec::new() }];
             }
             // A partial line from a canonical read must not leak into a raw one.
-            if kind == ReadKind::Raw {
+            if matches!(kind, ReadKind::Raw(_)) {
                 self.ttys[i].disc.reset();
             }
             self.ttys[i].waiting = Some((request_id, kind));
@@ -423,7 +432,7 @@ pub mod routing {
     }
 
     /// Bytes a single raw read takes at most.
-    const RAW_CHUNK: usize = 64;
+    pub const RAW_CHUNK: usize = 64;
 }
 
 /// One-time tokens naming a terminal's backend — `Tty::Token` and `Tty::Redeem`.
@@ -729,11 +738,48 @@ mod routing_tests {
     #[test]
     fn a_raw_read_stops_at_an_interrupt_in_the_same_chunk() {
         let mut r = console_ttys(1);
-        r.read(1, 1, ReadKind::Raw);
+        r.read(1, 1, ReadKind::raw(&[]));
         let acts = r.feed(CONSOLE, b"ab\x03cd");
         let got = replies_to(&acts, 1);
         assert_eq!(got[0], (OP_TTY_READ, b"ab".to_vec()), "the bytes before the interrupt");
         assert!(got.iter().any(|(op, _)| *op == OP_TTY_INTERRUPT), "the interrupt was swallowed as data: {got:?}",);
+    }
+
+    /// A raw read takes at most what it asks for and leaves the rest queued: a pager that quits on
+    /// `q` leaves the shell what was typed after it.
+    #[test]
+    fn a_raw_read_takes_at_most_its_count_and_leaves_the_rest() {
+        let (mut r, win) = shell_and_stage_in_a_window();
+        r.read(2, 2, ReadKind::raw(&[1]));
+        assert_eq!(replies_to(&r.feed(win, b"qls\r"), 2), [(OP_TTY_READ, b"q".to_vec())]);
+        r.close_and_retire(2);
+        assert_eq!(replies_to(&r.read(1, 3, ReadKind::raw(&[])), 1), [(OP_TTY_READ, b"ls\r".to_vec())]);
+    }
+
+    #[test]
+    fn a_raw_reads_count_is_one_to_a_chunk() {
+        let counts = [&[][..], &[0], &[1], &[63], &[64], &[65], &[255, 1]].map(ReadKind::raw);
+        assert_eq!(counts, [64, 1, 1, 63, 64, 64, 64].map(ReadKind::Raw));
+    }
+
+    /// The server echoes a canonical read only: not a raw one, echo on, nor input with nobody
+    /// reading, so a program reading keys raw has no echo to turn off.
+    #[test]
+    fn a_raw_read_and_input_nobody_reads_are_never_echoed() {
+        let (mut r, win) = shell_and_stage_in_a_window();
+        r.set_mode(2, 1, true);
+        assert_eq!(written(&r.feed(win, b"ab"), Sink::Channel(0xAB)), b"", "nobody reading");
+        let acts = r.read(2, 2, ReadKind::raw(&[]));
+        assert_eq!(
+            (written(&acts, Sink::Channel(0xAB)), replies_to(&acts, 2)),
+            (Vec::new(), [(OP_TTY_READ, b"ab".to_vec())].to_vec())
+        );
+        r.read(2, 3, ReadKind::raw(&[]));
+        let acts = r.feed(win, b" jq");
+        assert_eq!(
+            (written(&acts, Sink::Channel(0xAB)), replies_to(&acts, 2)),
+            (Vec::new(), [(OP_TTY_READ, b" jq".to_vec())].to_vec())
+        );
     }
 
     /// A backend is a channel end the server can send on, receive from and wait on; lacking any

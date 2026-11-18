@@ -175,6 +175,22 @@ pub(crate) fn cmd_check_terminal(accel: Accel, size: DisplaySize) -> R<()> {
     session.expect(&format!("nxterm: grid> {}z", "a".repeat(76)))?;
     println!("  ok: a line wider than the grid was edited across its wrap, and ran as edited");
 
+    // **A table longer than the grid is paged** on the alternate screen, a row short of the grid for
+    // the status; Space turns it, and `q` gives back the screen, where the shell prompts again.
+    // Before the next line is typed: keys typed early would go to the pager. Not `man`: this
+    // `nxterm` is a service in init's namespace, which holds no manual.
+    let page = rows.parse::<usize>().map_err(|e| format!("grid rows {rows:?}: {e}"))? - 1;
+    type_at_terminal(&mut qmp, "1..300 | map { |n| {n: n} } | page")?;
+    session.expect(&format!("nxterm: grid> lines 1-{page} of "))?;
+    press(&mut qmp, "spc")?;
+    // Line `k` shows `k`, under the header: the second page's last row, which the cursor never
+    // passes, is read as the redraw changed it.
+    session.expect(&format!("nxterm: grid> {}", 2 * page - 1))?;
+    session.expect(&format!("nxterm: grid> lines {}-{} of ", page + 1, 2 * page))?;
+    press(&mut qmp, "q")?;
+    session.expect("nxterm: grid> />")?;
+    println!("  ok: a long page was paged {page} rows at a time, turned, and left for the prompt");
+
     // The title follows the shell's current directory; that it changes once, not per prompt, is
     // `a_repeated_announcement_is_not_a_change` (`expect` cannot assert an absence).
     type_at_terminal(&mut qmp, "cd /home")?;

@@ -14,7 +14,7 @@ pub const PROMPT: &str = "\x1b[96m";
 pub const BANNER: &str = "\x1b[36m";
 
 /// Bright black — a table's header row, and the shell's notes about itself (`#8FA5A3`).
-pub const HEADER: &str = "\x1b[90m";
+pub const HEADER: &str = libstream::display::HEADER;
 
 /// Bright red — a diagnostic. The design's `#D68A83`.
 pub const DIAG: &str = "\x1b[91m";

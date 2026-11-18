@@ -135,6 +135,7 @@ impl Host for NitroxHost {
         stages: &[StageSpec],
         input: Option<&[u8]>,
         strict: bool,
+        shown: bool,
         env: &libstream::wire::Record,
     ) -> Result<PipelineRun, String> {
         if stages.is_empty() {
@@ -163,7 +164,7 @@ impl Host for NitroxHost {
         let tty = tty.as_deref();
         let names: Vec<&str> = stages.iter().map(|s| s.program.as_str()).collect();
         let mut p = Pipeline::new(stages::Stages::new(self, images, &argvs, env));
-        let ends = p.start(&names, input.is_some())?;
+        let ends = p.start(&names, input.is_some(), shown)?;
 
         // An interrupt that arrived during setup: handing a stage its terminal is a tty exchange,
         // and `Tty::await_reply` records a `Ctrl-C` there rather than leaving it queued, so the

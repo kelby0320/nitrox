@@ -9,6 +9,7 @@ struct Fake {
     moved: Vec<u64>,
     children: Vec<u64>,
     terminated: Vec<u64>,
+    shown: Vec<usize>,
     awaited: bool,
     calls: usize,
     fail_at: Option<usize>,
@@ -48,8 +49,11 @@ impl Sys for &mut Fake {
     fn terminal(&mut self) -> Option<u64> {
         (!self.fails()).then(|| self.handle())
     }
-    fn send_setup(&mut self, _stage: usize, _setup: u64, streams: Streams, terminal: Option<u64>) -> bool {
+    fn send_setup(&mut self, stage: usize, _setup: u64, streams: Streams, terminal: Option<u64>, shown: bool) -> bool {
         self.moved.extend(streams.ordered().into_iter().chain(terminal));
+        if shown {
+            self.shown.push(stage);
+        }
         !self.fails()
     }
     fn say(&mut self, _what: &str) {}
@@ -87,11 +91,11 @@ const NAMES: [&str; 3] = ["a", "b", "c"];
 #[test]
 fn a_start_failing_at_any_call_gives_everything_back() {
     let mut all = Fake::failing(None);
-    Pipeline::new(&mut all).start(&NAMES, true).unwrap();
+    Pipeline::new(&mut all).start(&NAMES, true, false).unwrap();
     assert_eq!(all.calls, 2 + 6 * NAMES.len(), "two pipes, then six calls a stage");
     for at in 0..all.calls {
         let mut f = Fake::failing(Some(at));
-        let started = Pipeline::new(&mut f).start(&NAMES, true).is_ok();
+        let started = Pipeline::new(&mut f).start(&NAMES, true, false).is_ok();
         given_back(&f, false, &format!("call {at} failing, started {started}"));
     }
 }
@@ -102,14 +106,14 @@ fn a_start_failing_at_any_call_gives_everything_back() {
 fn a_started_pipeline_gives_everything_back_left_or_reaped() {
     let mut f = Fake::failing(None);
     let mut p = Pipeline::new(&mut f);
-    let ends = p.start(&NAMES, true).unwrap();
+    let ends = p.start(&NAMES, true, false).unwrap();
     assert!(ends.feed.is_some() && ends.capture.is_some());
     drop(p);
     given_back(&f, false, "left");
 
     let mut f = Fake::failing(None);
     let mut p = Pipeline::new(&mut f);
-    let ends = p.start(&NAMES, false).unwrap();
+    let ends = p.start(&NAMES, false, false).unwrap();
     assert_eq!(ends.feed, None);
     for h in [ends.capture.unwrap(), ends.diagnostics] {
         p.close(h);
@@ -128,7 +132,7 @@ fn a_started_pipeline_gives_everything_back_left_or_reaped() {
 fn a_start_keeps_only_its_ends_and_stages() {
     let mut f = Fake::failing(None);
     let mut p = Pipeline::new(&mut f);
-    let ends = p.start(&NAMES, true).unwrap();
+    let ends = p.start(&NAMES, true, false).unwrap();
     let fake = &p.sys;
     let open = |h: &&u64| !fake.closed.contains(h) && !fake.moved.contains(h);
     let mut held: Vec<u64> = fake.made.iter().filter(open).copied().collect();
@@ -137,4 +141,14 @@ fn a_start_keeps_only_its_ends_and_stages() {
     held.sort();
     want.sort();
     assert_eq!(held, want);
+}
+
+/// **Only a shown pipeline's last stage is told so**: the stages before it feed another stage.
+#[test]
+fn only_the_last_stage_of_a_shown_pipeline_is_told_it_is_shown() {
+    for (shown, want) in [(true, vec![NAMES.len() - 1]), (false, vec![])] {
+        let mut f = Fake::failing(None);
+        Pipeline::new(&mut f).start(&NAMES, false, shown).unwrap();
+        assert_eq!(f.shown, want, "shown {shown}");
+    }
 }

@@ -16,7 +16,7 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
         return fail(b"no channel");
     };
     let long = "x".repeat(5000);
-    let streams = StageStreams { stdin: None, stdout: Some(tx), stderr: None };
+    let streams = StageStreams { stdin: None, stdout: Some(tx), stderr: None, shown: false };
     let refused = send_stage_setup(&ours, streams, Some(t), &[&long], &Record::default(), Deadline::NEVER);
     // The handles gone are the ones whose peers see them close.
     let gone = peer_gone_by(&rx, clock_ns() + 2_000 * MS) && peer_gone_by(&peer, clock_ns() + 2_000 * MS);
@@ -25,7 +25,7 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
     let Ok((y, y_peer)) = open_pipe(4) else {
         return fail(b"no channel");
     };
-    let streams = StageStreams { stdin: None, stdout: Some(y), stderr: None };
+    let streams = StageStreams { stdin: None, stdout: Some(y), stderr: None, shown: false };
     let sent = send_stage_setup(&ours, streams, None, &["stage"], &Record::default(), Deadline::NEVER);
     let received = theirs.recv(&mut Msg::new()).ok();
     let one = received.as_ref().is_some_and(|carried| carried.len() == 1);
@@ -36,7 +36,7 @@ pub(super) fn a_refused_setup_message_closes_its_handles_test() -> bool {
         return fail(b"no channel");
     };
     drop(theirs);
-    let streams = StageStreams { stdin: None, stdout: Some(x), stderr: None };
+    let streams = StageStreams { stdin: None, stdout: Some(x), stderr: None, shown: false };
     let peerless = send_stage_setup(&dead, streams, None, &["stage"], &Record::default(), Deadline::NEVER);
     let closed = peer_gone_by(&x_peer, clock_ns() + 2_000 * MS);
     if peerless.is_ok() || !closed {

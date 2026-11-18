@@ -32,6 +32,7 @@ extern crate alloc;
 
 pub mod channel;
 pub mod diag;
+pub mod display;
 pub mod record;
 pub mod setup;
 pub mod table;

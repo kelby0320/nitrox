@@ -32,6 +32,8 @@ pub mod value;
 #[cfg(test)]
 mod exec_tests;
 #[cfg(test)]
+mod shown_tests;
+#[cfg(test)]
 mod tilde_tests;
 #[cfg(test)]
 mod use_tests;

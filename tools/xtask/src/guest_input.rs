@@ -275,6 +275,9 @@ pub(crate) fn qcode_for(c: char) -> R<(String, bool)> {
         '(' => s("9", true),
         ')' => s("0", true),
         '|' => s("backslash", true),
+        '{' => s("bracket_left", true),
+        '}' => s("bracket_right", true),
+        ':' => s("semicolon", true),
         other => Err(format!(
             "no qcode for {other:?} — add one to `qcode_for` rather than letting a command line \
              lose a character"

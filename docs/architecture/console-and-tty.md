@@ -1,7 +1,8 @@
 # Console and TTY
 
-**Status: stages 1–4 built; last checked 2026-11-17**, when a terminal gained a size: a window's
-emulator tells the server its grid and a program asks it (`Tty::Size`, pre-Phase-7 Part G.2). On
+**Status: stages 1–4 built; last checked 2026-11-17**, when a program came to page on its terminal
+(pre-Phase-7 Part G.3), and earlier that day a terminal gained a size: a window's emulator tells
+the server its grid and a program asks it (`Tty::Size`, G.2). On
 2026-10-19 the line discipline gained a cursor and the editing keys, which `nxsh` acts on and
 canonical mode drops (pre-Phase-7 Part C.2). On
 2026-10-02 a stage's diagnostics gained a level — an error, a warning or a notice, each drawn its own way — and `nxsh --help` started writing to the terminal it was handed rather than to `kprint` (the laptop polish's Part E). On 2026-09-30 a program `with` runs in a view started getting the stage's `stderr` (it had none, so on the laptop it printed nothing). On 2026-09-23 every stage `nxsh` spawns started getting a terminal of its own — a sibling of the shell's, on the same backend, minted by `Tty::OpenSibling` (administration Part A.2). Before that, on 2026-09-17, a *stage's* diagnostics stopped going to `kprint` and started reaching the terminal the shell holds (Phase 5 Part H.1). The server exists, `/dev/tty` is a capability, and
@@ -298,6 +299,17 @@ each stage's sibling — answers it to `Tty::Size`. Nothing is pushed: `nxsh` as
 and at `Ctrl-C`, so its line and its completion listing fit a window refitted mid-line, and `man`
 asks before it renders. The
 console's size is unknown, as a serial line cannot say, and a program draws to 80 columns there.
+
+**A program pages on its terminal** (pre-Phase-7 Part G.3) where the shell tells it its output is
+shown there ([`pipeline-stdio.md`](../spec/pipeline-stdio.md) § Payload): `page`, and `man`
+through the same pager in the coreutils library. It draws in place of writing its output, on the
+**alternate screen** `libterm` keeps (`ESC [ ? 1049 h`, and `l` to leave), which comes up clear,
+keeps no history, and gives back the screen it covered; it reads the keys raw, a byte at a time so
+that what is typed after `q` stays queued for the shell, decodes them as the shell does
+(`libline::Keys`), and asks the size at every key. It turns no echo off: the server echoes a
+canonical read only. `Ctrl-C`, an
+`Interrupt` or a read answered empty, leaves it as `q` does. A serial line's far terminal may have
+no alternate screen, and the pages then stay in its scrollback.
 
 ## Stage 3 — line editing, history, and where they belong
 

@@ -131,13 +131,13 @@ fn a_setup_message_moves_its_handles_and_the_stage_receives_them() {
     let (stderr, _stderr_peer) = pair();
     let terminal = end();
     let (out_raw, err_raw, term_raw) = (stdout.raw().0, stderr.raw().0, terminal.raw().0);
-    let streams = StageStreams { stdout: Some(stdout), stderr: Some(stderr), ..Default::default() };
+    let streams = StageStreams { stdout: Some(stdout), stderr: Some(stderr), shown: true, ..Default::default() };
     send_stage_setup(&shell, streams, Some(terminal), &["nxsh", "-c"], &Record::default(), Deadline::NEVER).unwrap();
     assert!(![out_raw, err_raw, term_raw].iter().any(|&h| mock::is_open(h)), "moved, not kept");
 
     let got = receive_setup(&stage, Deadline::POLL).unwrap().unwrap();
     assert_eq!(got.argv, ["nxsh", "-c"]);
-    assert!(got.streams.stdin.is_none() && got.terminal.is_some());
+    assert!(got.streams.stdin.is_none() && got.terminal.is_some() && got.streams.shown);
     let stdout = got.streams.stdout.unwrap();
     let mut m = Msg::new();
     stdout.send(&m, &mut Carried::new()).unwrap();
@@ -178,7 +178,7 @@ fn a_setup_too_large_to_send_closes_its_handles_and_says_so() {
 /// A setup message made by hand, `extra` handles beyond the ones its payload names.
 fn handmade(streams: u32, terminal: bool, handles: usize) -> (Handle<Channel, Only>, Vec<u64>) {
     let (shell, stage) = pair();
-    let payload = crate::setup::SetupPayload { streams, argv: Vec::new(), env: Record::default(), terminal };
+    let payload = crate::setup::SetupPayload { streams, terminal, ..Default::default() };
     let mut msg = Msg::new();
     msg.set(&payload.encode().unwrap()).unwrap();
     let mut carried = Carried::new();

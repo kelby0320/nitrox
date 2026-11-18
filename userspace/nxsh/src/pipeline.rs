@@ -21,7 +21,7 @@ pub trait Sys {
     fn terminal(&mut self) -> Option<u64>;
     /// Send stage `stage` its setup message on `setup`. **Every handle in it is gone on every
     /// return**, moved or closed (`libstream::setup::send_stage_setup`).
-    fn send_setup(&mut self, stage: usize, setup: u64, streams: Streams, terminal: Option<u64>) -> bool;
+    fn send_setup(&mut self, stage: usize, setup: u64, streams: Streams, terminal: Option<u64>, shown: bool) -> bool;
     /// Tell the person something.
     fn say(&mut self, what: &str);
     /// Close a handle the shell holds.
@@ -88,8 +88,8 @@ impl<S: Sys> Pipeline<S> {
     }
 
     /// **Start a stage for each of `names`**, each spawned and sent its streams in turn, the first
-    /// fed when `input`: the ends the shell goes on with.
-    pub fn start(&mut self, names: &[&str], input: bool) -> Result<Ends, String> {
+    /// fed when `input` and the last told it is shown when `shown`: the ends the shell goes on with.
+    pub fn start(&mut self, names: &[&str], input: bool, shown: bool) -> Result<Ends, String> {
         let (mut upstream, mut feed) = (None, None);
         if input {
             let (rx, tx) = self.pipe(4, "an input pipe")?;
@@ -121,7 +121,7 @@ impl<S: Sys> Pipeline<S> {
             for h in streams.stdin.into_iter().chain([tx]) {
                 self.disown(h);
             }
-            if !self.sys.send_setup(i, setup, streams, terminal) {
+            if !self.sys.send_setup(i, setup, streams, terminal, shown && i + 1 == names.len()) {
                 return Err(format!("could not hand `{name}` its streams"));
             }
             self.close(setup);

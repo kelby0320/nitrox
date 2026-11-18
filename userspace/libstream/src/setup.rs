@@ -16,7 +16,8 @@
 //!
 //! The stream endpoints ride as transferred handles in the IPC message, packed in the
 //! canonical order **stdin, stdout, stderr** (only those present — see [`Streams`]). The
-//! payload is a TSM1 `Record { streams: Int, argv: List<String>, env: Record, terminal: Int }`
+//! payload is a TSM1 `Record { streams: Int, argv: List<String>, env: Record, terminal: Int,
+//! shown: Int }`
 //! ([`SetupPayload`]); fields are appended without a version bump, as readers ignore
 //! fields they don't know.
 
@@ -142,6 +143,8 @@ pub struct SetupPayload {
     /// because `/dev/tty` cannot name a *particular* terminal; an emulator hands its shell
     /// its own.
     pub terminal: bool,
+    /// `stdout` is shown on the terminal as it comes, so the stage may draw there instead.
+    pub shown: bool,
 }
 
 /// Split a setup message's transferred handles into its streams and its terminal.
@@ -159,7 +162,8 @@ pub fn split_handles(payload: &SetupPayload, handles: &[u64]) -> Result<(Streams
 }
 
 impl SetupPayload {
-    /// Encode as a TSM1 `Record { streams: Int, argv: List<String>, env: Record }`.
+    /// Encode as a TSM1 `Record { streams: Int, argv: List<String>, env: Record, terminal: Int,
+    /// shown: Int }`.
     ///
     /// Fields are **appended**, never inserted: [`decode`](Self::decode) reads by position,
     /// so reordering them would break every existing stage.
@@ -168,7 +172,8 @@ impl SetupPayload {
             .field("streams", TypeTag::Int, TypeModifiers::NONE)
             .field("argv", TypeTag::List, TypeModifiers::NONE)
             .field("env", TypeTag::Record, TypeModifiers::NONE)
-            .field("terminal", TypeTag::Int, TypeModifiers::NONE);
+            .field("terminal", TypeTag::Int, TypeModifiers::NONE)
+            .field("shown", TypeTag::Int, TypeModifiers::NONE);
         let argv: Vec<Value> = self.argv.iter().map(|s| Value::Str(s.clone())).collect();
         let record = Record {
             schema,
@@ -177,6 +182,7 @@ impl SetupPayload {
                 Value::List(Arc::from(argv)),
                 Value::Record(Arc::new(self.env.clone())),
                 Value::Int(self.terminal as i64),
+                Value::Int(self.shown as i64),
             ],
         };
         let mut buf = Vec::new();
@@ -208,7 +214,8 @@ impl SetupPayload {
         }
         let env = record.values.get(2).and_then(|v| v.as_record()).cloned().unwrap_or_default();
         let terminal = record.values.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0;
-        Ok(SetupPayload { streams, argv, env, terminal })
+        let shown = record.values.get(4).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        Ok(SetupPayload { streams, argv, env, terminal, shown })
     }
 }
 
@@ -238,6 +245,8 @@ mod io_stage {
         pub stdout: Option<Handle<Channel, Only>>,
         /// The shared diagnostic sink, if any.
         pub stderr: Option<Handle<Channel, Only>>,
+        /// `stdout` is shown on the terminal as it comes. See [`SetupPayload::shown`].
+        pub shown: bool,
     }
 
     impl StageStreams {
@@ -273,6 +282,7 @@ mod io_stage {
             argv: argv.iter().map(|s| String::from(*s)).collect(),
             env: env.clone(),
             terminal: terminal.is_some(),
+            shown: streams.shown,
         }
         // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge`, not `SinkFull`.
         .encode()?;
@@ -327,6 +337,7 @@ mod io_stage {
             stdin: take(payload.streams & super::STREAM_STDIN != 0)?,
             stdout: take(payload.streams & super::STREAM_STDOUT != 0)?,
             stderr: take(payload.streams & super::STREAM_STDERR != 0)?,
+            shown: payload.shown,
         };
         debug_assert_eq!(streams.bitmap(), payload.streams & STREAM_MASK);
         let terminal = take(payload.terminal)?;
@@ -340,8 +351,7 @@ mod tests {
     #[test]
     fn a_claimed_terminal_with_no_handle_transferred_is_refused() {
         // Not `Some(0)`: only the transferred `count` proves a handle, not the array bound.
-        let claims =
-            SetupPayload { streams: STREAM_STDOUT, argv: alloc::vec![], env: Record::default(), terminal: true };
+        let claims = SetupPayload { streams: STREAM_STDOUT, terminal: true, ..Default::default() };
         assert!(split_handles(&claims, &[7]).is_err(), "one handle is the stream's");
         let (streams, terminal) = split_handles(&claims, &[7, 9]).expect("both transferred");
         assert_eq!(streams.stdout, Some(7));
@@ -350,7 +360,7 @@ mod tests {
 
     #[test]
     fn a_payload_with_no_terminal_ignores_a_handle_beyond_its_streams() {
-        let none = SetupPayload { streams: STREAM_STDIN, argv: alloc::vec![], env: Record::default(), terminal: false };
+        let none = SetupPayload { streams: STREAM_STDIN, ..Default::default() };
         let (streams, terminal) = split_handles(&none, &[3, 4]).expect("ok");
         assert_eq!(streams.stdin, Some(3));
         assert_eq!(terminal, None);
@@ -363,6 +373,7 @@ mod tests {
             argv: alloc::vec![String::from("nxsh")],
             env: Record::default(),
             terminal: true,
+            shown: false,
         };
         let got = SetupPayload::decode(&with.encode().unwrap()).unwrap();
         assert_eq!(got, with);
@@ -372,6 +383,28 @@ mod tests {
         let got = SetupPayload::decode(&without.encode().unwrap()).unwrap();
         assert!(!got.terminal, "a payload with no terminal decoded as having one");
         assert_ne!(with.encode().unwrap(), without.encode().unwrap());
+    }
+
+    /// `shown` comes through, and a payload from before it reads as not shown.
+    #[test]
+    fn shown_survives_the_round_trip_and_its_absence_is_not_shown() {
+        let shown = SetupPayload { streams: STREAM_STDOUT, terminal: true, shown: true, ..Default::default() };
+        assert_eq!(SetupPayload::decode(&shown.encode().unwrap()).unwrap(), shown);
+        let schema = Schema::new()
+            .field("streams", TypeTag::Int, TypeModifiers::NONE)
+            .field("argv", TypeTag::List, TypeModifiers::NONE)
+            .field("env", TypeTag::Record, TypeModifiers::NONE)
+            .field("terminal", TypeTag::Int, TypeModifiers::NONE);
+        let values = alloc::vec![
+            Value::Int(STREAM_STDOUT as i64),
+            Value::List(Arc::from(alloc::vec![])),
+            Value::Record(Arc::new(Record::default())),
+            Value::Int(1),
+        ];
+        let mut old = alloc::vec::Vec::new();
+        write_value(&mut old, &Value::Record(Arc::new(Record { schema, values }))).unwrap();
+        let got = SetupPayload::decode(&old).expect("a four-field message still decodes");
+        assert!(got.terminal && !got.shown, "{got:?}");
     }
 
     #[test]
@@ -407,12 +440,8 @@ mod tests {
             schema = schema.field(&name, TypeTag::String, TypeModifiers::NONE);
             values.push(Value::Str(String::from("0123456789012345")));
         }
-        let p = SetupPayload {
-            terminal: false,
-            streams: 0,
-            argv: alloc::vec![String::from("x")],
-            env: Record { schema, values },
-        };
+        let p =
+            SetupPayload { argv: alloc::vec![String::from("x")], env: Record { schema, values }, ..Default::default() };
         match p.encode() {
             Err(WireError::SetupTooLarge) => {}
             Err(e) => panic!("expected SetupTooLarge, got {e:?}"),
@@ -434,10 +463,10 @@ mod tests {
     #[test]
     fn env_round_trips_as_a_typed_record() {
         let p = SetupPayload {
-            terminal: false,
             streams: 0b011,
             argv: alloc::vec![String::from("list"), String::from("--long")],
             env: env_record(),
+            ..Default::default()
         };
         let back = SetupPayload::decode(&p.encode().expect("encodes")).expect("decodes");
         assert_eq!(back.streams, p.streams);
@@ -450,8 +479,7 @@ mod tests {
 
     #[test]
     fn an_absent_environment_is_empty_not_an_error() {
-        let p =
-            SetupPayload { terminal: false, streams: 0, argv: alloc::vec![String::from("x")], env: Record::default() };
+        let p = SetupPayload { argv: alloc::vec![String::from("x")], ..Default::default() };
         let back = SetupPayload::decode(&p.encode().expect("encodes")).expect("decodes");
         assert!(back.env.values.is_empty());
     }
@@ -524,8 +552,7 @@ mod tests {
             vec![String::from("copy"), String::from("/a"), String::from("/b")],
             vec![String::from("echo"), String::from(""), String::from("héllo")],
         ] {
-            let p =
-                SetupPayload { terminal: false, streams: STREAM_STDOUT | STREAM_STDERR, argv, env: Record::default() };
+            let p = SetupPayload { streams: STREAM_STDOUT | STREAM_STDERR, argv, ..Default::default() };
             let bytes = p.encode().unwrap();
             assert_eq!(SetupPayload::decode(&bytes).unwrap(), p);
         }

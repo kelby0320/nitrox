@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -392,6 +392,66 @@ page.
 
 **Docs**: [`pipeline-stdio.md`](../spec/pipeline-stdio.md), on a stage drawing to its terminal;
 `page(1)`.
+
+**Built 2026-11-17** (`aa8625c9`, `2a643748`, `b365dfb1`, `7571317f`, `7b7c4a2f`, `a7d99dc7`).
+- **The table display** moved into `libstream::display`, with the value rendering under it and the
+  header's colour: the shell and the pager lay a table out, and paint its header, one way.
+- **The alternate screen** in `libterm`: `ESC [ ? 1049 h` and `l`, a second grid with no history,
+  the main one rewrapped beneath it at a refit.
+- **The pager**, `coreutils::pager`: a pure model, the keys the plan named, a status row; and a
+  driver that pages on the stage's terminal, echo off, the keys read raw, the size asked at every
+  key, `Ctrl-C` leaving as `q` does. **`page`**, and **`man`** through it, a page or its listing.
+- **`nxterm`'s receipts** report every row a chunk changed while the alternate screen is up.
+
+**Departures, for the maintainer's eye:**
+- **A stage pages only where its output is shown**, the maintainer's call: the plan's "when it has
+  a terminal" would page inside `man | count` and `let x = man ls`, a stage having a terminal
+  mid-pipeline. The setup message gains `shown`, appended, which the shell sets on the last stage
+  of a pipeline, a program's call or a bare name the REPL displays, and nowhere else
+  ([`pipeline-stdio.md`](../spec/pipeline-stdio.md) § Payload). Where `page` is not shown, or one
+  page holds its input, it passes the input on unchanged; `man` writes as ever.
+- **`check-terminal` pages `page`'s input, not `man`**: the test image's `nxterm` is a service in
+  init's namespace, which holds no manual. `test-interactive` pages `man`.
+- **The receipts cover the alternate screen only**: on the main one, output scrolls and every row
+  would change, a flood the gates' scans would trip on.
+- **`libline::Keys`**, the discipline's escape decoding on its own, so the pager reads keys as the
+  shell does; and `libprompt::write_on` and `set_echo_on`.
+- **Size raised by hand**: `eval.rs` by seven lines, where the statement sets the flag and its
+  pipeline takes it, and the view broker's `main.rs` by one, its literal's field.
+
+**Tests**: the display's layout and rendering, moved with it, and the shell's paint of it; the
+decoder alone; the alternate screen's switch, its history, its refit, and its parsing; `shown`
+through the payload, the send and the receive, which run is told line by line, and only the last
+stage; the pager's rows, controls, keys, search, status, refit and drawing, and on a terminal the
+mock plays, its alternate screen, echo, a refit at the next key, `Ctrl-C`, a failing terminal and
+a page that fits; `write_on` in parts, and echo. **Controls**: 9 mutations of the alternate screen,
+11 of `shown`, 20 of the pager, each failing a test; `check-terminal` fails at the second page's
+last row with the receipts' alternate-screen rows off, and at the first page's status with `shown`
+never set.
+
+**The gates**:
+- **`check-terminal`**: `1..300 | map { |n| {n: n} } | page`, paged a row short of the grid, turned
+  with Space, its second page's last row read, left with `q` for the prompt;
+- **`test-interactive`**: `man man` paged at 80 by 24 and turned, `man 5 manual-page` paged and
+  left, and a table far over a page passed through `page` to `count` (57 steps).
+
+**After review** (#453, fourteen findings: nine fixed, two deferred, one the maintainer's call
+written down, one declined, one refuted; `b1260430`, `47315438`):
+- **`n` goes on from the page shown**: from the line last found only while the page shows it, so
+  moving back above a match no longer skips every match before it.
+- **A raw read takes a count** (`rsproto-tty-ops.md` § Read): the pager reads a byte at a time, so
+  what is typed after `q` stays queued for the shell. **It turns no echo off**: the server echoes a
+  canonical read only, which a routing test now holds; `libprompt::set_echo_on` went.
+- **An escape sequence is dropped whole**, so a coloured cell shows its text, not `[31m`.
+- **What a program paged is not kept**, the maintainer's call, written into the shell spec's
+  `$last` and both pages.
+- **Deferred**: a diagnostic the shell draws while a page is up (`TODO(diag-on-alternate)`), and a
+  stage that ends on the alternate screen (`TODO(alt-screen-crash)`). **Declined**: a host test for
+  the shell's own `send_setup`, in its binary, which `check-terminal` holds. **Refuted**: the gates'
+  paging waits, each failing where a broken Space should fail them.
+- **Tests**: the terminate request and `show`'s guard driven through a stage built from a setup
+  message; a refit's clamp and an empty search; the alternate screen's selection, damage, crop and
+  cursor, against a grid's invariants; the raw read's count, its rest, and its echo.
 
 ### G.4 The shell's operators, and `help`
 

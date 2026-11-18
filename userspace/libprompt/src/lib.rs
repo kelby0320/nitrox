@@ -21,7 +21,9 @@ use alloc::vec::Vec;
 use libkern::scrub;
 use libos::{Channel, Deadline, Only, Ref, WaitSet};
 use librsproto::tty::Size;
-use librsproto::{OP_TTY_INTERRUPT, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_SIZE, OP_TTY_WRITE, TTY_MODE_ECHO};
+use librsproto::{
+    OP_TTY_INTERRUPT, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_SIZE, OP_TTY_WRITE, RS_MAX_BODY, TTY_MODE_ECHO,
+};
 
 use ipc::{ready, receive, transmit};
 
@@ -53,6 +55,13 @@ pub fn size_on<'a>(term: impl Into<Ref<'a, Channel, Only>>) -> Option<Size> {
         Some((false, body)) => Size::decode(&body).filter(|s| s.is_known()),
         _ => None,
     }
+}
+
+/// Write `bytes` on `term`, in parts a message carries: `false` if the terminal refused one or is
+/// gone. An `Interrupt` meanwhile is stepped over, as [`size_on`] steps over one.
+pub fn write_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, bytes: &[u8]) -> bool {
+    let term = term.into();
+    bytes.chunks(RS_MAX_BODY).all(|part| matches!(tty(term, OP_TTY_WRITE, part, &mut false), Some((false, _))))
 }
 
 /// Ask for a line on `term`, echo on. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.

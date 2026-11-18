@@ -4,6 +4,7 @@
 //! clamps and never wraps or scrolls; erasing fills with the current background; scrolling
 //! moves a line into a bounded scrollback ring.
 
+use alloc::boxed::Box;
 use alloc::collections::VecDeque;
 use alloc::string::String;
 use alloc::vec;
@@ -152,6 +153,8 @@ pub struct Grid {
     /// The range a person has swept out, if any. The grid's, since reflow and eviction both
     /// invalidate it.
     selection: Option<Selection>,
+    /// The main screen while the alternate one is shown ([`Op::AltScreen`]).
+    main: Option<Box<Screen>>,
 }
 
 /// Only exactly-blank cells past `keep`: a space written with a background colour is content.
@@ -187,6 +190,7 @@ impl Grid {
             cursor_drawn: (0, 0),
             scrolled: 0,
             selection: None,
+            main: None,
         }
     }
 
@@ -478,6 +482,9 @@ impl Grid {
         if cols == self.cols && rows == self.rows {
             return Reflow { base: self.oldest_line(), at: Vec::new(), lines: Vec::new(), cols, evicted: 0 };
         }
+        if self.main.is_some() {
+            return self.resize_alternate(cols, rows);
+        }
         let base = self.oldest_line();
 
         // 1. Every line there is, oldest first: old absolute number `base + i` for index `i`.
@@ -645,6 +652,7 @@ impl Grid {
             Op::EraseInDisplay(e) => self.erase_in_display(e),
             Op::EraseInLine(e) => self.erase_in_line(e),
             Op::Attr(s) => self.attr(s),
+            Op::AltScreen(on) => self.switch_screen(on),
         }
     }
 
@@ -724,8 +732,16 @@ impl Grid {
 
     /// Move the top line into scrollback and open a blank one at the bottom.
     fn scroll_up(&mut self) {
-        let cells = self.cells[0..self.cols].to_vec();
-        self.scrollback.push_back(Line { cells, wrapped: self.wrapped[0], printed: self.printed[0] });
+        // The alternate screen keeps no history, and its lines are not the main one's to count.
+        if self.main.is_none() {
+            let cells = self.cells[0..self.cols].to_vec();
+            self.scrollback.push_back(Line { cells, wrapped: self.wrapped[0], printed: self.printed[0] });
+            // Counts lines produced; eviction below does not adjust it.
+            self.scrolled += 1;
+            while self.scrollback.len() > SCROLLBACK {
+                self.scrollback.pop_front();
+            }
+        }
         // The flags move with their rows.
         self.wrapped.rotate_left(1);
         if let Some(last) = self.wrapped.last_mut() {
@@ -734,11 +750,6 @@ impl Grid {
         self.printed.rotate_left(1);
         if let Some(last) = self.printed.last_mut() {
             *last = 0;
-        }
-        // Counts lines produced; eviction below does not adjust it.
-        self.scrolled += 1;
-        while self.scrollback.len() > SCROLLBACK {
-            self.scrollback.pop_front();
         }
         self.cells.copy_within(self.cols.., 0);
         let blank = self.blank();
@@ -835,6 +846,10 @@ impl Grid {
         }
     }
 }
+
+mod alternate;
+
+use alternate::Screen;
 
 #[cfg(test)]
 mod tests;
