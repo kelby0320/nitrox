@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18; G.6 built 2026-11-18.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -619,6 +619,37 @@ example's row with `select` keeping one column.
 **The gate**: `test-interactive` runs `list --help` and `man list`.
 
 Author; the pages can be the implementer's, from the `HELP` texts and the code.
+
+**Built 2026-11-18** (`198fc6fe`, `27bab753`).
+- **A page in section 1 for every program in `/bin`**: the 21 coreutils, `nxsh`, `nxinstall`, and
+  the applications `nxterm`, `nxfiles` and `nxedit`, with their menus and keys. 24 new pages, the
+  implementer's from the sources and the spec's rows, each claim checked against the source; a
+  test holds that every program `/bin` ships has one.
+- **A coreutil's flags and usage are one table**, `coreutils::usage`: the program parses with it,
+  and `--help` prints the usage line, a sentence, and the options from it, lined up and wrapped at
+  80 columns. A flag carries the words after it (`--mount DEVICE [LABEL]`).
+- **Every program in section 1 answers `--help`**: `nxsh` with a short overview, and the three
+  applications, before they open a window (`libstream::channel::answer_help`).
+
+**Departures, for the maintainer's eye:**
+- **The tables are in one module of the coreutils library**, not each program's file: one test
+  can then hold every program's flags to its page, and its `--help` to 80 columns.
+- **`with` keeps reading its options by hand**, the first word deciding; its table is held to the
+  arms that read them, both ways.
+- **A flag is held to its page's Options section**, not the page at large, where a passing mention
+  would satisfy it.
+- **No service is in `/bin`**, so the check has nothing to send to the services' page yet.
+- **Size raised by hand**: `nxfiles`'s `main.rs` by one line, its `--help`.
+
+**Tests**: every program's `--help` within 80 columns and naming each flag; the layout of `list`'s
+and `disk`'s; every flag in its page's Options; every flag a program asks for in its table;
+`with`'s table and its arms; every program in `/bin` with a page. **Controls**: a flag dropped from
+its page's Options, a program asking for a flag its table lacks, a flag dropped from `with`'s table,
+`--help` wrapped at 100, and a page removed, each fail a test; `test-interactive` fails at
+`nxedit --help` with `--help` unanswered.
+
+**The gate**: `test-interactive` runs `list --help`, `man list`, paged and left, and
+`nxedit --help` (62 steps).
 
 ### G.7 The system, the desktop, and a programmer's pages
 
