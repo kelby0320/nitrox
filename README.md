@@ -70,7 +70,8 @@ cargo xtask help           # every command
 ```
 
 The image boots to a graphical greeter. The build seeds an account, `alice`, whose password is
-`DEMO_PASSWORD` in `tools/xtask/src/main.rs`.
+`DEMO_PASSWORD` in `tools/xtask/src/main.rs`. In a terminal, `man intro` is where the manual
+starts, and `man shell` is a tour of the shell.
 
 ## Testing it
 

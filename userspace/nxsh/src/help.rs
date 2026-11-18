@@ -185,8 +185,8 @@ pub fn listing() -> String {
     }
     out.push_str(&line);
     out.push_str(
-        "\n`help NAME` says what one does. `man shell-operators` shows every operator,\n\
-         and `man shell-language` is the whole language.",
+        "\n`help NAME` says what one does, and `man shell` is a tour of the shell;\n\
+         `man shell-operators` shows every operator, and `man shell-language` the rules.",
     );
     out
 }

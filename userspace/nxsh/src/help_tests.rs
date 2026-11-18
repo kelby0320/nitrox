@@ -148,6 +148,7 @@ fn help_alone_lists_the_operators_builtins_and_keywords() {
     assert!(missing.is_empty(), "{missing:?} missing from {listed}");
     assert!(listed.lines().all(|l| l.len() <= 80), "{listed}");
     assert!(listed.contains("  in and out  open save display\n"), "by group: {listed}");
+    assert!(listed.contains("`man shell` is a tour"), "the guide: {listed}");
     assert_eq!(listed, format!("{}\n", help::listing()));
 }
 
@@ -283,7 +284,7 @@ is a flag. Each example below is run by the shell's tests, and prints what is sh
 const SEE_ALSO: &str = "
 ## See also
 
-`shell-language(7)`, the language whole.
+`shell(7)`, a tour of the shell; `shell-language(7)`, the language whole.
 ";
 
 /// `text` broken into lines of at most 100 columns, as the docs are.

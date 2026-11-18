@@ -35,6 +35,8 @@ pub mod value;
 #[cfg(test)]
 mod exec_tests;
 #[cfg(test)]
+mod guide_tests;
+#[cfg(test)]
 mod help_tests;
 #[cfg(test)]
 mod shown_tests;
