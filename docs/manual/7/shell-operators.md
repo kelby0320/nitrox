@@ -14,8 +14,9 @@ is a flag. Each example below is run by the shell's tests, and prints what is sh
 
 ## Sequences
 
-A table's rows, a list's values, a string's characters and a range's values are each a sequence, and
-each comes back in the shape it went in: a string filtered is a string.
+A table's rows, a list's values, a string's characters and a range's values are each a sequence. A
+table, a list or a string comes back as it went in, a string filtered a string; a range comes back a
+list; and `map` makes records a table.
 
 ### filter
 
@@ -124,7 +125,8 @@ n  square
 
 ## Reducing
 
-Many values made one. Of nothing, `count` and `sum` are 0, and the rest are errors.
+Many values made one. Of nothing, `count` and `sum` are 0, `reduce --from` its seed, and the rest
+are errors.
 
 ### count
 

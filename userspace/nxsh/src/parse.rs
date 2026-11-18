@@ -919,7 +919,7 @@ impl<'a> Parser<'a> {
         }
 
         let is_operator = at_head && !forced_external && operators::is_operator(&name);
-        let is_builtin = at_head && !forced_external && crate::help::is_builtin(&name);
+        let is_builtin = at_head && !forced_external && crate::builtins::is_builtin(&name);
         if is_builtin {
             // A builtin takes a **path**, not an expression: `cd ..` and `cd /system` break
             // `operator_args` (a range, a division). Word mode is how an external gets its paths.

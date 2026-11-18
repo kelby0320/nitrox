@@ -11,6 +11,7 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod builtins;
 pub mod complete;
 pub mod editor;
 pub mod eval;

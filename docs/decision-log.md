@@ -38669,11 +38669,14 @@ G.3 merged, #453. G.4, `manual.md` § G.4, built on `pre-phase-7/part-g4-operato
   piecemeal. **A host test runs every example**, one prints only its last line, and one holds that
   the evaluator's dispatch names each operator and no other, read from its match arms.
 - **`help` is a builtin**, beside `cd` and `exit`: `help` lists the operators by family, the
-  builtins and the keywords; `help NAME` prints one entry; a program's name is answered with its
-  page; anything else is an error naming `man --keyword`. **It returns its text as a value**, so a
-  builtin may now head a pipeline (`help trim | count`), as it still may not take one. The
-  builtins and keywords have entries too, in `help.rs`, examples run where one can run; `exit`,
-  `help`, `pub`, `strict`, `use` and `time` have none.
+  builtins and the keywords; `help NAME` prints one entry; a name bound here is said to be one; a
+  program's name is answered with its page where the manual has one and its `--help` where not;
+  anything else is an error naming `man --keyword`. **It returns its text as a value**, so it may
+  head a pipeline (`help trim | count`). **`cd` and `exit` may not**, on review: they act on the
+  shell before a stage after them can fail, so `cd / | count` moved and then failed. No builtin
+  takes a pipe. The builtins have their table in `builtins.rs`, which the parser asks, and the
+  keywords theirs in `help.rs`, examples run where one can run; `exit`, `help`, `pub`, `strict`,
+  `use` and `time` have none.
 - **`help` points at `man shell-language`**, where the plan said `man shell`: `shell(7)` is G.5's,
   and a pointer to a page not yet written would fail the person who follows it. G.5 moves it.
 - **`shell-operators(7)` is the table as a page**, written by the test that holds it to the table

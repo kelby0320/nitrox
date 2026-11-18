@@ -262,7 +262,7 @@ impl Interp {
                 .filter(|k| k.as_bytes().first().is_some_and(u8::is_ascii_alphabetic));
             let commands = self.host.commands();
             let names = keywords
-                .chain(crate::help::BUILTINS.iter().flat_map(|b| b.names.iter().copied()))
+                .chain(crate::builtins::BUILTINS.iter().map(|b| b.name))
                 .chain(crate::operators::OPERATORS.iter().map(|o| o.name))
                 .chain(self.functions.iter().map(|(n, _)| n.as_str()))
                 .chain(commands.iter().map(alloc::string::String::as_str));
@@ -364,7 +364,7 @@ impl Interp {
     }
 
     /// A binding, or failing that a hoisted function.
-    fn lookup_any(&self, name: &str) -> Option<Val> {
+    pub(crate) fn lookup_any(&self, name: &str) -> Option<Val> {
         if let Some(s) = self.lookup(name) {
             return Some(s.val.clone());
         }
@@ -1271,7 +1271,7 @@ impl Interp {
         crate::timing::rows(&bytes)
     }
 
-    /// §3's shell-state builtins: they mutate *this* process, which an external cannot.
+    /// §3's builtins: they act on *this* process, which an external cannot.
     fn apply_builtin(&mut self, c: &Call) -> Result<Val> {
         match c.name.as_str() {
             "cd" => {
@@ -1299,10 +1299,10 @@ impl Interp {
                 self.set_env_entry("PWD", Value::Str(resolved));
                 Ok(Val::NULL)
             }
+            "help" => self.help(c),
             // §11f. `exit` is a *control outcome of evaluation*, not a string the REPL loop watches
             // for (`exit 1` once missed that comparison). It travels the error channel because that
             // already crosses a `def`, a closure and a loop; `catch` re-raises it (see `exec_try`).
-            "help" => self.help(c),
             "exit" => {
                 let status = match c.args.first() {
                     None => 0,
@@ -1736,7 +1736,7 @@ impl Interp {
                 i += 1;
                 continue;
             }
-            if i == 0 && !matches!(&stages[0], Expr::Call(c) if c.kind != CallKind::Builtin) {
+            if i == 0 && !matches!(&stages[0], Expr::Call(c) if !crate::builtins::heads_a_pipeline(c)) {
                 carried = Some(self.eval(&stages[0])?);
                 i += 1;
                 continue;
@@ -1874,13 +1874,11 @@ impl Interp {
     }
 }
 
-/// `c` where nothing runs it. A builtin after a pipe's first stage is the one way here: the parser
-/// makes an operator or a builtin only of a name its table has, and each name has its arm.
+/// `c` where nothing runs it. A builtin in a pipeline is the one way here, after a pipe or at its
+/// head: the parser makes an operator or a builtin only of a name its table has, each with its arm.
 fn unavailable(c: &Call) -> EvalError {
     EvalError::new(match c.kind {
-        CallKind::Builtin => {
-            alloc::format!("`{}` is a builtin, which acts on the shell: nothing is piped into it", c.name)
-        }
+        CallKind::Builtin => crate::builtins::not_a_stage(&c.name),
         _ => alloc::format!("`{}` has nothing here to run it", c.name),
     })
 }

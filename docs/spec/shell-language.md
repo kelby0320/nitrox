@@ -22,8 +22,9 @@ this one where they touch
 ### Changes in v1.4 (2026-11-18, the operators' table and `help`)
 
 - **§3 — `help` is a builtin**: what an operator, a builtin or a keyword does, from the tables the
-  shell reads, so `help` is no longer a program's name to take. A builtin may head a pipeline,
-  its value going on (`help trim | count`); it still takes no pipe.
+  shell reads, so `help` is no longer a program's name to take. It may head a pipeline, its value
+  going on (`help trim | count`); `cd` and `exit`, which act on the shell, may not, and no builtin
+  takes a pipe.
 - **§10b — the operators are one table**, `userspace/nxsh/src/operators.rs`: what each takes, a
   line saying what it does, and an example the tests run. `shell-operators(7)` is that table.
 - **§7, a sketch from before the grammar settled, is gone**: it used `print`, `ls` and
@@ -291,7 +292,7 @@ for scripts that want it.
   | Category | Examples | Why |
   |---|---|---|
   | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail`, `expect`, `assert` and `parse` as stages, and `time` as a prefix | Pure syntax, not commands at all |
-  | Shell-state builtins | `cd`, `exit`, `help` | Act on the shell itself: `cd` and `exit` change its state, which an external process structurally can't reach back and do, and `help` reads the tables the shell parses by |
+  | Shell-state builtins | `cd`, `exit`, `help` | Act on the shell itself: `cd` and `exit` change its state, which an external process structurally can't reach back and do, and `help` reads the tables the shell parses by. No builtin takes a pipe, and only `help`, which changes nothing, heads one: a stage failing after `cd` would come too late to undo it. A builtin's name at a statement's head is the builtin, given what follows as its words; a name bound to the same word is read there alone, `help`, or in parentheses, `(help) + 1` |
   | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `format`, `last`, `skip`, `dedupe`, and the §10b families: `shell-operators(7)` has each | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
   | External programs | `list`, `copy`, `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` | Ordinary userspace programs speaking TSM1 on stdio for pipeline composability. **Not** resource servers — resource servers (`fs-server-ext4`, block/device drivers) are a distinct, narrower category of long-running service speaking `librsproto`; an external program may be a *client* of one, but implementing `librsproto` is not required to participate in a shell pipeline. Full scope and naming rationale in §10 |
 

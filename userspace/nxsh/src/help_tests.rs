@@ -2,8 +2,9 @@
 //! dispatch knows each name and no other, and `shell-operators(7)` is the table.
 
 use crate::ast::{BinOp, Expr, Stmt};
+use crate::builtins::BUILTINS;
 use crate::eval::{Interp, Mode};
-use crate::help::{self, BUILTINS, Entry, KEYWORDS};
+use crate::help::{self, Entry, KEYWORDS};
 use crate::host::MockHost;
 use crate::operators::{Group, OPERATORS, Takes};
 use alloc::boxed::Box;
@@ -36,12 +37,12 @@ fn run(example: &str) -> Result<String, String> {
 
 /// Every entry as (name, signature, does, example, output).
 fn entries() -> Vec<(&'static str, &'static str, &'static str, &'static str, &'static str)> {
-    let words = |t: &'static [Entry]| t.iter().map(|e| (e.names[0], e.signature, e.does, e.example, e.output));
+    let keywords = KEYWORDS.iter().map(|e: &Entry| (e.names[0], e.signature, e.does, e.example, e.output));
     OPERATORS
         .iter()
         .map(|o| (o.name, o.signature, o.does, o.example, o.output))
-        .chain(words(BUILTINS))
-        .chain(words(KEYWORDS))
+        .chain(BUILTINS.iter().map(|b| (b.name, b.signature, b.does, b.example, b.output)))
+        .chain(keywords)
         .collect()
 }
 
@@ -75,7 +76,8 @@ fn no_name_has_two_entries() {
     let names: Vec<&str> = OPERATORS
         .iter()
         .map(|o| o.name)
-        .chain(BUILTINS.iter().chain(KEYWORDS).flat_map(|e| e.names.iter().copied()))
+        .chain(BUILTINS.iter().map(|b| b.name))
+        .chain(KEYWORDS.iter().flat_map(|e| e.names.iter().copied()))
         .collect();
     let once: BTreeSet<&str> = names.iter().copied().collect();
     assert_eq!(once.len(), names.len(), "{names:?}");
@@ -112,7 +114,7 @@ fn arms(fn_name: &str) -> BTreeSet<String> {
 fn the_dispatch_knows_each_name_in_the_tables_and_no_other() {
     let operators: BTreeSet<String> = OPERATORS.iter().map(|o| o.name.to_string()).collect();
     assert_eq!(arms("apply_operator"), operators);
-    let builtins: BTreeSet<String> = BUILTINS.iter().flat_map(|b| b.names.iter().map(|n| n.to_string())).collect();
+    let builtins: BTreeSet<String> = BUILTINS.iter().map(|b| b.name.to_string()).collect();
     assert_eq!(arms("apply_builtin"), builtins);
 }
 
@@ -158,16 +160,49 @@ fn help_name_prints_its_entry_and_for_a_program_its_page() {
          > [{n: 1}, {n: 5}, {n: 9}] | filter n > 2\n  [{ n: 5 }, { n: 9 }]\n\n  \
          An operator, among the sequences: `man shell-operators`.\n"
     );
-    for (line, starts) in
-        [("help else", "if CONDITION"), ("help _", "_\n"), ("help cd", "cd [PATH]"), ("help time", "time")]
-    {
+    for (line, starts) in [
+        ("help else", "if CONDITION"),
+        ("help \"if\"", "if CONDITION"),
+        ("help _", "_\n"),
+        ("help cd", "cd [PATH]"),
+        ("help time", "time"),
+    ] {
         let said = repl(MockHost::new(), line).expect("runs").expect("prints");
         assert!(said.starts_with(starts) && said.contains("`man shell-language`"), "{line}: {said}");
     }
-    let mut with_list = MockHost::new();
-    with_list.commands.push("list".into());
-    let program = repl(with_list, "help list");
-    assert_eq!(program, Ok(Some("`list` is a program, not the shell's: `man list` is its page.\n".into())));
+}
+
+/// A program is sent to its page where the manual has one, and to its `--help`, which every
+/// program answers, where it has none; `/bin` is listed only once no table has the name.
+#[test]
+fn help_for_a_program_names_its_page_or_its_help() {
+    let host = || {
+        let mut h = MockHost::new().with_file(&help::page_path("man"), "# man");
+        h.commands.extend(["list".into(), "man".into()]);
+        h
+    };
+    let said = |line: &str| repl(host(), line).expect("runs").expect("prints");
+    assert_eq!(said("help man"), "`man` is a program, not the shell's: `man man` is its page.\n");
+    assert_eq!(said("help list"), "`list` is a program, not the shell's: `list --help` says what it takes.\n");
+    let h = host();
+    let log = h.log();
+    let _ = repl(h, "help filter");
+    assert_eq!(log.borrow().listed, 0, "the tables answered, and /bin was listed anyway");
+}
+
+/// A function or a name bound here is said to be one, not "nothing here".
+#[test]
+fn help_for_a_name_bound_here_says_so() {
+    let mut i = Interp::with_host(Box::new(MockHost::new()), Mode::Repl);
+    for line in ["def twice(n) { n * 2 }", "let x = 2"] {
+        i.run_line(line).expect("binds");
+    }
+    let said = |i: &mut Interp, line| i.run_line(line).map_err(|e| e.message);
+    assert_eq!(
+        said(&mut i, "help twice"),
+        Ok(Some("`twice` is a function defined here, not one of the shell's.\n".into()))
+    );
+    assert_eq!(said(&mut i, "help x"), Ok(Some("`x` is a name bound here; its value is of type Int.\n".into())));
 }
 
 #[test]
@@ -177,15 +212,56 @@ fn help_for_nothing_known_or_two_names_is_an_error() {
     assert_eq!(repl(MockHost::new(), "help a b"), Err("`help` takes one name, or none".into()));
 }
 
-/// A builtin can head a pipeline, its value going on; it cannot take one.
+/// `help` can head a pipeline, its value going on; no builtin takes one.
 #[test]
-fn a_builtin_heads_a_pipe_but_is_not_fed_one() {
-    let n = help::about("trim", false).expect("an operator").chars().count();
+fn help_heads_a_pipe_but_no_builtin_is_fed_one() {
+    let n = help::entry("trim").expect("an operator").chars().count();
     assert_eq!(repl(MockHost::new(), "help trim | count"), Ok(Some(format!("{n}\n"))));
-    assert_eq!(
-        repl(MockHost::new().with_dir("/"), "[1] | cd /"),
-        Err("`cd` is a builtin, which acts on the shell: nothing is piped into it".into())
-    );
+    assert_eq!(repl(MockHost::new(), "3 | help"), Err("`help` is a builtin: nothing is piped into it".into()));
+    let refused = "`cd` is a builtin, which acts on the shell: it takes no pipe, and heads none";
+    assert_eq!(repl(MockHost::new().with_dir("/"), "[1] | cd /"), Err(refused.into()));
+}
+
+/// `cd` and `exit` act on the shell, so at a pipeline's head they are refused before they act: a
+/// stage failing after them would come too late to undo a move or an exit.
+#[test]
+fn cd_or_exit_heading_a_pipe_is_refused_before_it_acts() {
+    let mut i = Interp::with_host(Box::new(MockHost::new().with_dir("/").with_dir("/home")), Mode::Repl);
+    i.run_line("cd /home").expect("goes");
+    let refused = "`cd` is a builtin, which acts on the shell: it takes no pipe, and heads none";
+    assert_eq!(i.run_line("cd / | count").map_err(|e| e.message), Err(refused.into()));
+    assert_eq!(i.run_line("$env.PWD").map_err(|e| e.message), Ok(Some("/home\n".into())), "it moved");
+    let exit = i.run_line("exit 3 | count").expect_err("refused");
+    assert_eq!((exit.exit, exit.message.contains("`exit` is a builtin")), (None, true), "{}", exit.message);
+}
+
+/// A builtin's name at a statement's head is the builtin, given what follows as its words, as an
+/// operator's is (§3); a name bound to the same word is read there alone, or in parentheses.
+#[test]
+fn a_binding_named_as_a_builtin_is_read_alone_or_in_parentheses() {
+    let mut i = Interp::with_host(Box::new(MockHost::new()), Mode::Repl);
+    i.run_line("let help = 2").expect("binds");
+    let said = |i: &mut Interp, line| i.run_line(line).map_err(|e| e.message);
+    assert_eq!(said(&mut i, "help"), Ok(Some("2\n".into())));
+    assert_eq!(said(&mut i, "(help) + 1"), Ok(Some("3\n".into())));
+    assert_eq!(said(&mut i, "help + 1"), Err("`help` takes one name, or none".into()));
+}
+
+/// What each group's heading says of its operators holds of them.
+#[test]
+fn the_groups_say_what_their_operators_do() {
+    for (line, said) in [
+        ("\"nitrox\" | filter { |c| c != \"t\" }", "nirox\n"),
+        ("1..4 | filter { |n| n > 1 }", "[2, 3]\n"),
+        ("[] | count", "0\n"),
+        ("[] | sum", "0\n"),
+        ("[] | reduce --from 7 { |a, it| a + it }", "7\n"),
+    ] {
+        assert_eq!(repl(MockHost::new(), line), Ok(Some(said.into())), "{line}");
+    }
+    for line in ["[] | min", "[] | max", "[] | avg", "[] | reduce { |a, it| a + it }"] {
+        assert!(repl(MockHost::new(), line).is_err(), "{line}");
+    }
 }
 
 const PAGE: &str = include_str!("../../../docs/manual/7/shell-operators.md");
@@ -255,7 +331,8 @@ fn the_page_is_the_table() {
     let want = page();
     if std::env::var_os("NXSH_WRITE_PAGE").is_some() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/manual/7/shell-operators.md");
-        std::fs::write(path, &want).expect("writes the page");
+        // Written, not compared: `PAGE` is the page as it was when this test was built.
+        return std::fs::write(path, &want).expect("writes the page");
     }
     assert!(
         PAGE == want,
