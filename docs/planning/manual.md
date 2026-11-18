@@ -596,6 +596,9 @@ example's row with `select` keeping one column.
 - **The gate reads the example's whole answer**, its header before its row.
 - **Declined**: comparing the mock's `/bin` with the real `list`'s, which would make the shell's
   tests depend on the coreutils; the gate runs the one example whose answer is the same anywhere.
+- **CI's `check-copy` flaked again**, a log line landing inside the copy's row before its count
+  (after it, the last time). The maintainer's call: fixed here (`042edb98`). The gate finds the
+  count as a whole number between the copy's line and the next prompt, wherever a line lands.
 
 ### G.6 The commands
 

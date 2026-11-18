@@ -38705,3 +38705,7 @@ G.4 merged, #454. G.5, `manual.md` § G.5, built on `pre-phase-7/part-g5-guide` 
 - **The gate types the example whose answer is the same anywhere**, `list /bin | filter name ==
   "man" | select name kind`, and a host test holds it to the guide's.
 - **`help`'s listing names `man shell`**; its entries keep `man shell-language`, the rules.
+- **On CI, `check-copy`'s serial flake, fixed on the maintainer's call**: a log line landed inside
+  the copy's table row before its count, and the gate read it as the answer. The gate now waits for
+  the prompt and finds the count as a whole number between, so a line landing before, inside or
+  after the row cannot be read for it (`042edb98`).
