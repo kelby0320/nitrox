@@ -38646,3 +38646,14 @@ G.2 merged, #452. G.3, `manual.md` § G.3, built on `pre-phase-7/part-g3-pager` 
 - **`check-terminal` pages `page`'s input**, as its `nxterm` sits in init's namespace with no
   manual; the harness reports every row a chunk changed while the alternate screen is up, and only
   then, as on the main one scrolling output changes every row.
+- **On review, the maintainer's call: what a program paged is not kept.** A paging stage writes
+  nothing, so `$last.value` is null after a page but holds an output one screen held: it turns on
+  the window's height, and the spec and both pages now say so. Keeping it would need a stream marked as
+  shown already, for the shell to keep and not draw; withholding what fits would lose the common
+  case.
+- **A raw read takes a count**, one byte, and what it does not take stays queued for the next: the
+  pager reads a byte at a time, so keys typed after `q` in one read were the shell's and were lost.
+  An empty body reads as before. The pager turns no echo off, the server echoing only a canonical
+  read; `libprompt::set_echo_on` went with it.
+- **A page drops an escape sequence whole**, not only its `ESC`, so a coloured cell shows its text
+  as the shell's display does, with no `[31m` left behind.

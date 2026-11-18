@@ -1528,6 +1528,11 @@ $last: { value: Value, status: PipelineStatus }
 as already settled (§9d). Purely REPL bookkeeping, scoped only to the interactive session per §2's
 original rule.
 
+**What a program paged is not kept.** A stage told its output is shown
+([`pipeline-stdio.md`](pipeline-stdio.md) § Payload), as `man` and `page` are, draws a long output
+on the terminal a page at a time and writes nothing, so `$last.value` is null after it, as after a
+program that writes nothing. What one screen holds it writes as ever, and that is kept.
+
 ### 11e. Top-level auto-display — deliberately different defaults in REPL vs. script
 
 **REPL:** a top-level pipeline that isn't assigned (`let`/`mut`/`const`) and doesn't already end in

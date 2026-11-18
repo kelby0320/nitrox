@@ -304,8 +304,10 @@ console's size is unknown, as a serial line cannot say, and a program draws to 8
 shown there ([`pipeline-stdio.md`](../spec/pipeline-stdio.md) § Payload): `page`, and `man`
 through the same pager in the coreutils library. It draws in place of writing its output, on the
 **alternate screen** `libterm` keeps (`ESC [ ? 1049 h`, and `l` to leave), which comes up clear,
-keeps no history, and gives back the screen it covered; it turns echo off, reads the keys raw and
-decodes them as the shell does (`libline::Keys`), and asks the size at every key. `Ctrl-C`, an
+keeps no history, and gives back the screen it covered; it reads the keys raw, a byte at a time so
+that what is typed after `q` stays queued for the shell, decodes them as the shell does
+(`libline::Keys`), and asks the size at every key. It turns no echo off: the server echoes a
+canonical read only. `Ctrl-C`, an
 `Interrupt` or a read answered empty, leaves it as `q` does. A serial line's far terminal may have
 no alternate screen, and the pages then stay in its scrollback.
 

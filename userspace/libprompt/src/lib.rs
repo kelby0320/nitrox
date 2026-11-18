@@ -64,12 +64,6 @@ pub fn write_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, bytes: &[u8]) -> bo
     bytes.chunks(RS_MAX_BODY).all(|part| matches!(tty(term, OP_TTY_WRITE, part, &mut false), Some((false, _))))
 }
 
-/// Turn `term`'s echo on or off: `false` if it did not answer.
-pub fn set_echo_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, on: bool) -> bool {
-    let flags = [if on { TTY_MODE_ECHO } else { 0 }];
-    matches!(tty(term.into(), OP_TTY_SET_MODE, &flags, &mut false), Some((false, _)))
-}
-
 /// Ask for a line on `term`, echo on. `None` on `Ctrl-C`, `Ctrl-D` or a terminal failure.
 pub fn ask_line_on<'a>(term: impl Into<Ref<'a, Channel, Only>>, prompt: &[u8]) -> Option<Vec<u8>> {
     let term = term.into();

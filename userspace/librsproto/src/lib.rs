@@ -123,7 +123,8 @@ pub const OP_TTY_READ_LINE: u16 = 0x0B00;
 /// `Tty::Read` — take whatever input is available, **unedited**.
 ///
 /// The raw counterpart to [`OP_TTY_READ_LINE`]: completes on any byte, with no line
-/// discipline. There is deliberately no `TTY_MODE_RAW` (`rsproto-tty-ops.md` § Read).
+/// discipline; its body is empty, or one byte, the most the reply may carry. There is deliberately
+/// no `TTY_MODE_RAW` (`rsproto-tty-ops.md` § Read).
 pub const OP_TTY_READ: u16 = 0x0B04;
 /// `Tty::Write` — write the body's bytes to the terminal; output is a **capability**.
 pub const OP_TTY_WRITE: u16 = 0x0B01;

@@ -1,7 +1,7 @@
 # rsproto — Tty operations (`0x0Bxx`)
 
 **Status: normative for what is built (2026-08-13; `OpenSibling` 2026-09-23; `Token` and `Redeem`
-2026-10-01; `Size` and `Resize` 2026-11-17).** `ReadLine`, `Read`, `Write`, `SetMode`, `Close` and
+2026-10-01; `Size` and `Resize` 2026-11-17; `Read`'s count 2026-11-18).** `ReadLine`, `Read`, `Write`, `SetMode`, `Close` and
 `Interrupt` are implemented in `userspace/tty-server/`; `AttachBackend`, `Output` and `Input` landed
 with Milestone 5 Part C, `OpenSibling` with administration Part A.2, `Token` and `Redeem` with the
 laptop polish's Part A, and `Size` and `Resize` with pre-Phase-7 Part G.2. Job control and terminal emulation are unbuilt —
@@ -53,10 +53,14 @@ answers: a reader that conflated them would either exit on a stray Enter or neve
 
 ### `Read` (`0x0B04`)
 
-Request: empty. Reply: whatever is available, up to 64 bytes.
+Request: empty, or a count in one byte, taken as 1 to 64. Reply: whatever is available, up to the
+count, or 64 bytes with none.
 
 The raw counterpart. Completes as soon as any byte arrives; the discipline neither consumes,
 echoes, nor interprets it. A client doing its own line editing — `nxsh`'s REPL — uses this.
+
+**What a read does not take stays queued for the next**, on the same terminal or a sibling: a
+pager that leaves on `q` reads a byte at a time, so what was typed after it reaches the shell.
 
 **A raw read stops at an interrupt byte.** Bytes typed before `Ctrl-C` are ordinary input and are
 delivered; the interrupt itself is never handed over as data.

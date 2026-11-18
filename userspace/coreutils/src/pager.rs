@@ -53,22 +53,63 @@ pub struct Pager {
     missed: bool,
 }
 
-/// `line` as it is drawn: a tab to the next stop, and no other control, so a page cannot drive the
-/// terminal.
+/// `line` as it is drawn: a tab to the next stop, and no control or escape sequence, so a page
+/// cannot drive the terminal and shows a sequence's text as the shell's display does: none of it.
 fn clean(line: &str) -> String {
     let mut out = String::new();
     let mut col = 0;
-    for c in line.chars() {
-        if c == '\t' {
-            let next = (col / TAB + 1) * TAB;
-            out.extend(core::iter::repeat_n(' ', next - col));
-            col = next;
-        } else if !c.is_control() {
-            out.push(c);
-            col += 1;
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '\t' => {
+                let next = (col / TAB + 1) * TAB;
+                out.extend(core::iter::repeat_n(' ', next - col));
+                col = next;
+            }
+            '\x1b' => skip_escape(&mut chars),
+            '\u{9b}' => skip_csi(&mut chars),
+            c if c.is_control() => {}
+            c => {
+                out.push(c);
+                col += 1;
+            }
         }
     }
     out
+}
+
+/// Past the rest of a sequence an `ESC` began (ECMA-48): a control sequence; a control string, to
+/// `BEL` or `ST`; or intermediates and a final character.
+fn skip_escape(chars: &mut core::str::Chars<'_>) {
+    match chars.next() {
+        Some('[') => skip_csi(chars),
+        Some(']' | 'P' | 'X' | '^' | '_') => {
+            let mut esc = false;
+            for c in chars.by_ref() {
+                if c == '\x07' || c == '\u{9c}' || (esc && c == '\\') {
+                    return;
+                }
+                esc = c == '\x1b';
+            }
+        }
+        Some(' '..='/') => {
+            for c in chars.by_ref() {
+                if !(' '..='/').contains(&c) {
+                    return;
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Past a control sequence's parameters and intermediates, and the character that ends it.
+fn skip_csi(chars: &mut core::str::Chars<'_>) {
+    for c in chars.by_ref() {
+        if !(' '..='?').contains(&c) {
+            return;
+        }
+    }
 }
 
 /// `lines` broken into rows of at most `width` characters; an empty line is a row.
@@ -134,6 +175,10 @@ impl Pager {
         self.rows.get(self.top).map_or(0, |r| r.0)
     }
 
+    fn line_at_bottom(&self) -> usize {
+        self.rows.get((self.top + self.height).min(self.rows.len()).saturating_sub(1)).map_or(0, |r| r.0)
+    }
+
     /// Act on what a byte typed came to.
     pub fn feed(&mut self, typed: Typed) -> Act {
         if let Some(word) = &mut self.typing {
@@ -168,10 +213,12 @@ impl Pager {
         if self.top != top || missed || self.typing.is_some() || self.missed { Act::Draw } else { Act::Nothing }
     }
 
-    /// To the next line holding the word, past the top line and the line it was last found on.
+    /// To the next line holding the word, past the top line, and past the line it was last found on
+    /// while the page shows it: at the end, the page cannot move up to it.
     fn search(&mut self) {
         let Some(word) = &self.word else { return };
-        let from = self.found.filter(|&f| f >= self.line_at_top()).unwrap_or(self.line_at_top()) + 1;
+        let (top, bottom) = (self.line_at_top(), self.line_at_bottom());
+        let from = self.found.filter(|f| (top..=bottom).contains(f)).unwrap_or(top) + 1;
         match self.lines.iter().enumerate().skip(from).find(|(_, l)| l.contains(word.as_str())) {
             Some((l, _)) => {
                 self.found = Some(l);
@@ -189,9 +236,8 @@ impl Pager {
         if let (true, Some(word)) = (self.missed, &self.word) {
             return format!("not found: {word}");
         }
-        let last = self.rows.get((self.top + self.height).min(self.rows.len()).saturating_sub(1)).map_or(0, |r| r.0);
         let end = if self.top >= self.last_top() { " (END)" } else { "" };
-        format!("lines {}-{} of {}{end}", self.line_at_top() + 1, last + 1, self.lines.len())
+        format!("lines {}-{} of {}{end}", self.line_at_top() + 1, self.line_at_bottom() + 1, self.lines.len())
     }
 
     /// The text of each row shown, top to bottom.

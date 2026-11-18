@@ -1,4 +1,4 @@
-//! The pager on a stage's terminal: the alternate screen, echo off, and the keys read raw.
+//! The pager on a stage's terminal: the alternate screen, and the keys read raw, a byte at a time.
 
 use super::{Act, Pager, SIZE_UNKNOWN};
 use crate::stage::Stage;
@@ -45,8 +45,9 @@ pub(super) fn page_on(
     if pager.fits() {
         return Shown::Not;
     }
-    // Echo off, or the keys would be drawn over the page.
-    libprompt::set_echo_on(term, false);
+    // No echo to turn off: the server echoes a canonical read only. Nothing but this stage gives
+    // the screen back (`TODO(alt-screen-crash)`), and the shell may draw a diagnostic here,
+    // gone with it (`TODO(diag-on-alternate)`).
     let (mut keys, mut reading, mut draw) = (Keys::new(), false, true);
     let _ = libprompt::write_on(term, b"\x1b[?1049h");
     'paging: loop {
@@ -69,13 +70,13 @@ pub(super) fn page_on(
         }
     }
     let _ = libprompt::write_on(term, b"\x1b[?1049l");
-    libprompt::set_echo_on(term, true);
     Shown::Paged
 }
 
-/// The next bytes typed on `term`, the read sent unless one is outstanding: `None` for `Ctrl-C`,
+/// The next byte typed on `term`, the read sent unless one is outstanding: `None` for `Ctrl-C`,
 /// a terminal gone or failing, or `stop` true when `notify` wakes. A read answered empty is a
-/// `Ctrl-C` that came while none was outstanding.
+/// `Ctrl-C` that came while none was outstanding. One byte, so what is typed after `q` stays
+/// queued for the shell.
 fn read(
     term: &Handle<Channel, Only>,
     notify: Option<&Handle<Notify, Only>>,
@@ -83,7 +84,7 @@ fn read(
     reading: &mut bool,
 ) -> Option<Vec<u8>> {
     if !*reading {
-        if !transmit(term, OP_TTY_READ, 1, &[], &mut Carried::new()) {
+        if !transmit(term, OP_TTY_READ, 1, &[1], &mut Carried::new()) {
             return None;
         }
         *reading = true;

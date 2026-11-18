@@ -1725,6 +1725,25 @@ echo is drawn to the old width. Not seen: it needs the ring full at one send and
 fix holds the input back while the size is unsent. Trigger: a probe that fills the ring shows it,
 or a line drawn to the wrong width after a refit.
 
+**A diagnostic drawn while a page is up goes with it — `TODO(diag-on-alternate)`.** The shell
+draws a stage's diagnostics on its own terminal as they come, and a paging stage draws on the
+alternate screen through a sibling on the same backend; nothing orders the two. In
+`list -r / | page`, a diagnostic `list` sends just before it finishes can reach the server after
+`page` has its input and has switched screens: drawn on the page, painted over at the next key,
+and gone when `q` gives back the main screen, it leaves a failed status without its reason. Read
+from the code, not seen: it needs the shell's draw to trail the stage's switch. A fix holds a
+pipeline's diagnostics while its shown stage has the screen, which the shell cannot yet tell.
+Trigger: a probe delaying the shell's drain shows it, or a reason missing after a page.
+
+**A stage that ends on the alternate screen leaves the terminal there — `TODO(alt-screen-crash)`.**
+Only the stage that wrote `CSI ? 1049 h` writes the `l` that gives the screen back. One that
+faults, or panics through its handler's log and exit, leaves the shell prompting on the alternate
+screen, with no history and the main screen out of reach, and there is no `reset`. No panic is
+reachable while a page is up, as far as has been found. The shell could send `l` after a shown
+stage that did not end cleanly: `libterm` takes it on the main screen as nothing, but xterm also
+restores a saved cursor, so a serial line's far terminal would put the prompt wherever that was.
+Trigger: a paging stage that can fail mid-page.
+
 **A shell reading a file through a mapping is suspended when the fill fails — `TODO(mapped-read-faults)`.**
 `nxsh` reads a file by mapping it: `read_file` for a script, a `use` and `open`, and `read_head`
 for the first bytes of every program it runs (`userspace/nxsh/src/stage.rs`). A fill that fails —

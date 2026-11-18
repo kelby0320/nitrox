@@ -267,13 +267,3 @@ fn a_write_goes_in_parts_and_a_refused_one_is_false() {
     put(&b, 0, 1, RS_FLAG_ERROR, &(KError::NoAccess as i32).to_le_bytes());
     assert!(!write_on(&a, b"x"), "refused");
 }
-
-#[test]
-fn echo_is_set_by_its_flag() {
-    for (on, flags) in [(true, librsproto::TTY_MODE_ECHO), (false, 0)] {
-        let (a, b) = pair();
-        ack(&b);
-        assert!(set_echo_on(&a, on));
-        assert_eq!(got(&b), (librsproto::OP_TTY_SET_MODE, 1, vec![flags]));
-    }
-}

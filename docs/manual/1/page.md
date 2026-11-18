@@ -41,7 +41,8 @@ goes back to the keys.
 
 ## Output
 
-The input, unchanged, when it is not paged; nothing when it is.
+The input, unchanged, when it is not paged; nothing when it is, so after a page `$last.value` is
+null, as after any program that writes nothing.
 
 ## Exit status
 
