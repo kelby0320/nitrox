@@ -20,6 +20,7 @@ extern crate alloc;
 pub mod args;
 pub mod format;
 pub mod manual;
+pub mod pager;
 pub mod stage;
 pub mod text;
 /// Calendar arithmetic and duration parsing, re-exported from [`libtime`], which

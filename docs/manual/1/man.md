@@ -19,6 +19,10 @@ other:
 man | filter section == 1
 ```
 
+Where its output is what the shell shows at the prompt and one screen cannot hold it, `man` pages
+it, as `page(1)` does: Space turns the page and `q` leaves. Piped on or assigned, it writes the page
+or the listing as ever.
+
 ## Options
 
 - `-k`, `--keyword WORD`: list only the pages whose name or summary holds WORD, case aside.
@@ -53,4 +57,4 @@ which serves each package's pages read-only.
 
 ## See also
 
-`intro(7)`, `manual-page(5)`
+`intro(7)`, `manual-page(5)`, `page(1)`

@@ -80,6 +80,7 @@ dependencies = [
  "libgpt",
  "libheap",
  "libkern",
+ "libline",
  "libos",
  "libprompt",
  "librsproto",

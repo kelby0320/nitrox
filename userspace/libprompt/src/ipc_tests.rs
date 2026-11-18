@@ -249,3 +249,31 @@ fn carrying(h: u64) -> Carried {
 fn is_open(h: u64) -> bool {
     mock::is_open(h)
 }
+
+/// A write longer than one message goes in parts, each answered; a refusal is `false`.
+#[test]
+fn a_write_goes_in_parts_and_a_refused_one_is_false() {
+    let (a, b) = pair();
+    for _ in 0..3 {
+        ack(&b);
+    }
+    let text = vec![b'x'; 2 * librsproto::RS_MAX_BODY + 1];
+    assert!(write_on(&a, &text));
+    let parts: Vec<_> = (0..3).map(|_| got(&b)).collect();
+    assert!(parts.iter().all(|(op, ..)| *op == librsproto::OP_TTY_WRITE));
+    assert_eq!(parts.iter().map(|(.., body)| body.len()).sum::<usize>(), text.len());
+
+    let (a, b) = pair();
+    put(&b, 0, 1, RS_FLAG_ERROR, &(KError::NoAccess as i32).to_le_bytes());
+    assert!(!write_on(&a, b"x"), "refused");
+}
+
+#[test]
+fn echo_is_set_by_its_flag() {
+    for (on, flags) in [(true, librsproto::TTY_MODE_ECHO), (false, 0)] {
+        let (a, b) = pair();
+        ack(&b);
+        assert!(set_echo_on(&a, on));
+        assert_eq!(got(&b), (librsproto::OP_TTY_SET_MODE, 1, vec![flags]));
+    }
+}

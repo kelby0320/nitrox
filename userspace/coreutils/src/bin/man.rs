@@ -2,7 +2,8 @@
 //!
 //! The pages are files under `/system/manual`, one directory a section, staged from the
 //! repository's `docs/manual` and its specs. The format and its rendering are
-//! [`coreutils::manual`]'s; this is what reaches the filesystem.
+//! [`coreutils::manual`]'s; this is what reaches the filesystem. Where the shell would show its
+//! output on a terminal, it is paged there ([`coreutils::pager`]).
 
 #![no_std]
 #![no_main]
@@ -14,13 +15,14 @@ use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
 use coreutils::manual::{self, Found, Request};
+use coreutils::pager::{self, Shown};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
 use libos::{exit, log};
 use libstream::channel::ChannelSink;
 use libstream::table::TableWriter;
-use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
+use libstream::{Schema, StreamFlags, Table, TypeModifiers, TypeTag, Value};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -74,6 +76,10 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     };
     let width = stage.terminal_size().map_or(WIDTH, |s| usize::from(s.cols));
     let page = manual::answer(&pages, section, name, width).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_FAILURE));
+    let lines: Vec<String> = page.lines().map(String::from).collect();
+    if pager::show(&stage, &lines, 0) == Shown::Paged {
+        exit(EXIT_OK);
+    }
     // A reader that has gone wanted no more; any other failure is one.
     match stage.text(page.as_bytes()) {
         Ok(true) | Err(libstream::wire::WireError::PeerClosed) => {}
@@ -101,8 +107,13 @@ fn pages(stage: &Stage) -> Result<Vec<Found>, String> {
     Ok(out)
 }
 
-/// Emit `pages` as the table `man` lists, and exit.
+/// Emit `pages` as the table `man` lists, or page it, and exit.
 fn list(stage: &Stage, pages: &[&Found]) -> ! {
+    let table = listing(pages);
+    let (lines, head) = pager::table_lines(&table);
+    if pager::show(stage, &lines, head) == Shown::Paged {
+        exit(EXIT_OK);
+    }
     let Some(port) = stage.stdout() else {
         for p in pages {
             let mut line = p.name.clone();
@@ -111,20 +122,27 @@ fn list(stage: &Stage, pages: &[&Found]) -> ! {
         }
         exit(EXIT_OK)
     };
-    emit(stage, port, pages);
+    emit(stage, port, &table);
     exit(EXIT_OK)
 }
 
-fn emit(stage: &Stage, stdout: Port<'_>, pages: &[&Found]) {
+fn listing(pages: &[&Found]) -> Table {
     let schema = Schema::new()
         .field("name", TypeTag::String, TypeModifiers::NONE)
         .field("section", TypeTag::Int, TypeModifiers::NONE)
         .field("summary", TypeTag::String, TypeModifiers::NONE);
+    let rows = pages
+        .iter()
+        .map(|p| alloc::vec![Value::Str(p.name.clone()), Value::Int(i64::from(p.section)), Value::Str(p.summary())])
+        .collect();
+    Table { flags: StreamFlags::NONE, schema, rows }
+}
+
+fn emit(stage: &Stage, stdout: Port<'_>, table: &Table) {
     let mut tw = TableWriter::new(ChannelSink::new(stdout, IPC_PAYLOAD_SIZE));
-    let wrote = tw.write_schema(StreamFlags::NONE, &schema).and_then(|()| {
-        for p in pages {
-            let row = [Value::Str(p.name.clone()), Value::Int(i64::from(p.section)), Value::Str(p.summary())];
-            tw.write_row(&row)?;
+    let wrote = tw.write_schema(table.flags, &table.schema).and_then(|()| {
+        for row in &table.rows {
+            tw.write_row(row)?;
         }
         tw.finish_with_status(0)
     });

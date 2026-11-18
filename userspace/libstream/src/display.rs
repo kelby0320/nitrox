@@ -6,6 +6,9 @@ use alloc::vec::Vec;
 
 use crate::wire::{Record, StreamFlags, Table, TypeTag, Value};
 
+/// The SGR a header row is drawn in on a terminal, bright black: the shell's and a pager's.
+pub const HEADER: &str = "\x1b[90m";
+
 /// A table laid out as text: its header row, if it has one, and its rows, each a line without
 /// its newline.
 #[derive(Clone, PartialEq, Eq, Debug)]

@@ -311,7 +311,14 @@ fn write_script(s: &mut Session, body: &str, path: &str, prompt: &str) -> R<()> 
 
 /// The manual: a page, read through the session's bind of `/system/manual`, and every page counted.
 fn interactive_manual(s: &mut Session) -> R<usize> {
+    // Longer than a screen, and shown at the prompt, a page is paged, at 80 by 24 on a serial line,
+    // which cannot say its size: Space turns it, and `q` leaves the alternate screen for the prompt.
     quietly(s, "man man", "prints the page named NAME")?;
+    s.expect("lines 1-23 of ")?;
+    s.send_raw(" ")?;
+    s.expect("lines 24-46 of ")?;
+    s.send_raw("q")?;
+    s.expect("\x1b[?1049l")?;
     s.expect("/home>")?;
     // No session can add a page or take one away: the count below says neither landed.
     s.send("touch /system/manual/zz.1.md")?;
@@ -325,6 +332,12 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     quietly(s, "format(\"pages={}\", man | count)", &format!("pages={pages}"))?;
     s.expect("/home>")?;
     quietly(s, "man 5 manual-page", "The contract between a page")?;
+    s.expect("lines 1-23 of ")?;
+    s.send_raw("q")?;
+    s.expect("/home>")?;
+    // Not the last stage, `page` passes its input on unchanged, though it is far over a page.
+    quietly(s, "let through = 1..100 | map { |n| {n: n} } | page | count", "/home>")?;
+    quietly(s, "format(\"through={}\", through)", "through=99")?;
     s.expect("/home>")?;
     // A serial line cannot say its size: `terminal` reports it null, and `man` drew to 80 columns.
     quietly(s, "let unknown = terminal | filter columns == null | filter rows == null | count", "/home>")?;
@@ -335,9 +348,9 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     quietly(s, "format(\"kw={}\", kw)", "kw=1")?;
     s.expect("/home>")?;
     println!(
-        "  ok: man printed its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size"
+        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show"
     );
-    Ok(7)
+    Ok(8)
 }
 
 /// `test-interactive`'s steps 19d-1 to 19d-5: editing the line being typed, with the keys a serial
