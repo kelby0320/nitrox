@@ -48,7 +48,7 @@ pub const KEYWORDS: &[Entry] = &[
     keyword(
         &["const"],
         "const NAME = VALUE",
-        "A name fixed when the script is read.",
+        "A name not to be bound again where it is; pub offers it.",
         "const LIMIT = 10\nLIMIT * 2",
         "20\n",
     ),
@@ -69,7 +69,7 @@ pub const KEYWORDS: &[Entry] = &[
     keyword(
         &["for"],
         "for NAME in VALUE { ... }",
-        "Run the block once for each row, value or character.",
+        "Run the block once for each row or value.",
         "mut total = 0\nfor n in 1..4 { total = total + n }\ntotal",
         "6\n",
     ),

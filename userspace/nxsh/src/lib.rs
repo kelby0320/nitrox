@@ -39,6 +39,8 @@ mod guide_tests;
 #[cfg(test)]
 mod help_tests;
 #[cfg(test)]
+mod last_tests;
+#[cfg(test)]
 mod shown_tests;
 #[cfg(test)]
 mod tilde_tests;

@@ -8,12 +8,12 @@ often, not text. Its operators, such as `filter` and `sort`, work on that value 
 itself. It has variables, functions and control flow, as a scripting language does, and it
 refuses to guess: a condition must be a Bool, and a number is not a string.
 
-This page is a tour. Each example is what you type, after `>`, then what the shell prints. The shell's tests
-type every example here and compare what comes back, in the order they appear, as one session
-would; an example that runs a program shows what it printed on one machine, so a size or a count
-on yours will differ. The rules are `shell-language(7)`; every operator, with an example, is
-`shell-operators(7)`; and at the prompt, `help` lists the shell's own words and `help NAME` says
-what one does.
+This page is a tour. Each example is what you type, after `>`, then what the shell prints. The
+shell's tests type every example here and compare what comes back, in the order they appear, as
+one session would; an example that runs a program shows what it printed on one machine, so a size
+or a count on yours will differ. The rules are `shell-language(7)`; every operator, with an
+example, is `shell-operators(7)`; and at the prompt, `help` lists the shell's own words and
+`help NAME` says what one does.
 
 ## Running a command
 
@@ -163,8 +163,36 @@ A program's arguments are words, and need no quotes unless they hold a space: `l
 
 ### Variables
 
-`let` binds a name for good; `mut` makes one that can be assigned again; `const` fixes one when a
-script is read.
+`let` binds a name that nothing can assign to, though a later `let` may bind it anew; `mut` makes
+one that can be assigned; and `const` one that cannot even be bound again where it is, and that a
+script may offer to others with `pub`.
+
+```nxsh
+> let a = 1
+> a = 2
+```
+
+```
+nxsh: `a` was bound with `let` — only a `mut` binding can be assigned to
+```
+
+```nxsh
+> let a = 2
+> a
+```
+
+```
+2
+```
+
+```nxsh
+> const LIMIT = 10
+> const LIMIT = 20
+```
+
+```
+nxsh: `LIMIT` is a const and cannot be rebound in the same scope
+```
 
 ```nxsh
 > mut total = 0
@@ -177,8 +205,9 @@ script is read.
 ```
 
 The environment is a record, `$env`: `$env.PWD` is the working directory, and `$env.HOME` your
-home. `cd` changes `$env.PWD`, and only to somewhere that exists. At the prompt, `$last.value` is
-what the last line computed, and `$last.status` how its stages ended.
+home. `cd` changes `$env.PWD`, and only to somewhere that exists. At the prompt, `$last` is the
+last line that succeeded: `$last.value` what it computed, and `$last.status` how the stages of its
+pipelines ended, null when it ran none. A failed line's stages are `e.stages`, in a `catch`.
 
 ## Blocks and control flow
 
@@ -193,7 +222,7 @@ what the last line computed, and `$last.status` how its stages ended.
 big
 ```
 
-`for` walks a table's rows, a list's values, a string's characters or a range's numbers:
+`for` walks a table's rows, a list's values or a range's numbers:
 
 ```nxsh
 > for n in 1..4 { display n * n }
@@ -246,9 +275,10 @@ cannot parse "x" as Int
 an odd number
 ```
 
-A pipeline whose stage fails is reported failed, and the stages after it still finish what they
-were sent. `strict { ... }` stops the rest at the first that fails. `Ctrl-C` stops what is
-running: the stages a pipeline started, or a loop at its next turn.
+A pipeline whose stage fails is reported failed, naming the stage, and the programs after it still
+finish what they were sent; a program that failed and sent nothing ends it there. In a `catch`,
+`e.stages` says how each stage ended. `strict { ... }` stops the rest at the first that fails.
+`Ctrl-C` stops what is running: the stages a pipeline started, or a loop at its next turn.
 
 ## Functions and scripts
 

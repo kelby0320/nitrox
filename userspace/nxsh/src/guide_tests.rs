@@ -2,13 +2,15 @@
 //! reading it would type them, and prints the block that follows it.
 
 use crate::eval::{Interp, Mode};
-use crate::host::MockHost;
+use crate::host::{MockHost, MockLog};
 use crate::repl::{Continue, diagnostic, needs_continuation};
 use alloc::boxed::Box;
 use alloc::format;
+use alloc::rc::Rc;
 use alloc::string::{String, ToString};
 use alloc::vec;
 use alloc::vec::Vec;
+use core::cell::RefCell;
 use libstream::wire::{Record, Schema, StreamFlags, Table, TypeModifiers, TypeTag, Value};
 
 const GUIDE: &str = include_str!("../../../docs/manual/7/shell.md");
@@ -20,10 +22,16 @@ struct Block {
     follows: bool,
 }
 
+/// The page's blocks. A fence this reader would not see, indented under a list item or of tildes,
+/// is refused, or an example in it would go unrun.
 fn blocks(page: &str) -> Vec<Block> {
     let (mut out, mut follows) = (Vec::new(), false);
     let mut lines = page.lines();
     while let Some(line) = lines.next() {
+        let fence = line.trim_start();
+        if (fence.starts_with("```") || fence.starts_with("~~~")) && !line.starts_with("```") {
+            panic!("a fence this test cannot read: {line:?}");
+        }
         if let Some(tag) = line.strip_prefix("```") {
             let mut body = String::new();
             for l in lines.by_ref().take_while(|l| *l != "```") {
@@ -117,28 +125,46 @@ fn run_guide() -> Vec<(String, String, String)> {
         TypeModifiers::NONE,
     );
     shell.set_env(Record { schema: env, values: vec![home.clone(), home] });
-    let mut ran = Vec::new();
-    for (source, shown) in examples {
-        let (mut printed, mut statement) = (String::new(), String::new());
-        for line in source.lines() {
-            statement.push_str(line);
-            statement.push('\n');
-            if needs_continuation(&statement) != Continue::No {
-                continue;
-            }
-            let before = log.borrow().output.len();
-            let result = shell.run_line(statement.trim_end());
-            printed.push_str(&log.borrow().output[before..].concat());
-            match result {
-                Ok(text) => printed.push_str(text.as_deref().unwrap_or("")),
-                Err(e) => printed.push_str(&format!("{}\n", diagnostic(&e.message, false))),
-            }
-            statement.clear();
+    examples
+        .into_iter()
+        .map(|(source, shown)| {
+            let printed = typed(&mut shell, &log, &source);
+            (source, shown, printed)
+        })
+        .collect()
+}
+
+/// What `source` prints at the prompt of `shell`, whose host logs to `log`: what a line writes, to
+/// `stdout` and to `stderr`, then its value or its error, as the REPL draws them.
+fn typed(shell: &mut Interp, log: &Rc<RefCell<MockLog>>, source: &str) -> String {
+    let (mut printed, mut statement) = (String::new(), String::new());
+    for line in source.lines() {
+        statement.push_str(line);
+        statement.push('\n');
+        if needs_continuation(&statement) != Continue::No {
+            continue;
         }
-        assert!(statement.is_empty(), "an example ends mid-statement: {source}");
-        ran.push((source, shown, printed));
+        let before = (log.borrow().output.len(), log.borrow().diagnostics.len());
+        let result = shell.run_line(statement.trim_end());
+        printed.push_str(&log.borrow().output[before.0..].concat());
+        printed.push_str(&log.borrow().diagnostics[before.1..].concat());
+        match result {
+            Ok(text) => printed.push_str(text.as_deref().unwrap_or("")),
+            Err(e) => printed.push_str(&format!("{}\n", diagnostic(&e.message, false))),
+        }
+        statement.clear();
     }
-    ran
+    assert!(statement.is_empty(), "an example ends mid-statement: {source}");
+    printed
+}
+
+/// A line's `stderr` is shown, as `time`'s, before its value.
+#[test]
+fn what_a_line_writes_to_stderr_is_shown() {
+    let host = MockHost::new();
+    let log = host.log();
+    let mut shell = Interp::with_host(Box::new(host), Mode::Repl);
+    assert_eq!(typed(&mut shell, &log, "time 1"), "time: unknown\n1\n");
 }
 
 #[test]
@@ -158,6 +184,9 @@ fn the_guide_is_read_whole() {
     let (examples, files) = read(GUIDE);
     assert!(examples.len() >= 20, "{} examples", examples.len());
     assert_eq!(files.iter().map(|f| f.0.as_str()).collect::<Vec<_>>(), ["/home/alice/lib.nx"]);
+    for unseen in ["- an item\n\n  ```nxsh\n  > 1\n  ```\n", "~~~nxsh\n> 1\n~~~\n"] {
+        assert!(std::panic::catch_unwind(|| read(unseen)).is_err(), "{unseen:?} would go unrun");
+    }
     let stray = "```nxsh\n> 1\n```\n\nprose\n\n```\n1\n```\n";
     assert!(std::panic::catch_unwind(|| read("```nxsh\n1\n```\n")).is_err(), "a line typed with no `> `");
     assert!(std::panic::catch_unwind(|| read(stray)).is_err(), "an output after prose was taken as one");

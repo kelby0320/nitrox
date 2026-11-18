@@ -353,8 +353,13 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     s.expect("[{ n: 5 }, { n: 9 }]")?;
     s.expect("`man shell-operators`")?;
     s.expect("/home>")?;
-    // One of `shell(7)`'s examples that runs a program, whose answer is the same on any machine.
-    quietly(s, GUIDE_EXAMPLE.0, GUIDE_EXAMPLE.1.lines().last().unwrap_or_default())?;
+    // One of `shell(7)`'s examples that runs a program, whose answer is the same on any machine:
+    // each of its lines, in order.
+    let mut answer = GUIDE_EXAMPLE.1.lines();
+    quietly(s, GUIDE_EXAMPLE.0, answer.next().unwrap_or_default())?;
+    for line in answer {
+        s.expect(line)?;
+    }
     s.expect("/home>")?;
     println!(
         "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry; the guide's example ran"
