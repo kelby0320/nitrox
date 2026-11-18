@@ -879,3 +879,46 @@ fn a_refit_on_the_alternate_screen_rewraps_the_main_one_beneath() {
     feed(&mut g, "\x1b[?1049l");
     assert_eq!((line(&g, 0), line(&g, 1), g.cursor()), ("abcde".into(), "fghij".into(), (1, 4)));
 }
+
+/// What a grid holds whatever it was fed: rows sized to it, the cursor on it, nothing printed past
+/// its width.
+fn assert_sound(g: &Grid) {
+    assert_eq!(g.cells.len(), g.cols * g.rows);
+    assert_eq!((g.wrapped.len(), g.printed.len(), g.dirty.len()), (g.rows, g.rows, g.rows));
+    assert!(g.row < g.rows && g.col < g.cols, "the cursor {:?} is off a {}x{} grid", g.cursor(), g.cols, g.rows);
+    assert!(g.printed.iter().all(|&p| p <= g.cols), "printed past the width: {:?}", g.printed);
+}
+
+/// A selection names lines of the screen it was made on, so a switch, either way, drops it; and
+/// draws every row again, though the cursor has not moved.
+#[test]
+fn a_switch_drops_the_selection_and_draws_every_row() {
+    let mut g = Grid::new(10, 3);
+    feed(&mut g, "one");
+    for switch in ["\x1b[?1049h", "\x1b[?1049l"] {
+        g.select_from(0, 0);
+        g.extend(0, 2);
+        g.take_damage();
+        feed(&mut g, switch);
+        assert!(g.selection().is_none(), "{switch:?}");
+        assert_eq!(g.take_damage(), alloc::vec![0, 1, 2], "{switch:?}");
+    }
+}
+
+/// A refit cuts the alternate screen to its new bounds, the cursor and each row's printed extent
+/// too, drops a selection, and draws every row again.
+#[test]
+fn a_refit_cuts_the_alternate_screen_to_its_bounds() {
+    let mut g = Grid::new(10, 3);
+    feed(&mut g, "\x1b[?1049h\x1b[H0123456789\x1b[3;10H");
+    g.select_from(0, 0);
+    g.extend(0, 4);
+    g.take_damage();
+    g.resize(5, 2);
+    assert_sound(&g);
+    assert_eq!((line(&g, 0), g.cursor()), ("01234".into(), (1, 4)));
+    assert!(g.selection().is_none());
+    assert_eq!(g.take_damage(), alloc::vec![0, 1]);
+    feed(&mut g, "\x1b[?1049l");
+    assert_sound(&g);
+}

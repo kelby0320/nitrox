@@ -69,9 +69,9 @@ impl Grid {
         let reflow = self.resize(cols, rows);
         let main = self.swap(shown.cropped(from, self.cols, self.rows));
         self.main = Some(Box::new(main));
+        // `resize` damaged every row, and mapped the selection by the main screen's rewrap: but its
+        // lines are this screen's.
         self.selection = None;
-        self.cursor_drawn = (self.row, self.col);
-        self.damage_all();
         reflow
     }
 
