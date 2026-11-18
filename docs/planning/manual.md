@@ -496,7 +496,8 @@ The four parallel lists become questions asked of the table.
 **Departures, for the maintainer's eye:**
 - **`help` points at `man shell-language`**, not `man shell`: `shell(7)` is G.5's, which moves the
   pointer when the page exists.
-- **`help` returns its text as a value**, so a builtin may head a pipeline (`help trim | count`).
+- **`help` returns its text as a value**, so it may head a pipeline (`help trim | count`); `cd` and
+  `exit` may not.
 - **The builtins and keywords have entries**, with examples run where one can, beside the operators.
 - **§3's table said `expect`, `assert` and `parse` were operators**; they are keywords, and it says so.
 
@@ -509,6 +510,20 @@ builtin, and at its example's output with the output left out.
 
 **The gate**: `test-interactive` runs `help filter` and reads its entry, its example's output among
 it, over serial (58 steps).
+
+**After review** (#454, nine findings, every one fixed; `ef879ba2`):
+- **Only `help` heads a pipeline.** Every builtin could, so `cd / | count` moved and then failed,
+  and `exit 3 | count` left the shell. Each builtin now says whether it may (`builtins.rs`, which
+  the parser asks for the builtins, where it asked `help.rs`); `cd` and `exit` at a pipe's head are
+  refused before they act.
+- **`help PROGRAM` names a page the manual has**, and the program's `--help` where it has none,
+  which is every program but `man` and `page` until G.6; `/bin` is listed only once no table has
+  the name. A function or a name bound here is said to be one.
+- **A builtin's name at a statement's head is the builtin**, as `cd`'s always was: §3 says so, and
+  a binding named `help` is read alone or in parentheses.
+- **The smaller pieces**: `nxsh`'s `CLAUDE.md` names the tables; two group headings said what
+  their operators do not; the builtins' docs said they mutate the shell; `help`'s arms the parser
+  never reaches went; `exit`'s comment is back above it; and the run that rewrites the page passes.
 
 ### G.5 The shell guide
 
