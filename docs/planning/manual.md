@@ -582,6 +582,21 @@ example's row with `select` keeping one column.
 **The gate**: `test-interactive` types the guide's `list` example over serial and reads its row
 (59 steps).
 
+**After review** (#455, ten findings: nine fixed, one declined; `33171cb2`):
+- **The guide said what the shell does not**: `for` walks no string; `let` may bind a name again,
+  where `const` may not, and neither is fixed when a script is read; `$last.status` could be an
+  earlier line's. Each claim is now an example the test runs, or is said as the source does it.
+- **Two shell faults it described, fixed**: a line that ran no pipeline paired its value with an
+  earlier line's status, and now has none; and a program that failed and sent nothing let the
+  operator after it blame its missing operand, where now the pipeline fails naming the program,
+  its stages in the `catch`. The spec's §1 and §11d say so. `eval.rs`'s entry was raised by hand,
+  seven lines.
+- **The guide's test sees what it could miss**: a fence indented under a list item or of tildes
+  is refused, and what a line writes to `stderr` is shown before its value.
+- **The gate reads the example's whole answer**, its header before its row.
+- **Declined**: comparing the mock's `/bin` with the real `list`'s, which would make the shell's
+  tests depend on the coreutils; the gate runs the one example whose answer is the same anywhere.
+
 ### G.6 The commands
 
 - **A page in section 1 for every program a person runs**:
