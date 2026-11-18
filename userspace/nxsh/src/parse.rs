@@ -33,10 +33,6 @@ use crate::exec::is_path_head;
 use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 use crate::operators::{self, Takes};
 
-/// Shell-state builtins (§3): they mutate the shell's own process state, which an
-/// external program structurally cannot do.
-pub(crate) const BUILTINS: &[&str] = &["cd", "exit"];
-
 /// How the operator called `name` reads its arguments, if it is one.
 fn takes(name: &str) -> Option<Takes> {
     operators::find(name).map(|o| o.takes)
@@ -923,7 +919,7 @@ impl<'a> Parser<'a> {
         }
 
         let is_operator = at_head && !forced_external && operators::is_operator(&name);
-        let is_builtin = at_head && !forced_external && BUILTINS.contains(&name.as_str());
+        let is_builtin = at_head && !forced_external && crate::help::is_builtin(&name);
         if is_builtin {
             // A builtin takes a **path**, not an expression: `cd ..` and `cd /system` break
             // `operator_args` (a range, a division). Word mode is how an external gets its paths.
@@ -1664,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn the_section_7_sketch_parses() {
+    fn a_script_of_every_statement_form_parses() {
         let src = r#"
 const THRESHOLD_DEFAULT: Int = 1000
 let threshold = THRESHOLD_DEFAULT

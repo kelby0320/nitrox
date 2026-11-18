@@ -1,10 +1,11 @@
-# Nitrox: Shell Design Notes (v1.3)
+# Nitrox: Shell Design Notes (v1.4)
 
 ## Status
 
 **Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
 (2026-10-08), §3; v1.3's paths, `~`, running a file by its path and `$args` since pre-Phase-7
-Part C.1 (2026-10-19), and its line editing (§11c-1) since Part C.2 (2026-10-19). This is the language reference: grammar, operators and semantics. Sections
+Part C.1 (2026-10-19), and its line editing (§11c-1) since Part C.2 (2026-10-19); v1.4's `help`
+since Part G.4 (2026-11-18). This is the language reference: grammar, operators and semantics. Sections
 describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
@@ -17,6 +18,16 @@ Companion document: `docs/architecture/ui-composition-model.md` (windows/widgets
 window-to-window composition) — graduated to `docs/architecture/` with Milestone 8, upstream of
 this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
+
+### Changes in v1.4 (2026-11-18, the operators' table and `help`)
+
+- **§3 — `help` is a builtin**: what an operator, a builtin or a keyword does, from the tables the
+  shell reads, so `help` is no longer a program's name to take. A builtin may head a pipeline,
+  its value going on (`help trim | count`); it still takes no pipe.
+- **§10b — the operators are one table**, `userspace/nxsh/src/operators.rs`: what each takes, a
+  line saying what it does, and an example the tests run. `shell-operators(7)` is that table.
+- **§7, a sketch from before the grammar settled, is gone**: it used `print`, `ls` and
+  `validate_schema`, which never existed.
 
 ### Changes in v1.3 (2026-10-19, the shell's paths and line editing)
 
@@ -279,9 +290,9 @@ for scripts that want it.
 
   | Category | Examples | Why |
   |---|---|---|
-  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail`, and `time` as a prefix | Pure syntax, not commands at all |
-  | Shell-state builtins | `cd`, `exit` | Must mutate the shell's own process state; an external process structurally can't reach back and do this |
-  | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `expect`, `assert`, `parse`, `format`, `last`, `skip`, `dedupe`, and the §10b families | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
+  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail`, `expect`, `assert` and `parse` as stages, and `time` as a prefix | Pure syntax, not commands at all |
+  | Shell-state builtins | `cd`, `exit`, `help` | Act on the shell itself: `cd` and `exit` change its state, which an external process structurally can't reach back and do, and `help` reads the tables the shell parses by |
+  | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `format`, `last`, `skip`, `dedupe`, and the §10b families: `shell-operators(7)` has each | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
   | External programs | `list`, `copy`, `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` | Ordinary userspace programs speaking TSM1 on stdio for pipeline composability. **Not** resource servers — resource servers (`fs-server-ext4`, block/device drivers) are a distinct, narrower category of long-running service speaking `librsproto`; an external program may be a *client* of one, but implementing `librsproto` is not required to participate in a shell pipeline. Full scope and naming rationale in §10 |
 
   **`time PIPELINE`** (Phase 6 Part H.2, 2026-10-08) times a pipeline: it runs as ever and yields
@@ -546,41 +557,11 @@ the densest, most frequent chains no longer touch it at all.
     — got Table<{name: String, email: String}>, missing field 'size'
   ```
 
-## 7. Illustrative sketch (early snapshot — see §8/§9 for the settled grammar this now reflects)
+## 7. (Removed in v1.4)
 
-```
-const THRESHOLD_DEFAULT: Int = 1000
-let threshold = THRESHOLD_DEFAULT
-let files = open ./src | filter { |row| row.size > threshold }
-
-if (files | count) > 0 {
-    display files
-} else {
-    print "nothing matched"
-}
-
-def summarize(data: Table<{name: String, size: Int}>, label: String = "result")
-    -> Record<{label: String, total: Int}> {
-    return { label: label, total: data | count }
-}
-
-ls --long
-  | expect Table<{name: String, size: Int}>
-  | assert (count > 0)
-  | sort size --reverse
-  | summarize(_, label: "src files")
-
-strict {
-    open ./input.csv | validate_schema | save ./output.csv
-}
-
-mut counts = { errors: 0, warnings: 0 }
-for line in open ./log.txt {
-    if line.level == "error" {
-        counts.errors = counts.errors + 1
-    }
-}
-```
+§7 was a sketch from before the grammar settled. It used `print`, `ls` and `validate_schema`,
+none of which exist, and nothing ran it. §8 and §9 are the grammar, and `shell-operators(7)`
+shows each operator with an example the shell's tests run.
 
 ## 8. Grammar: lexical and expression layer
 
@@ -1235,6 +1216,13 @@ generic-operator set, and belongs there instead.
   it interact with `^`, §8a? is it `def`-level or its own construct?). Flagged, not solved here.
 
 ### 10b. New generic-operator additions
+
+**The operators are one table**, `userspace/nxsh/src/operators.rs`: each one's name, how its
+arguments read, its signature, a line saying what it does, and an example with what it prints. The
+parser asks it how an operator reads, `help NAME` prints an entry at the prompt, and
+`shell-operators(7)` is the table as a page. A host test holds the page to the table, another runs
+every example, and a third holds that the evaluator dispatches each name and no other. What follows
+is why each operator is as it is.
 
 - **`last N` / `skip N`** — tail/head-from-end and offset-skip, siblings to the existing `take`.
 - **`dedupe`** — row-equality-based deduplication, same generic-dispatch shape as `sort`/`filter`

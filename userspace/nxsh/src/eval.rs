@@ -149,7 +149,7 @@ pub struct Interp {
     /// functions, or mutual recursion is impossible. So a `def` goes here and is always reachable,
     /// while a `let` stays in `scopes` and is not.
     functions: Vec<(String, Val)>,
-    host: alloc::boxed::Box<dyn Host>,
+    pub(crate) host: alloc::boxed::Box<dyn Host>,
     mode: Mode,
     /// Whether the statement currently executing is inside a `strict { }` block (§1).
     strict: bool,
@@ -262,7 +262,7 @@ impl Interp {
                 .filter(|k| k.as_bytes().first().is_some_and(u8::is_ascii_alphabetic));
             let commands = self.host.commands();
             let names = keywords
-                .chain(crate::parse::BUILTINS.iter().copied())
+                .chain(crate::help::BUILTINS.iter().flat_map(|b| b.names.iter().copied()))
                 .chain(crate::operators::OPERATORS.iter().map(|o| o.name))
                 .chain(self.functions.iter().map(|(n, _)| n.as_str()))
                 .chain(commands.iter().map(alloc::string::String::as_str));
@@ -1302,6 +1302,7 @@ impl Interp {
             // §11f. `exit` is a *control outcome of evaluation*, not a string the REPL loop watches
             // for (`exit 1` once missed that comparison). It travels the error channel because that
             // already crosses a `def`, a closure and a loop; `catch` re-raises it (see `exec_try`).
+            "help" => self.help(c),
             "exit" => {
                 let status = match c.args.first() {
                     None => 0,
@@ -1601,8 +1602,7 @@ impl Interp {
                 wrap(ops::format(&template, &vals[1..]).map(Val::str))
             }
             "display" => {
-                // §7 writes `display files` as well as `… | display`: an explicit operand stands
-                // in.
+                // `display files` as well as `… | display`: an explicit operand stands in.
                 let v = match operand {
                     Some(v) => v,
                     None => match raw.first() {
@@ -1736,7 +1736,7 @@ impl Interp {
                 i += 1;
                 continue;
             }
-            if i == 0 && !matches!(&stages[0], Expr::Call(_)) {
+            if i == 0 && !matches!(&stages[0], Expr::Call(c) if c.kind != CallKind::Builtin) {
                 carried = Some(self.eval(&stages[0])?);
                 i += 1;
                 continue;
@@ -1874,24 +1874,15 @@ impl Interp {
     }
 }
 
-/// "That command cannot run yet": names the category so a script written against the finished
-/// language fails informatively against a half-built one.
+/// `c` where nothing runs it. A builtin after a pipe's first stage is the one way here: the parser
+/// makes an operator or a builtin only of a name its table has, and each name has its arm.
 fn unavailable(c: &Call) -> EvalError {
-    EvalError::new(alloc::format!(
-        "`{}` cannot run yet: {} arrive in {}",
-        c.name,
-        match c.kind {
-            CallKind::Operator => "generic operators",
-            CallKind::Builtin => "shell builtins",
-            CallKind::Def => "function calls",
-            CallKind::External => "external programs",
-        },
-        match c.kind {
-            CallKind::Operator => "Part D",
-            CallKind::Def => "Part E",
-            _ => "Part C",
+    EvalError::new(match c.kind {
+        CallKind::Builtin => {
+            alloc::format!("`{}` is a builtin, which acts on the shell: nothing is piped into it", c.name)
         }
-    ))
+        _ => alloc::format!("`{}` has nothing here to run it", c.name),
+    })
 }
 
 /// Encode a value as a TSM1 stream for a stage's `stdin`.
