@@ -19,9 +19,14 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
   `ops`, `repl`, `regex`, `complete`, `timing` (`time`'s line, Phase 6 Part H.2), `paths`
   (resolving and `~`, where a `use` reads, the chain of files loading), `exec` (what a file
   named as a program runs as), `search` (Ctrl-R), `editor` (what each byte typed at the prompt
-  writes and runs) and `pipeline` (every handle and stage a pipeline makes, given back on any
-  return, its syscalls behind `pipeline::Sys`). **No syscalls.** Host-tested (`cargo test -p nxsh
-  --lib --target x86_64-unknown-linux-gnu`) in a second rather than through a 90-second boot.
+  writes and runs), `pipeline` (every handle and stage a pipeline makes, given back on any
+  return, its syscalls behind `pipeline::Sys`), and the tables: `operators` (every operator: how
+  its arguments read, and its entry), `builtins` (the same for `cd`, `exit` and `help`) and `help`
+  (the keywords' entries, and the `help` builtin). **An operator or a builtin is added to its
+  table**, which the parser asks; a test holds the evaluator's arms to the tables, runs every
+  example, and holds `shell-operators(7)` to the operators. **No syscalls.** Host-tested
+  (`cargo test -p nxsh --lib --target x86_64-unknown-linux-gnu`) in a second rather than through a
+  90-second boot.
 - **`src/main.rs` — the host.** `_start`, spawning stages, wiring pipes, the console
   reader, the filesystem — all through `libos`, so the binary makes no raw syscall and holds
   no `static mut`; `src/stage.rs`, a stage's image read and decided by `exec`; `src/stages.rs`,

@@ -205,6 +205,8 @@ pub struct MockLog {
     pub envs: Vec<Record>,
     /// Whether each run's last stage was told it is shown.
     pub shown: Vec<bool>,
+    /// How many times `/bin` was listed.
+    pub listed: usize,
 }
 
 impl Default for MockHost {
@@ -280,6 +282,7 @@ impl MockHost {
 
 impl Host for MockHost {
     fn commands(&mut self) -> Vec<String> {
+        self.log.borrow_mut().listed += 1;
         self.commands.clone()
     }
 

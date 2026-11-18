@@ -399,8 +399,8 @@ impl<'a> Lexer<'a> {
         if self.at(i) == b'|' && self.at(i + 1) != b'|' {
             return true;
         }
-        // `->` can only continue a `def` signature whose return type wrapped — §7's own
-        // worked example is written that way.
+        // `->` can only continue a `def` signature whose return type wrapped, as a long one is
+        // written.
         if self.at(i) == b'-' && self.at(i + 1) == b'>' {
             return true;
         }

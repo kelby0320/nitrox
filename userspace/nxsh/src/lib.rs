@@ -11,13 +11,16 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod builtins;
 pub mod complete;
 pub mod editor;
 pub mod eval;
 pub mod exec;
+pub mod help;
 pub mod history;
 pub mod host;
 pub mod lex;
+pub mod operators;
 pub mod ops;
 pub mod parse;
 pub mod paths;
@@ -31,6 +34,8 @@ pub mod value;
 
 #[cfg(test)]
 mod exec_tests;
+#[cfg(test)]
+mod help_tests;
 #[cfg(test)]
 mod shown_tests;
 #[cfg(test)]

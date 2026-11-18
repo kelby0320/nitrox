@@ -23,7 +23,7 @@ pub struct Script {
 pub enum CallKind {
     /// A generic value operator — `filter`, `sort`, `save` (§5c); may take a closure.
     Operator,
-    /// A shell-state builtin — `cd`, `exit` (§3); it must mutate the shell's own state.
+    /// A builtin — `cd`, `exit`, `help` (§3); it acts on the shell itself.
     Builtin,
     /// A script function called with the parens/named-argument convention (§5b).
     Def,

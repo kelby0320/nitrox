@@ -31,44 +31,12 @@ use alloc::vec::Vec;
 use crate::ast::*;
 use crate::exec::is_path_head;
 use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
+use crate::operators::{self, Takes};
 
-/// Generic value operators (§3, §5c, §10b). Closed at parse time because it selects the
-/// argument grammar; a user-defined generic `def` is called with parens, so it is
-/// syntactically distinct.
-///
-/// The bitwise family (`band`/`bor`/`bxor`/`shl`/`shr`) would join this table: `|`, `&` and
-/// `^` are all spoken for.
-/// TODO(shell-bitwise): `docs/rationale/deferred-decisions.md`.
-pub(crate) const OPERATORS: &[&str] = &[
-    "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last", "skip", "dedupe", "take",
-    "count", "sum", "min", "max", "avg", "reduce", // §10b's Part E families: strings, records, numbers.
-    "split", "join", "trim", "replace", "upper", "lower", "keys", "values", "merge", "round", "floor", "ceil", "trunc",
-    "abs", "capture",
-];
-
-/// Shell-state builtins (§3): they mutate the shell's own process state, which an
-/// external program structurally cannot do.
-pub(crate) const BUILTINS: &[&str] = &["cd", "exit"];
-
-/// Operators whose bareword argument is a *predicate*, and therefore desugars to an
-/// implicit `{ |it| … }` closure (§8b).
-const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map", "reduce"];
-
-/// Operators whose argument may open with `{`.
-///
-/// A predicate operator takes a **closure**, `merge` a **record**; `brace_expr` tells them
-/// apart by the `|` (§8c), so this only grants reading a `{` as an argument rather than as
-/// an enclosing block.
-const BRACE_ARG_OPERATORS: &[&str] = &["filter", "each", "map", "reduce", "merge"];
-
-/// Operators that take **no** arguments at all.
-///
-/// `sum`/`min`/`max`/`avg` are not here: they take an optional column, so `sum size` must
-/// keep reading `size`. Knowing this at parse time lets `(count > 0)` read as a comparison
-/// rather than `count` applied to `> 0`, while a paren can still open a pipeline whose
-/// first stage is a command.
-const NULLARY_OPERATORS: &[&str] =
-    &["count", "dedupe", "trim", "upper", "lower", "keys", "values", "round", "floor", "ceil", "trunc", "abs"];
+/// How the operator called `name` reads its arguments, if it is one.
+fn takes(name: &str) -> Option<Takes> {
+    operators::find(name).map(|o| o.takes)
+}
 
 /// Deepest nesting the parser will descend (D5): recursion on user input must end in an
 /// error, not an overflow of the fixed userspace stack.
@@ -942,7 +910,7 @@ impl<'a> Parser<'a> {
             let args = self.paren_args()?;
             let kind = if forced_external {
                 CallKind::External
-            } else if OPERATORS.contains(&name.as_str()) {
+            } else if operators::is_operator(&name) {
                 CallKind::Operator
             } else {
                 CallKind::Def
@@ -950,8 +918,8 @@ impl<'a> Parser<'a> {
             return Ok(Expr::Call(Box::new(Call { name, kind, args, forced_external })));
         }
 
-        let is_operator = at_head && !forced_external && OPERATORS.contains(&name.as_str());
-        let is_builtin = at_head && !forced_external && BUILTINS.contains(&name.as_str());
+        let is_operator = at_head && !forced_external && operators::is_operator(&name);
+        let is_builtin = at_head && !forced_external && crate::builtins::is_builtin(&name);
         if is_builtin {
             // A builtin takes a **path**, not an expression: `cd ..` and `cd /system` break
             // `operator_args` (a range, a division). Word mode is how an external gets its paths.
@@ -1070,7 +1038,8 @@ impl<'a> Parser<'a> {
     /// whatever ends the stage. §8b's sugar is applied here, not at evaluation.
     fn operator_args(&mut self, name: &str) -> Result<Vec<Arg>> {
         let mut args = Vec::new();
-        if NULLARY_OPERATORS.contains(&name) {
+        let takes = takes(name);
+        if takes == Some(Takes::Nothing) {
             return Ok(args);
         }
         self.in_op_args += 1;
@@ -1084,7 +1053,7 @@ impl<'a> Parser<'a> {
                 // A `{` after an operator is a closure argument only for operators that take one;
                 // elsewhere it is the block of an enclosing `for` or `if`. `for line in open
                 // ./log.txt { … }` would otherwise read the block as a record argument to `open`.
-                Tok::LBrace if !BRACE_ARG_OPERATORS.contains(&name) => break,
+                Tok::LBrace if !matches!(takes, Some(Takes::Predicate | Takes::Record)) => break,
                 // A flag in expression-mode argument position. Re-lex in word mode: it is
                 // `--reverse`, not minus-minus-reverse.
                 Tok::Minus => {
@@ -1105,7 +1074,7 @@ impl<'a> Parser<'a> {
             }
         }
         self.in_op_args -= 1;
-        if PREDICATE_OPERATORS.contains(&name) {
+        if takes == Some(Takes::Predicate) {
             desugar_predicate(&mut args);
         }
         Ok(args)
@@ -1691,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn the_section_7_sketch_parses() {
+    fn a_script_of_every_statement_form_parses() {
         let src = r#"
 const THRESHOLD_DEFAULT: Int = 1000
 let threshold = THRESHOLD_DEFAULT

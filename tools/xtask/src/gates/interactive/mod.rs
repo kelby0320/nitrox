@@ -347,10 +347,16 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     quietly(s, "let kw = man --keyword rsproto-auth | count", "/home>")?;
     quietly(s, "format(\"kw={}\", kw)", "kw=1")?;
     s.expect("/home>")?;
+    // `help`, the shell's own: an operator's entry, in the order it prints, its example's output
+    // among it.
+    quietly(s, "help filter", "Keep what a predicate holds for")?;
+    s.expect("[{ n: 5 }, { n: 9 }]")?;
+    s.expect("`man shell-operators`")?;
+    s.expect("/home>")?;
     println!(
-        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show"
+        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry"
     );
-    Ok(8)
+    Ok(9)
 }
 
 /// `test-interactive`'s steps 19d-1 to 19d-5: editing the line being typed, with the keys a serial

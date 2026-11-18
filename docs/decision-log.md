@@ -38657,3 +38657,33 @@ G.2 merged, #452. G.3, `manual.md` § G.3, built on `pre-phase-7/part-g3-pager` 
   read; `libprompt::set_echo_on` went with it.
 - **A page drops an escape sequence whole**, not only its `ESC`, so a coloured cell shows its text
   as the shell's display does, with no `[31m` left behind.
+
+## 2026-11-18 — Before Phase 7, G.4: the operators' table and `help`
+
+G.3 merged, #453. G.4, `manual.md` § G.4, built on `pre-phase-7/part-g4-operators` (`842f3b48`,
+`dfface44`).
+
+- **One table, `nxsh/src/operators.rs`**: each operator's name, its family, how its arguments read
+  (a predicate, a record, nothing, or words), whether it ends a chain, its signature, a line saying
+  what it does, and an example with what it prints. The parser asks it, where five lists said it
+  piecemeal. **A host test runs every example**, one prints only its last line, and one holds that
+  the evaluator's dispatch names each operator and no other, read from its match arms.
+- **`help` is a builtin**, beside `cd` and `exit`: `help` lists the operators by family, the
+  builtins and the keywords; `help NAME` prints one entry; a name bound here is said to be one; a
+  program's name is answered with its page where the manual has one and its `--help` where not;
+  anything else is an error naming `man --keyword`. **It returns its text as a value**, so it may
+  head a pipeline (`help trim | count`). **`cd` and `exit` may not**, on review: they act on the
+  shell before a stage after them can fail, so `cd / | count` moved and then failed. No builtin
+  takes a pipe. The builtins have their table in `builtins.rs`, which the parser asks, and the
+  keywords theirs in `help.rs`, examples run where one can run; `exit`, `help`, `pub`, `strict`,
+  `use` and `time` have none.
+- **`help` points at `man shell-language`**, where the plan said `man shell`: `shell(7)` is G.5's,
+  and a pointer to a page not yet written would fail the person who follows it. G.5 moves it.
+- **`shell-operators(7)` is the table as a page**, written by the test that holds it to the table
+  (`NXSH_WRITE_PAGE=1`), so the table is the one source and the page's diff shows a change to it.
+- **Entries are ASCII and fit 80 columns**: `help` is read on serial too.
+- **§7 of the shell spec is a numbered tombstone**, so every `§8` and later still points where it
+  did. §3's table had `expect`, `assert` and `parse` as operators; they are keywords, as `help`
+  lists them, and the table says so now.
+- **The message a builtin gets after a pipe** was "builtins arrive in Part C"; it says what is
+  wrong: nothing is piped into a builtin. It is the one call no table and arm agreement covers.

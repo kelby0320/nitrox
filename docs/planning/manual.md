@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -483,6 +483,48 @@ The four parallel lists become questions asked of the table.
 
 **Docs**: [`shell-language.md`](../spec/shell-language.md), whose §10b points at the table.
 
+**Built 2026-11-18** (`842f3b48`, `dfface44`).
+- **The table**, `nxsh/src/operators.rs`: the 34 operators, each with its family, how its arguments
+  read, whether it ends a chain, its signature, a line, and an example with what it prints. The
+  parser and the REPL ask it.
+- **`help`**, a builtin: the operators by family, the builtins and the keywords; `help NAME`, an
+  entry; a program's name, its page. The builtins and keywords have entries in `nxsh/src/help.rs`.
+- **`shell-operators(7)`**, `docs/manual/7`, the table as a page.
+- **The stale pieces**: §7 of the shell spec is a tombstone, and a builtin after a pipe is told that
+  nothing is piped into it.
+
+**Departures, for the maintainer's eye:**
+- **`help` points at `man shell-language`**, not `man shell`: `shell(7)` is G.5's, which moves the
+  pointer when the page exists.
+- **`help` returns its text as a value**, so it may head a pipeline (`help trim | count`); `cd` and
+  `exit` may not.
+- **The builtins and keywords have entries**, with examples run where one can, beside the operators.
+- **§3's table said `expect`, `assert` and `parse` were operators**; they are keywords, and it says so.
+
+**Tests**: every example in all three tables, run; the dispatch's arms against the table; the
+twelve operators that take nothing named and parsed; the keywords against the lexer's; names once,
+ASCII, within 80 columns; `help`'s two forms, a program and an error; a builtin heading a pipe and
+refused one; the page against the table. **Controls**: 14 mutations of the table, the dispatch and
+`help`, each failing a test; `test-interactive` fails at `help filter`'s entry with `help` no
+builtin, and at its example's output with the output left out.
+
+**The gate**: `test-interactive` runs `help filter` and reads its entry, its example's output among
+it, over serial (58 steps).
+
+**After review** (#454, nine findings, every one fixed; `ef879ba2`):
+- **Only `help` heads a pipeline.** Every builtin could, so `cd / | count` moved and then failed,
+  and `exit 3 | count` left the shell. Each builtin now says whether it may (`builtins.rs`, which
+  the parser asks for the builtins, where it asked `help.rs`); `cd` and `exit` at a pipe's head are
+  refused before they act.
+- **`help PROGRAM` names a page the manual has**, and the program's `--help` where it has none,
+  which is every program but `man` and `page` until G.6; `/bin` is listed only once no table has
+  the name. A function or a name bound here is said to be one.
+- **A builtin's name at a statement's head is the builtin**, as `cd`'s always was: §3 says so, and
+  a binding named `help` is read alone or in parentheses.
+- **The smaller pieces**: `nxsh`'s `CLAUDE.md` names the tables; two group headings said what
+  their operators do not; the builtins' docs said they mutate the shell; `help`'s arms the parser
+  never reaches went; `exit`'s comment is back above it; and the run that rewrites the page passes.
+
 ### G.5 The shell guide
 
 **`shell(7)`, a tour in a person's register.** Each example is a fenced `nxsh` block followed by
@@ -500,6 +542,9 @@ its output. It covers:
 programs answer canned tables. A guide the language stops matching fails CI.
 
 **The spec stays the contract**, and the guide points into it for the exact rules.
+
+**`help` points at it**: since G.4 its listing and its keywords' entries name `man shell-language`,
+for want of `shell(7)`.
 
 **The gate**: `test-interactive` runs one of the guide's examples that calls a real program.
 
