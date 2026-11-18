@@ -38616,3 +38616,33 @@ G.1 merged, #451. G.2, `manual.md` § G.2, built on `pre-phase-7/part-g2-tty-siz
   above as debris.
 - **A size is read from a body's first four bytes**, any after them a later version's, as a field
   added to a body's end is; the decoder wanted exactly four where `nxsh` read the first four.
+
+## 2026-11-17 — Before Phase 7, G.3: the pager
+
+G.2 merged, #452. G.3, `manual.md` § G.3, built on `pre-phase-7/part-g3-pager` (`aa8625c9` to
+`a7d99dc7`).
+
+- **The maintainer's call: a stage pages only where its output is shown.** A stage has its own
+  terminal mid-pipeline as at its end, so the plan's "when it has a terminal" would have paged
+  inside `man | count` and `let x = man ls`. The setup message gains `shown`, appended, read as not
+  shown where absent: the shell sets it on the last stage of a statement the REPL displays, a
+  pipeline, a call to a program or a bare name run as one. **The statement's own pipeline takes it
+  before its arguments run**, so `man x (whoami)` tells `man` and not `whoami`, and an operator's
+  call, `format("{}", man)`, tells nobody. "Only `page` pages" was the other way, with `man ls`
+  printing the whole page into the scrollback as before; "page on any terminal", the plan's words,
+  was the third.
+- **What one page holds, or what is not shown, is written as ever**: `page` passes its input on
+  unchanged and `man` writes its page or its listing, so the shell draws it as it always did.
+- **The table display is `libstream`'s**, call 3: `display::table` lays a table out and leaves
+  the header to be painted, and the header's colour moved with it, so the shell and the pager
+  print a table one way.
+- **The alternate screen**, call 2: a second grid with no history, swapped in whole, the main one's
+  cursor and attributes kept as `DECSC` keeps them. A refit while it is up rewraps the main one
+  beneath, as it will be shown again, and cuts the alternate one, which its program draws again.
+- **The pager reads keys as the shell does**: the line discipline's escape decoding became
+  `libline::Keys`, the discipline its first reader. A page is drawn row by row by position, and
+  its status row stops a column short of the corner, so no terminal's way with a wrap moves it.
+  `Ctrl-C` leaves it: an `Interrupt`, or a read answered empty when it came between reads.
+- **`check-terminal` pages `page`'s input**, as its `nxterm` sits in init's namespace with no
+  manual; the harness reports every row a chunk changed while the alternate screen is up, and only
+  then, as on the main one scrolling output changes every row.
