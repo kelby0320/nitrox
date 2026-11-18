@@ -38687,3 +38687,21 @@ G.3 merged, #453. G.4, `manual.md` § G.4, built on `pre-phase-7/part-g4-operato
   lists them, and the table says so now.
 - **The message a builtin gets after a pipe** was "builtins arrive in Part C"; it says what is
   wrong: nothing is piped into a builtin. It is the one call no table and arm agreement covers.
+
+## 2026-11-18 — Before Phase 7, G.5: the shell guide
+
+G.4 merged, #454. G.5, `manual.md` § G.5, built on `pre-phase-7/part-g5-guide` (`18e28bee`).
+
+- **`shell(7)` is a tour**, in a person's register, of what the plan listed, and points into the
+  spec for the rules. Each example is the lines typed, after `>`, in an `nxsh` block, and what the
+  shell printed in the block after it: drawn by `man`, the two blocks look alike, and the mark is
+  what tells them apart.
+- **The examples are run as one session**, in order, on a mock machine: `alice` at home, and a
+  `/bin` of six programs, `list`'s table canned. One example may use what an earlier one bound, as
+  a reader typing along would. A multi-line example is joined as the REPL joins it. A program's
+  sizes are the mock's, and the page says a machine's will differ.
+- **A file an example needs is on the page**, in a `text` block headed with its path, which the
+  test makes on the mock machine: the script `use` reads.
+- **The gate types the example whose answer is the same anywhere**, `list /bin | filter name ==
+  "man" | select name kind`, and a host test holds it to the guide's.
+- **`help`'s listing names `man shell`**; its entries keep `man shell-language`, the rules.

@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -549,6 +549,38 @@ for want of `shell(7)`.
 **The gate**: `test-interactive` runs one of the guide's examples that calls a real program.
 
 **Docs**: `shell(7)`; the root `README.md` points a reader at `man intro`.
+
+**Built 2026-11-18** (`18e28bee`).
+- **`shell(7)`**, `docs/manual/7/shell.md`: a command, a pipeline, tables, values and their types,
+  strings, variables, blocks, errors and `try`, functions and scripts, the prompt's keys, and
+  `with`. 20 examples, each typed after `>` and followed by what the shell prints.
+- **Its examples are run** (`nxsh/src/guide_tests.rs`): typed at one prompt in order, as one
+  session would type them, on a mock machine whose `/bin` lists six programs and whose `whoami`
+  is `alice`; a multi-line one joined as the REPL joins it. A `text` block headed `# /PATH` is a
+  file on that machine, which the `use` example reads.
+- **`help` points at it**: `help`'s listing names `man shell` first. Its entries keep
+  `man shell-language` for the rules, and `shell-operators(7)` points at both.
+- **Where to start**: `intro(7)` lists the shell's three pages, and the root `README.md` points at
+  `man intro` and `man shell`.
+
+**Departures, for the maintainer's eye:**
+- **An example's lines start with `> `**, inside the `nxsh` block: drawn by `man`, a block and its
+  output are alike, and the mark tells what to type from what comes back. The test strips it, and
+  refuses a line without it.
+- **Its examples share one session**, so one may use what an earlier one bound, as a reader typing
+  along would.
+- **A program's answer is one machine's**: the mock's sizes, which the page says will differ.
+  `list /bin | filter name == "man" | select name kind`, which the gate types, answers the same on
+  any machine.
+
+**Tests**: every example, its output against the page's; the page read whole, an output after
+prose and a line with no `> ` refused; the gate's example against the guide's. **Controls**: an
+output changed, an output after prose taken as one, lines typed one at a time, the script file
+not made, and `help` pointing elsewhere each fail a test; `test-interactive` fails at the
+example's row with `select` keeping one column.
+
+**The gate**: `test-interactive` types the guide's `list` example over serial and reads its row
+(59 steps).
 
 ### G.6 The commands
 
