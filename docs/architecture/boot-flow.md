@@ -421,8 +421,9 @@ is what keeps serial the recovery path by construction.
 Failure on the critical path — no usable manifest, a mount that will not come up, the profile
 server, or a `critical` server `service-mgr` cannot bring up — or a declarations file that has lost
 its critical servers — which it tells `init` over the terminal channel — drops to `eshell`, a
-minimal interactive shell bundled in the initramfs with enough capability to inspect block devices,
-edit `init.toml` and reboot. Recovery from a misconfigured boot does not need a rescue USB.
+minimal interactive shell bundled in the initramfs that can only look: `lsblk`, `mounts`, `cat`,
+`echo` and `help`. It changes nothing and cannot reboot; `init.toml` is in the initramfs, which is
+read-only, and the way out is the machine's power or reset.
 
 `eshell` deliberately keeps `kprint` and talks to the raw console device rather than the
 tty server: its whole precondition is that the normal path failed. See

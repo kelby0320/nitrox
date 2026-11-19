@@ -168,7 +168,7 @@ Init processes the manifest as follows:
    g. Call `sys_ns_bind(system_namespace, mount_point, endpoint, derived_rights)`.
 4. For each bind, in file order, call `sys_ns_bind(system_namespace, path, source_endpoint, subtree)` with the source mount's endpoint. Init holds every mount's endpoint until the binds are done; then it keeps the root's (handed on to the service manager) and closes the rest, since each binding holds its own reference.
 5. If all mounts and binds succeed, proceed to read `/system/current-generation` and continue normal boot.
-6. If any mount or bind fails, log the failure to the kernel log and spawn the emergency shell. Wait for eshell exit (typically a reboot).
+6. If any mount or bind fails, write the failure to the console, spawn the emergency shell, and go on reaping.
 
 ## Failure modes and emergency mode
 
@@ -183,7 +183,7 @@ A mount fails if any of these occur:
 
 A bind fails if its source mount failed, or if its `sys_ns_bind` call fails. It is critical-path like a mount: a binding that silently did not happen surfaces later as a lookup failing for no visible reason.
 
-On any failure, init writes a structured error message to the kernel log indicating which mount failed and why, then spawns eshell with a pre-populated context describing the failure. The user can inspect the situation, edit `init.toml` from within eshell, and reboot.
+On any failure, init writes which mount failed and why to the console, then spawns eshell, which is handed nothing about the failure. It can list the block devices and what is bound and print a file; it cannot edit `init.toml`, which is in the read-only initramfs, or reboot.
 
 ## Examples
 
