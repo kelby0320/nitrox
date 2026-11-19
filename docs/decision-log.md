@@ -38787,9 +38787,13 @@ G.6 merged, #456. G.7, `manual.md` § G.7, built on `pre-phase-7/part-g7-system-
   cast is `libos`'s mapping, as at Part E's end.
 - **CI's nightly Miri job has failed since G.1 merged**, on a test's own deadline:
   `every_page_and_spec_renders_within_eighty_columns` fails a page not rendered in ten seconds,
-  and interpreted, a page can take longer. It reads every page from the repository, as a test in
-  `usage` does that Miri already skips for that reason, and is now skipped the same way (`f3e8ecdd`);
-  it still runs natively. The job's failures before it, 2026-11-14 to 2026-11-16, were the `libos`
-  model's undefined behaviour that Part E's run found, fixed with #444; the 2026-11-17 run passed.
+  and interpreted, a page can take longer: the whole test would take fifty minutes. It is skipped
+  under Miri (`f3e8ecdd`) and still runs natively. The job's failures before it, 2026-11-14 to
+  2026-11-16, were the `libos` model's undefined behaviour that Part E's run found, fixed with
+  #444; the 2026-11-17 run passed.
+- **After review, a skip says the true reason.** The test's first reason, that it reads the pages
+  from the repository, was copied from four `usage` tests, and was false for all five: the job
+  runs Miri with `-Zmiri-disable-isolation`, and reads the repository. The test's reason now names
+  its time, and the four run under Miri.
 - **Part F's record**: its Miri run, clean, was logged with G.1 on 2026-11-17, but no status line
   said Part F was done. `pre-phase-7.md`, `context-menus.md` and the implementation plan now do.

@@ -730,16 +730,29 @@ Borrows as well, in 13.
   `every_page_and_spec_renders_within_eighty_columns` renders each staged page on a thread of its
   own and fails a page not rendered in ten seconds, a guard against a renderer that loops.
   Interpreted, a page can take longer; which one ran out differed by run: `disk(1)` and `move(1)`
-  here, `services.toml(5)` and `nxfiles(1)` on the nightly job, 2026-11-18 and 2026-11-19. It reads
-  every page from the repository, as `usage`'s test of each flag on its page does, which Miri
-  already skips for that reason. It is skipped the same way (`f3e8ecdd`), and still runs natively.
-  The renderer holds no `unsafe`, and its other 24 tests run under Miri on pages of their own; the
-  crate's other deadline, five seconds for the line that once looped the parser, takes a third of
-  a second interpreted.
+  here, `services.toml(5)` and `nxfiles(1)` on the nightly job, 2026-11-18 and 2026-11-19.
+  Interpreted, a page renders at some 5 ms a byte, so the whole test would take fifty minutes. It
+  is skipped under Miri (`f3e8ecdd`) and still runs natively. The renderer holds no `unsafe`, and
+  its other 24 tests run under Miri on pages of their own; the crate's other deadline, five
+  seconds for the line that once looped the parser, takes a third of a second interpreted.
 - **Part G's new `unsafe`** is the `_start` of `man`, `page` and `terminal`, which no host test
   reaches, and one pager test's helper, which ran under both models.
 - **Not run**, as the job leaves them out: `libterm`, which holds no `unsafe` and which G.2 and
   G.3 changed, and the three applications.
+
+**After review** (#458, four findings: three fixed, one declined; `0c16e5ca`):
+- **The skip's reason names its time.** Its first, that the test reads the pages from the
+  repository, was false: the job runs Miri with `-Zmiri-disable-isolation`, which reads them,
+  `whoami(1)`'s 851 bytes in four seconds. It was copied from four `usage` tests, where it was as
+  false. They run under Miri now, in 79 seconds, the scan of each program's source for another's
+  table read once a source, where it took three minutes. The run's seven skips are three.
+- **A renderer that panics on a page says so**, where it read as a page not rendered in time; one
+  that loops still runs out the ten seconds.
+- **The pages are found as `xtask` stages them**, from `docs/manual`'s numbered sections, and a
+  directory that cannot be read or holds no page fails: with `docs/spec` gone, the test passed on
+  the manual's 32 pages alone.
+- **Declined**: a real page rendered under Miri. The renderer reaches no `unsafe`, and every page
+  renders natively.
 
 Part G's condition is met: G.7 merged, #457, and what Miri reports is triaged.
 
