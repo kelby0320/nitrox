@@ -699,11 +699,15 @@ its page's Options, a program asking for a flag its table lacks, a flag dropped 
   kernel reparents an orphan to `init`, which it never does, and that the emergency shell can edit
   `init.toml` and reboot, where its five commands only look. Corrected in `overview.md`,
   `service-manager.md`, `boot-flow.md`, `init-toml-schema.md`, and `init`'s comments and rules.
-- **Size lowered**: `desktop-shell`'s `main.rs` from 1,388 lines to 1,342.
+- **Size lowered**: `desktop-shell`'s `main.rs` from 1,388 lines to 1,338.
 
 **Tests**: every chord its own id, keys and action; each desktop number reached by both its chords;
 `desktop(7)`'s chord table row for row, in order; and services(8)'s sections, both ways, against
-the release image's declarations, `init`'s starts and `service-mgr`'s supervisors. **Controls**: a
+the release image's declarations, `init`'s starts and `service-mgr`'s supervisors. **After
+review** (`e9f2e61f`): what each chord registers, each key's name against the keymap, the table
+within the compositor's sixteen, every modifier spelled, every row of the page's table read, each
+service's section opening with its endpoint, and every start read however it is spelled; the
+shell's summary of its chords printed only when all registered, which a boot control shows. **Controls**: a
 chord's text changed, a page row deleted and a chord registered twice each fail the chord tests;
 a service's section removed, an endpoint not named and a stray section under *Started by init*
 each fail the services' check.
