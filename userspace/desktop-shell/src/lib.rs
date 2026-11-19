@@ -5,6 +5,7 @@
 
 extern crate alloc;
 
+pub mod chords;
 pub mod ending;
 pub mod panel;
 pub mod snap;
