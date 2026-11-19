@@ -192,6 +192,79 @@ mod tests {
         assert!(named >= 6, "{named} flags found: the scan has missed the programs' HELP");
     }
 
+    /// The names of the `###` sections under a page's `## heading`, in order, each with its text.
+    fn sections_under<'a>(page: &'a str, heading: &str) -> Vec<(&'a str, &'a str)> {
+        let Some(rest) = page.split(&format!("\n## {heading}\n")).nth(1) else { return Vec::new() };
+        let body = rest.split("\n## ").next().unwrap_or(rest);
+        body.split("\n### ")
+            .skip(1)
+            .map(|s| s.split_once('\n').map_or((s.trim(), ""), |(n, t)| (n.trim(), t)))
+            .collect()
+    }
+
+    /// The programs `src` starts with `call(root, "PATH"`, each by its path's file name.
+    fn started_by(src: &str, call: &str) -> Vec<String> {
+        let opening = format!("{call}(root, \"");
+        let paths = src.match_indices(&opening).filter_map(|(at, _)| src[at + opening.len()..].split('"').next());
+        paths.map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).collect()
+    }
+
+    /// The release image's declared services, in the file's order, each with its `endpoint`.
+    fn declared_services() -> Vec<(String, Option<String>)> {
+        let toml = crate::services_toml(crate::BuildMode::Normal);
+        let mut out: Vec<(String, Option<String>)> = Vec::new();
+        for line in toml.lines().map(str::trim) {
+            if let Some(name) = line.strip_prefix("[service.").and_then(|l| l.strip_suffix(']')) {
+                if !name.contains('.') {
+                    out.push((name.to_string(), None));
+                }
+            } else if let (Some(last), Some(v)) = (out.last_mut(), line.strip_prefix("endpoint = ")) {
+                last.1 = Some(v.trim_matches('"').to_string());
+            }
+        }
+        out
+    }
+
+    /// `services(8)` has a section for every service the release image declares, in their order,
+    /// saying where it serves; for every program `init` starts; and for each session supervisor
+    /// `service-mgr` starts; and for nothing else.
+    #[test]
+    fn every_service_and_every_supervised_program_has_its_section() {
+        let page = fs::read_to_string(repo_root().join("docs/manual/8/services.md")).unwrap();
+        let declared = declared_services();
+        assert!(declared.len() >= 9, "{} services read: the scan has missed the declarations", declared.len());
+        let services = sections_under(&page, "The services");
+        let names: Vec<&str> = services.iter().map(|s| s.0).collect();
+        assert_eq!(names, declared.iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), "The services");
+        for ((name, text), (_, endpoint)) in services.iter().zip(&declared) {
+            let endpoint = endpoint.as_deref().unwrap_or_else(|| panic!("{name} declares no endpoint"));
+            assert!(text.contains(&format!("`{endpoint}`")), "{name}'s section does not say it serves `{endpoint}`");
+        }
+        for (heading, crate_dir, call, least) in
+            [("Started by init", "init", "spawn_program", 4), ("The sessions", "service-mgr", "spawn_supervisor", 2)]
+        {
+            let src = fs::read_to_string(repo_root().join(format!("userspace/{crate_dir}/src/main.rs"))).unwrap();
+            let mut started = started_by(&src, call);
+            let mut sections: Vec<String> = sections_under(&page, heading).iter().map(|s| s.0.to_string()).collect();
+            assert!(started.len() >= least, "{started:?}: the scan has missed {crate_dir}'s {call} calls");
+            started.sort();
+            sections.sort();
+            assert_eq!(sections, started, "{heading}");
+        }
+    }
+
+    #[test]
+    fn a_section_and_a_start_are_read_as_written() {
+        let page = "# s\n\n## The services\n\n### a\n\nserves `/x`.\n\n### b\nmore\n\n## Next\n\n### c\n";
+        assert_eq!(sections_under(page, "The services"), [("a", "\nserves `/x`.\n"), ("b", "more\n")]);
+        assert_eq!(sections_under(page, "Absent"), []);
+        let src = "fn spawn_program(\n    root: R, path: &str,\n) {}\nspawn_program(root, \"/initramfs/sbin/x\", g);\n\
+                   spawn_program(other, \"/bin/no\");\nspawn_program(root, \"/bin/y\", None);";
+        assert_eq!(started_by(src, "spawn_program"), ["x", "y"]);
+        let auth = declared_services().into_iter().find(|d| d.0 == "auth-service");
+        assert_eq!(auth, Some(("auth-service".to_string(), Some("/svc/auth".to_string()))));
+    }
+
     #[test]
     fn a_flag_is_read_where_it_starts_a_word() {
         let named = flags_named("usage: nxsh [-c SOURCE]\n\x20 -h, --help  read-only, a --- and -- `x`, -cx");

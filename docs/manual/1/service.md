@@ -55,4 +55,4 @@ with admin service --restart NAME    # restart the service called NAME
 
 ## See also
 
-`with(1)`, `shutdown(1)`, `log(1)`, `shell-operators(7)`
+`services(8)`, `with(1)`, `shutdown(1)`, `log(1)`, `shell-operators(7)`
