@@ -32,20 +32,7 @@ type Root<'a> = Ref<'a, Namespace, NsReadOnly>;
 
 const KEY_ESC: u16 = 1;
 const KEY_ENTER: u16 = 28;
-/// `EV_KEY` code for `h`; named here, as `libkern::abi` lists only the keys the ABI needs.
-const KEY_H: u16 = 35;
-
-const HOTKEY_MINIMIZE: u32 = 1;
-const KEY_R: u16 = 19;
-const HOTKEY_RENAME: u32 = 2;
-const KEY_A: u16 = 30;
-const HOTKEY_APPS: u32 = 3;
-/// How many desktops the number chords reach: four, as each costs two of `MAX_HOTKEYS`' sixteen.
-const CHORD_DESKTOPS: u32 = 4;
-/// Ids `HOTKEY_SWITCH_BASE + n` switch to desktop `n`; `HOTKEY_MOVE_BASE + n` move to it.
-const HOTKEY_SWITCH_BASE: u32 = 10;
-const HOTKEY_MOVE_BASE: u32 = 20;
-const KEY_1: u16 = 2;
+use desktop_shell::chords::{self, Action};
 use desktop_shell::ending::{Asked, Closing, Ending, Next, POWER_PROGRAM, POWER_VIEW, Refusal, failed};
 use desktop_shell::panel::{self, BottomMsg, EndingMsg, MenuMsg, RefusalMsg, TopMsg};
 use desktop_shell::snap::RestoreList;
@@ -681,9 +668,9 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
 
             list_dirty |= normalize_desktops(&mut desktops, &entries, &mut current_desktop, &mut next_desktop_id);
             for id in fired {
+                let Some(action) = chords::action(id) else { continue };
                 // `Super+N` names the Nth desktop, not id N: ids stop matching the switcher.
-                if (HOTKEY_SWITCH_BASE + 1..=HOTKEY_SWITCH_BASE + CHORD_DESKTOPS).contains(&id) {
-                    let n = (id - HOTKEY_SWITCH_BASE) as usize;
+                if let Action::Switch(n) = action {
                     if let Some(d) = desktops.get(n - 1) {
                         let to = d.id;
                         if switch_desktop(m, &desktops, &mut current_desktop, &mut told_desktop, to) {
@@ -695,8 +682,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                     continue;
                 }
-                if (HOTKEY_MOVE_BASE + 1..=HOTKEY_MOVE_BASE + CHORD_DESKTOPS).contains(&id) {
-                    let n = (id - HOTKEY_MOVE_BASE) as usize;
+                if let Action::MoveTo(n) = action {
                     let Some(to) = desktops.get(n - 1).map(|d| d.id) else { continue };
                     if let Some(e) = entries.iter_mut().find(|e| e.focused) {
                         let wid = e.id;
@@ -717,7 +703,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                     continue;
                 }
-                if id == HOTKEY_RENAME {
+                if action == Action::Rename {
                     // The prompt is a popup, as the menus are: a `panel` takes no keyboard focus.
                     // Only when nothing else is up, or two popups would each believe the next
                     // keystroke is theirs.
@@ -731,7 +717,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                     }
                     continue;
                 }
-                if id == HOTKEY_APPS {
+                if action == Action::Apps {
                     // The keyboard's way in, and the only one without a pointer. A second press
                     // puts away whatever popup is up, and each says which it closed, because a
                     // dismissal read as the wrong one sends a later gate looking for the other
@@ -754,7 +740,7 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
                 let cap = task_capacity(&desktops, &entries, current_desktop, &theme, &font, screen);
                 let shown_now: alloc::vec::Vec<u32> =
                     visible_entries(&entries, current_desktop, cap).iter().map(|e| e.id).collect();
-                if id == HOTKEY_MINIMIZE
+                if action == Action::Minimize
                     && let Some(e) = entries.iter_mut().find(|e| shown_now.contains(&e.id) && e.focused && !e.minimized)
                 {
                     let wid = e.id;
@@ -775,66 +761,30 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
         if !hotkey_done && let Some(m) = manager.as_mut() {
             hotkey_done = true;
             sent_request = true;
-            use librsproto::surface::{MOD_META, MOD_SHIFT, MgrHotkey, OP_MGR_REGISTER_HOTKEY};
-            let hk = MgrHotkey { id: HOTKEY_MINIMIZE, mods: MOD_META, code: KEY_H };
-            for n in 1..=CHORD_DESKTOPS {
-                let code = KEY_1 + (n as u16 - 1);
-                for (base, mods) in [(HOTKEY_SWITCH_BASE, MOD_META), (HOTKEY_MOVE_BASE, MOD_META | MOD_SHIFT)] {
-                    let chord = MgrHotkey { id: base + n, mods, code };
-                    let mut b = [0u8; core::mem::size_of::<MgrHotkey>()];
-                    if chord.write(&mut b).is_none() {
-                        log::write(b"desktop-shell: a desktop chord would not serialise\n");
-                        continue;
-                    }
-                    let mut reply = [0u8; 64];
-                    if m.request(OP_MGR_REGISTER_HOTKEY, &b, None, &mut reply).is_err() {
-                        Line::new()
-                            .s(b"desktop-shell: registering a desktop chord was refused (id ")
-                            .u((base + n) as u64)
-                            .s(b")")
-                            .end();
-                    }
+            use librsproto::surface::{MgrHotkey, OP_MGR_REGISTER_HOTKEY};
+            // The summary says only what was registered: the gates take it for the chords' presence.
+            let (mut minimizes, mut refused) = (false, false);
+            for chord in chords::CHORDS {
+                let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
+                let mut reply = [0u8; 64];
+                let registered = chord.hotkey().write(&mut body).is_some()
+                    && m.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok();
+                if !registered {
+                    Line::new().s(b"desktop-shell: registering ").s(chord.keys().as_bytes()).s(b" failed").end();
+                    refused = true;
+                } else if chord.action == Action::Minimize {
+                    minimizes = true;
                 }
             }
-            let rename_hk = MgrHotkey { id: HOTKEY_RENAME, mods: MOD_META, code: KEY_R };
-            let mut rb = [0u8; core::mem::size_of::<MgrHotkey>()];
-            if rename_hk.write(&mut rb).is_some() {
-                let mut reply = [0u8; 64];
-                if m.request(OP_MGR_REGISTER_HOTKEY, &rb, None, &mut reply).is_err() {
-                    log::write(b"desktop-shell: registering Super+R was refused\n");
-                }
-            } else {
-                log::write(b"desktop-shell: the Super+R registration would not serialise\n");
+            if !refused {
+                Line::new()
+                    .s(b"desktop-shell: Super+1..")
+                    .u(chords::CHORD_DESKTOPS as u64)
+                    .s(b" switches, Super+Shift+N moves, Super+R names, Super+A opens applications")
+                    .end();
             }
-            // `Super+A`, not a tap of `Super`: every chord here begins with `Super` going down.
-            let apps_hk = MgrHotkey { id: HOTKEY_APPS, mods: MOD_META, code: KEY_A };
-            let mut ab = [0u8; core::mem::size_of::<MgrHotkey>()];
-            if apps_hk.write(&mut ab).is_some() {
-                let mut reply = [0u8; 64];
-                if m.request(OP_MGR_REGISTER_HOTKEY, &ab, None, &mut reply).is_err() {
-                    log::write(b"desktop-shell: registering Super+A was refused\n");
-                }
-            } else {
-                // A body that would not serialise would leave a gate waiting on a line nobody
-                // printed.
-                log::write(b"desktop-shell: the Super+A registration would not serialise\n");
-            }
-            Line::new()
-                .s(b"desktop-shell: Super+1..")
-                .u(CHORD_DESKTOPS as u64)
-                .s(b" switches, Super+Shift+N moves, Super+R names, Super+A opens applications")
-                .end();
-
-            let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
-            if hk.write(&mut body).is_none() {
-                log::write(b"desktop-shell: a RegisterHotkey body would not serialise\n");
-            } else {
-                let mut reply = [0u8; 64];
-                if m.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok() {
-                    log::write(b"desktop-shell: Super+H minimizes the focused window\n");
-                } else {
-                    log::write(b"desktop-shell: registering Super+H was refused\n");
-                }
+            if minimizes {
+                log::write(b"desktop-shell: Super+H minimizes the focused window\n");
             }
         }
 

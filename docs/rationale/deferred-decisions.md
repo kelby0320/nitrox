@@ -2010,7 +2010,7 @@ crosses into the kernel with the file's identity in hand, though a notification 
 has its own cost to weigh. Trigger: a text editor, or anything that rewrites a file in
 place without changing its length.
 
-**Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
+**Runtime reconfiguration of critical-path mounts.** Currently requires a new `init.toml`, which is in the initramfs, and a reboot. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
 **Writeback when a `FileObject` is torn down — built for unmount by administration C.1 and C.5c;
 shutdown's half still owed.**

@@ -88,7 +88,7 @@ and the slice plan all live there.
 service-mgr owns the **policy/declaration-driven** ecosystem: parsing declarations,
 dependency-ordered startup, supervision, restart policy + backoff, RS registration,
 lifecycle control channels. init keeps the **irreducible PID-1 roles**: the initial
-handle set, critical-path bootstrap, reaper of last resort, and the terminal
+handle set, critical-path bootstrap, reaping its own children, and the terminal
 shutdown/reboot + emergency backstop — which service-mgr asks for over the **terminal
 channel** (`TERMINAL_OP_EMERGENCY`) when a `critical` server does not come up at boot.
 Litmus test: *expressible as a `service.toml` and supervised?* → service-mgr's. See the design doc's

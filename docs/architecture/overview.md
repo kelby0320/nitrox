@@ -155,7 +155,7 @@ See: [memory management architecture](memory-management.md), [user memory access
 
 A process is an address space, a namespace handle, a current working directory subtree handle, a list of owned handles, a system capability bitmask, and a set of threads. A thread is a register state, an FPU context, a kernel stack, scheduling parameters, and a TLS base.
 
-There are no UIDs, no GIDs, no process groups, no session IDs. Children are tracked by a `creator` field for reparenting purposes; on creator exit, orphans reparent to init. Multiple processes can hold handles to the same child process and all receive `ChildExited` notifications independently. "Reaping" is closing the last process handle.
+There are no UIDs, no GIDs, no process groups, no session IDs. A child's `ChildExited` is queued on the notification channel of the process that spawned it, fixed at the spawn: nothing reparents an orphan, whose exit reaches its dead parent's channel and no one, and a process that holds a handle to another's child is not told. "Reaping" is closing the last process handle.
 
 Process spawn takes an explicit list of handle grants. Children do not inherit handles automatically. Argv and environment are typed structural values (a list of strings, a map of strings to typed values) rather than null-terminated C strings.
 
@@ -218,7 +218,7 @@ PID 1 (`init`) is deliberately minimal — its only job is bringing up enough of
 
 For the common single-partition case, init.toml has one entry (mount the root ext4 partition). For more complex layouts (separate `/home` partition, separate `/store` on a different filesystem), init brings up multiple fs-server instances in dependency order before proceeding.
 
-If a critical-path mount fails, init drops into the emergency shell (`eshell`), a minimal interactive shell bundled in the initramfs that provides enough capability to inspect block devices, edit init.toml, and reboot. Recovery from misconfigured boot is straightforward; you don't need a rescue USB.
+If a critical-path mount fails, init drops into the emergency shell (`eshell`), a minimal interactive shell bundled in the initramfs that can list the block devices and what is bound, and print a file. It changes nothing and cannot reboot: `init.toml` is in the read-only initramfs, and the way out is the machine's power or reset.
 
 The initramfs must contain the closure of software needed for critical-path mounting — all required fs-server binaries, any kernel modules for unusual storage controllers, plus eshell. The system image builder computes this closure at build time based on the target system's mount topology.
 

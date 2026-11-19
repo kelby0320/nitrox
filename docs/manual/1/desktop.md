@@ -62,4 +62,4 @@ desktop | filter current       # which one is current
 
 ## See also
 
-`shell-operators(7)`, `nxsh(1)`
+`desktop(7)`, `shell-operators(7)`, `nxsh(1)`

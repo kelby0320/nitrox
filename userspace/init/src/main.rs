@@ -1,7 +1,7 @@
 //! `init` — PID 1. The kernel hands it a notification channel (`rdi`), a full-rights root
 //! namespace (`rsi`) with the boot kernel-server bindings, and the power node (`rdx`).
 //! It processes `/initramfs/etc/init.toml`'s mounts in dependency order, binds the profile server
-//! at `/bin`, spawns `service-mgr` (which starts every other server), then reaps orphans and
+//! at `/bin`, spawns `service-mgr` (which starts every other server), then reaps its children and
 //! answers the terminal channel. It never `panic!`s in normal operation (see its `CLAUDE.md`).
 
 #![no_std]
@@ -472,7 +472,7 @@ fn emergency(notify: Option<Handle<Notify, Only>>, root: Root, held: Finish) -> 
     reap_loop(notify, root, None, held);
 }
 
-/// Reap exited children forever (init is the eventual parent of every orphan), and answer the
+/// Reap exited children forever (its own: nothing reparents an orphan to init), and answer the
 /// terminal channel: `TERMINAL_OP_EMERGENCY` (a critical server did not come up) starts the
 /// emergency shell, once, the console being still free; `TERMINAL_OP_FINISH` runs [`finish`].
 ///

@@ -21,7 +21,7 @@ Design doc for `service-mgr`, the userspace process supervisor.
 `service-mgr` is the userspace daemon that starts, supervises, and restarts the
 system's services. It is spawned by `init` once the critical-path boot is stable,
 receives a delegated subset of `init`'s capabilities, and from then on owns the
-service ecosystem: init reaps orphaned processes and handles shutdown, but does not
+service ecosystem: init reaps its own children and handles shutdown, but does not
 supervise services — that is `service-mgr`'s job.
 
 It is the userspace counterpart to what an init system (systemd, launchd, SysV
@@ -60,7 +60,7 @@ kernel_main
        ├─ read /system/current-generation, spawn + bind the system profile server
        ├─ spawn service-mgr; hand it a full-rights root,     ← THE HANDOFF
        │  the fs and profile endpoints and the clock node, down the terminal channel
-       └─ reap loop (orphans + the terminal channel)
+       └─ reap loop (its own children + the terminal channel)
                                     │
 service-mgr ────────────────────────┘
   ├─ read service declarations
@@ -114,8 +114,8 @@ wake that finds more deaths than codes waits on the notification channel for the
 `CODE_GRACE_NS` (1 s). Only past that is an exit reported `code=unknown`.
 
 **Litmus test:** *could this be written as a `service.toml` and supervised?* → it is
-service-mgr's. *Does it require being the kernel's first process / the reparent target
-/ the thing that exists when nothing else does?* → it is init's.
+service-mgr's. *Does it require being the kernel's first process / the thing that exists
+when nothing else does?* → it is init's.
 
 init's irreducible list is short and bounded:
 
@@ -124,10 +124,11 @@ init's irreducible list is short and bounded:
 2. **Critical-path bootstrap to *reach* service-mgr** — mount the root fs, read the
    manifest. service-mgr's binary and declarations live behind a mounted root, so
    this must precede it.
-3. **Reaper of last resort** — the kernel reparents *all* orphans to PID 1 (creator-
-   based reparenting, `overview.md`). This reaping is **split**: service-mgr reaps its
-   *own* service children to drive restart; a service's grandchildren, or anything
-   orphaned when service-mgr itself dies, land on init. Two levels, not a conflict.
+3. **Reaper of its own children** — the kernel reparents nothing (`overview.md`): a
+   child's exit reaches only the process that spawned it. service-mgr reaps its *own*
+   service children to drive restart; init reaps what it spawned, `service-mgr` among
+   them. A service's grandchildren, and the services of a `service-mgr` that has died,
+   land on no one.
 4. **Terminal shutdown/reboot + emergency backstop** — **shutdown is split**:
    service-mgr does *graceful, dependency-ordered* service teardown (via the control
    channels); init does the *terminal* step (it is the last process) and is the
@@ -369,7 +370,7 @@ a mutation path the design deliberately avoids; **deferred**, not adopted.
 
 **Recovery: service-mgr death → reboot / emergency, not respawn.** A naive respawn is
 unsound regardless of capabilities: service-mgr's death orphans all its services
-(they reparent to init), kills their control channels, and leaves its namespace
+(nothing reparents them), kills their control channels, and leaves its namespace
 bindings stale in the system namespace — a fresh service-mgr would have to *re-adopt*
 that live state (a real checkpoint/re-attach feature, not a respawn). So service-mgr
 exiting is a **critical fault**.

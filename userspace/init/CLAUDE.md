@@ -13,7 +13,7 @@ PID 1. The first userspace process. Spawned directly by the kernel with the full
 5. Spawn the service manager, handing it a root handle with init's own rights and the root
    filesystem's and profile server's endpoints and then the clock node (the fourth handoff), and
    keep the channel they went down as the **terminal channel**
-6. Enter main loop: reap orphaned processes, and answer the terminal channel — including a
+6. Enter main loop: reap its children, and answer the terminal channel — including a
    shutdown's `Finish`, which unmounts init's own filesystems and stops the machine
 
 **It starts no other server** (administration Part E.1a, 2026-09-28). The nine system servers —
@@ -55,7 +55,8 @@ Any critical-path failure (mount fails, bootstrap manifest is malformed, can't f
 2. Look up `/initramfs/sbin/eshell`
 3. Spawn eshell with no grant: it shares init's root, `LOOKUP` only, and finds `/dev/console` and
    `/dev/blk/*` there
-4. Wait for eshell to exit (typically a reboot)
+4. Go on reaping: eshell changes nothing and cannot reboot, so the way out is the machine's power
+   or reset
 
 Don't try to "soldier on" past a critical-path failure. If `init.toml` says mount this and it can't be mounted, the system is misconfigured; eshell exists exactly for this case.
 
@@ -147,7 +148,10 @@ beside its notification channel:
 
 ## Reaping
 
-Init is the eventual parent of all orphaned processes (creator-based reparenting). It receives `Notification::ChildExited` for every process it directly created and for every orphan that gets reparented to it.
+Init receives `Notification::ChildExited` for the processes it spawned, and for no others. **The
+kernel reparents nothing**: a child's exit is queued on the notification channel of the process
+that spawned it, set at the spawn, so an orphan's exit reaches its dead parent's channel and no
+one reads it.
 
 **It holds no child's process handle**: each is closed as the child is spawned (libos's `spawn`
 hands back an owning handle, which init drops), since nothing maps a `ChildExited` pid to a handle,

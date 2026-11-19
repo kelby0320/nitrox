@@ -38741,3 +38741,33 @@ G.5 merged, #455. G.6, `manual.md` § G.6, built on `pre-phase-7/part-g6-command
   coreutil parses with its own table, names no other's, and asks for every flag its table
   declares. The other programs' `--help` flags, `nxsh`'s, `nxinstall`'s and the applications', are
   held to their pages by an xtask test that reads each `HELP`.
+
+## 2026-11-19 — Before Phase 7, G.7: the system, the desktop, and a programmer's pages
+
+G.6 merged, #456. G.7, `manual.md` § G.7, built on `pre-phase-7/part-g7-system-pages` (`7187f365`,
+`589fe00c`, `eafca03f`).
+
+- **The desktop's chords are one table**, `desktop_shell::chords::CHORDS`, where they were
+  constants, two loops and three registrations written out, with dispatch by id range. The shell
+  registers each row and dispatches on its action; a chord's spelling is built from the modifiers
+  and key it registers, so the page's table, held to it row for row, cannot name a chord that is
+  not asked for.
+- **Four pages: `intro(7)` rewritten as the place to start, `boot(7)`, `services(8)` and
+  `desktop(7)`.** The implementer wrote them from the sources; then a fresh agent, given the code
+  and not the writer's notes, checked each claim. Twelve were false, among them a dialog's bar
+  button standing for it, a close button that closes, `desktop name` cutting a long name, `Enter`
+  in the Applications menu, every service given a log channel, an essential service that cannot be
+  started, `disk --format` going through the storage service and `init` adopting orphans; twelve
+  more were loosely put. Each was read in the code before it was corrected.
+- **A check holds `services(8)` to the image**: a section under *The services* for each service
+  the release image declares, in its order, each naming its endpoint; under *Started by init* for
+  each program `init` starts; and under *The sessions* for each supervisor `service-mgr` starts;
+  and no others.
+- **Two claims in the architecture docs and `init` were false**, found by the same check. The
+  kernel reparents nothing: a child's exit is queued on the channel of the process that spawned it,
+  fixed at the spawn, so `init` hears of its own children only. And the emergency shell cannot edit
+  `init.toml` or reboot: its five commands only look, and the initramfs is read-only. Both are
+  corrected where they were said, in `overview.md`, `service-manager.md`, `boot-flow.md`,
+  `init-toml-schema.md`, and `init`'s comments and rules file.
+- **`man desktop` is the command's page**, as section 1 is looked in first; the gate types
+  `man 7 desktop`, and `desktop(1)` points at it.

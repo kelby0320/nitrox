@@ -140,7 +140,7 @@ endpoint = \"/svc/storage\"\n\
 essential = true\n\
 syscaps = [\"BIND_NAMESPACE\"]\n\
 # Its stop writes back and unmounts every filesystem it mounted, which takes as long as what is\n\
-# dirty takes to write (PR #343 review): not `service-mgr`'s 3 s.\n\
+# dirty takes to write (PR #343 review): not `service-mgr`'s 5 s, or its 3 s at a shutdown.\n\
 stop_timeout = \"60s\"\n\
 \n\
 [service.storage-service.restart]\n\

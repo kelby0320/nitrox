@@ -375,10 +375,22 @@ fn interactive_manual(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     quietly(s, "nxedit --help", "usage: nxedit [PATH]")?;
     s.expect("/home>")?;
+    // A programmer's page, a spec staged as it is, and the desktop's: `desktop` alone is the
+    // command's page, as section 1 comes first.
+    for (asked, says) in
+        [("man syscalls", "Syscall ABI Specification"), ("man 7 desktop", "the graphical desktop: bars")]
+    {
+        s.send(asked)?;
+        s.expect(says)?;
+        s.expect("lines 1-23 of ")?;
+        s.send_raw("q")?;
+        s.expect("\x1b[?1049l")?;
+        s.expect("/home>")?;
+    }
     println!(
-        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry; the guide's example ran; list's help and page, and nxedit's help"
+        "  ok: man paged its own page and a staged spec, listed all {pages}, found one by keyword, and none changed; the serial line has no size; page passed on what it did not show; help printed filter's entry; the guide's example ran; list's help and page, and nxedit's help; syscalls(2) and desktop(7)"
     );
-    Ok(13)
+    Ok(15)
 }
 
 /// The example of `shell(7)`'s that `interactive_manual` types, and what it prints.
