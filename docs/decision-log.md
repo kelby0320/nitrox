@@ -38725,7 +38725,19 @@ G.5 merged, #455. G.6, `manual.md` § G.6, built on `pre-phase-7/part-g6-command
   flag in its page's Options section, and each flag a program asks for declared. `with` reads its
   options by hand and is held to its table both ways.
 - **The applications answer `--help`** before they open a window, through
-  `libstream::channel::answer_help`, which takes their `stdout` only when asked so it otherwise
-  stays open; `nxsh`'s is a short overview where it was a usage line.
+  `libstream::setup::answer_help`, which takes their streams only when asked so they otherwise
+  stay open, and says the text as a notice when `stdout` will not take it, as a coreutil does;
+  `nxsh`'s is a short overview where it was a usage line.
 - **No service lives in `/bin`**, so the plan's "or a service on the services' page" has nothing to
   excuse; the check is that every program `profile_programs` ships has a page.
+- **A failed run of `copy`, `mkdir`, `move`, `remove` or `touch` writes no rows**, which the review
+  found where three pages and their sources said the rows already written told what was done: each
+  writes its rows once every operand is done, and a failure ends it first. Writing them first would
+  show a person nothing, as a failed pipeline raises its error and drops its value. On the
+  maintainer's call the five pages say so, and that `list` shows what is left, and saying what a
+  failed run did is deferred, `TODO(failed-run-rows)`.
+- **A flag is held to its own row and its own bullet**: in `--help` a line that starts with it, and
+  on its page an Options bullet about it, where a mention in another's satisfied both tests. A
+  coreutil parses with its own table, names no other's, and asks for every flag its table
+  declares. The other programs' `--help` flags, `nxsh`'s, `nxinstall`'s and the applications', are
+  held to their pages by an xtask test that reads each `HELP`.

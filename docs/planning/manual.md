@@ -629,15 +629,15 @@ Author; the pages can be the implementer's, from the `HELP` texts and the code.
   and `--help` prints the usage line, a sentence, and the options from it, lined up and wrapped at
   80 columns. A flag carries the words after it (`--mount DEVICE [LABEL]`).
 - **Every program in section 1 answers `--help`**: `nxsh` with a short overview, and the three
-  applications, before they open a window (`libstream::channel::answer_help`).
+  applications, before they open a window (`libstream::setup::answer_help`).
 
 **Departures, for the maintainer's eye:**
 - **The tables are in one module of the coreutils library**, not each program's file: one test
   can then hold every program's flags to its page, and its `--help` to 80 columns.
 - **`with` keeps reading its options by hand**, the first word deciding; its table is held to the
   arms that read them, both ways.
-- **A flag is held to its page's Options section**, not the page at large, where a passing mention
-  would satisfy it.
+- **A flag is held to its own bullet in its page's Options section**, not the page or the section
+  at large, where a passing mention would satisfy it.
 - **No service is in `/bin`**, so the check has nothing to send to the services' page yet.
 - **Size raised by hand**: `nxfiles`'s `main.rs` by one line, its `--help`.
 

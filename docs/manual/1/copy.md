@@ -14,8 +14,8 @@ flag to ask for it.
 When DEST is an existing directory, each SOURCE is copied into it under its own name. Otherwise
 DEST names the copy, and only one SOURCE may be given.
 
-A DEST that already exists is an error unless `--force` is given. A failure stops the run; the rows
-already written say what was copied.
+A DEST that already exists is an error unless `--force` is given. A failure stops the run and
+writes no rows, not even for what was copied before it; `list` shows what is there.
 
 ## Options
 

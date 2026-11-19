@@ -14,7 +14,8 @@ given: removing is not undone, so it does not default to taking a tree.
 `remove` works on the filesystem only. A PATH that names a namespace binding, a mount point, is
 refused, and `remove` never unbinds one. The root cannot be removed.
 
-A failure stops the run; the rows already written say what was removed.
+A failure stops the run and writes no rows, not even for what was removed before it; `list` shows
+what is left.
 
 ## Options
 

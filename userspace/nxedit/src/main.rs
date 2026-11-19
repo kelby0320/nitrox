@@ -193,7 +193,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         _ => (Vec::new(), libstream::wire::Record::default()),
     };
-    libstream::channel::answer_help(&argv, || _held.take().and_then(|(s, _)| s.stdout), HELP);
+    libstream::setup::answer_help(&argv, || _held.take().map(|(s, _)| s), HELP);
     // `argv[1]`, or an untitled buffer whose name is asked for in the status strip.
     let path = argv.get(1).cloned().unwrap_or_default();
     // Where an untitled buffer is saved; `/home` outside a session.

@@ -11,7 +11,8 @@ touch [--no-create] PATH...
 `touch` creates each PATH as an empty file if it is not there, and stamps its modification time if
 it is. The time is the filesystem's own clock; it cannot be supplied.
 
-A PATH that is a directory is refused.
+A PATH that is a directory is refused. A failure stops the run and writes no rows, not even for the
+files made or stamped before it.
 
 ## Options
 

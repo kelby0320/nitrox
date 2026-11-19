@@ -9,7 +9,8 @@
 //!   a mount point, and `remove --recursive /` must not try to unbind `/dev/console`. The
 //!   descent uses `Dir::read_dir` alone, and an operand that names a binding is refused.
 //! - **`--force` suppresses only "not there"**; other failures stay failures.
-//! - **A failure stops the run**, as in `copy`; the rows already emitted say what was removed.
+//! - **A failure stops the run** and writes no rows, as in `copy`: they are written once every
+//!   operand is done. Saying what a failed run did is `TODO(failed-run-rows)`.
 //! - **It emits a table.** `Table<{path: String, kind: String}>`, one row per entry actually
 //!   removed, including those removed *inside* a `--recursive` descent.
 

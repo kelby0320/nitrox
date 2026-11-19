@@ -13,7 +13,8 @@ mkdir [--parents] PATH...
 Without `--parents`, the directory above PATH must exist and PATH must not. With it, missing
 directories above PATH are created too, and a PATH that is already a directory is not an error.
 
-A failure stops the run; the rows already written say what was created.
+A failure stops the run and writes no rows, not even for the directories made before it; `list`
+shows them.
 
 ## Options
 

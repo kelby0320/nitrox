@@ -10,7 +10,8 @@
 //!   server answers a colliding create with `KError::AlreadyExists`, so the common path is
 //!   one round trip. `--parents` accepts only a directory, so [`libfs::is_directory`] is asked
 //!   on the collision, not ahead of every component.
-//! - **A failure stops the run**, as in `copy`; the rows already emitted say what was created.
+//! - **A failure stops the run** and writes no rows, as in `copy`: they are written once every
+//!   operand is done. Saying what a failed run did is `TODO(failed-run-rows)`.
 //! - **It emits a table.** `Table<{path: String, created: Bool}>`, one row per operand.
 //!   `created` is `false` when `--parents` found the leaf already there.
 

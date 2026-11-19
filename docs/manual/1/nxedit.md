@@ -32,6 +32,10 @@ Rust and Markdown files by their endings. A file with any other name is plain te
 A right click, or the Menu key or `Shift+F10`, opens a menu of the Edit menu's rows that act on
 the text: Undo, Redo, Cut, Copy, Paste and Select All. From the keyboard it opens at the caret.
 
+## Options
+
+- `--help`: print the usage and exit, before any window opens.
+
 ## Menus
 
 | Menu | Item | Key |

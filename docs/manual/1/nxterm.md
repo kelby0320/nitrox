@@ -30,6 +30,10 @@ The menu from the keyboard opens at the cursor.
 Copy and Paste use the clipboard the windows share, which `clip(1)` reaches from a shell. Paste
 types the newest entry at the shell.
 
+## Options
+
+- `--help`: print the usage and exit, before any window opens.
+
 ## Menus
 
 | Menu | Item | Key |

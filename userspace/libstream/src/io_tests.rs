@@ -1,7 +1,7 @@
 //! The transport and the setup message, through libos's model of the kernel.
 
 use crate::channel::{ChannelReceiver, ChannelSink, IpcPort, IpcPortRef, MsgPort};
-use crate::setup::{STREAM_STDIN, StageStreams, open_pipe, receive_setup, send_stage_setup};
+use crate::setup::{STREAM_STDIN, StageStreams, answer_help, open_pipe, receive_setup, say_help, send_stage_setup};
 use crate::wire::{Record, WireError};
 use alloc::vec::Vec;
 use libkern::KError;
@@ -239,4 +239,66 @@ fn an_open_pipe_is_a_connected_pair_closed_with_its_ends() {
     let (ra, rb) = (a.raw().0, b.raw().0);
     drop((a, b));
     assert!(!mock::is_open(ra) && !mock::is_open(rb));
+}
+
+const HELP: &[&str] = &["usage: app [PATH]", "", "  --help  show this help and exit"];
+
+/// The rows a shell reads from `far`, the other end of a stage's `stdout`.
+fn rows_from(far: Handle<Channel, Only>) -> Vec<alloc::string::String> {
+    let bytes = ChannelReceiver::new(IpcPort::owning(far)).receive(usize::MAX).unwrap();
+    let table = crate::wire::Table::decode(&bytes).unwrap();
+    assert!(table.flags.contains(crate::wire::StreamFlags::TEXT_FALLBACK), "text, a line a row");
+    table.rows.iter().map(|r| alloc::string::String::from(r[0].as_str().unwrap())).collect()
+}
+
+/// The one message on `far`, the other end of `stderr`, as its level and text.
+fn diag_from(far: &Handle<Channel, Only>) -> (crate::diag::Level, Vec<u8>) {
+    let mut m = Msg::new();
+    far.recv(&mut m).expect("a diagnostic");
+    let (level, text) = crate::diag::parse(m.payload());
+    (level, text.to_vec())
+}
+
+#[test]
+fn help_goes_to_stdout_as_text_and_not_to_stderr() {
+    mock::reset();
+    let ((out, out_far), (err, err_far)) = (pair(), pair());
+    say_help(StageStreams { stdout: Some(out), stderr: Some(err), ..Default::default() }, HELP);
+    assert_eq!(rows_from(out_far), HELP);
+    // Closed with nothing queued: no message came before the close.
+    assert_eq!(err_far.recv(&mut Msg::new()).err().unwrap().code(), KError::PeerClosed);
+}
+
+#[test]
+fn help_with_no_stdout_is_a_notice() {
+    mock::reset();
+    let (err, err_far) = pair();
+    say_help(StageStreams { stderr: Some(err), ..Default::default() }, HELP);
+    assert_eq!(diag_from(&err_far), (crate::diag::Level::Notice, format!("{}\n", HELP.join("\n")).into_bytes()));
+}
+
+#[test]
+fn help_whose_stdout_has_gone_is_a_notice() {
+    mock::reset();
+    let ((out, out_far), (err, err_far)) = (pair(), pair());
+    drop(out_far);
+    say_help(StageStreams { stdout: Some(out), stderr: Some(err), ..Default::default() }, HELP);
+    assert_eq!(diag_from(&err_far).0, crate::diag::Level::Notice);
+}
+
+#[test]
+fn help_is_answered_only_when_asked_and_then_ends_the_program() {
+    mock::reset();
+    let argv = |a: &[&str]| a.iter().map(|s| alloc::string::String::from(*s)).collect::<Vec<_>>();
+    answer_help(&argv(&["app", "--", "--help"]), || panic!("taken unasked"), HELP);
+    answer_help(&argv(&["app", "--helpful"]), || panic!("taken unasked"), HELP);
+
+    let (out, out_far) = pair();
+    let asked = argv(&["app", "x", "--help"]);
+    let ended = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        answer_help(&asked, || Some(StageStreams { stdout: Some(out), ..Default::default() }), HELP)
+    }));
+    let why = ended.expect_err("it ends the program");
+    assert_eq!(why.downcast_ref::<alloc::string::String>().map(|s| s.as_str()), Some("exit(0)"));
+    assert_eq!(rows_from(out_far), HELP);
 }

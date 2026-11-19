@@ -179,7 +179,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         },
         None => (alloc::vec::Vec::new(), libstream::wire::Record::default(), None),
     };
-    libstream::channel::answer_help(&argv, || _held.take().and_then(|(s, _)| s.stdout), HELP);
+    libstream::setup::answer_help(&argv, || _held.take().map(|(s, _)| s), HELP);
 
     // Read here, before anything is sized with it: the grid's cells are built from `font_px`.
     let theme = theme_of(&env);

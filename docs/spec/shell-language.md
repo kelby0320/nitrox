@@ -1400,15 +1400,17 @@ grammar or new shell machinery. (Baked-in-argument user aliases are a different,
 ### 10f. Flag conventions
 
 Adopts actual GNU conventions as baseline, not just the general shape: long-form `--flag`, short
-`-f`, `--` to end option parsing, `--help`/`--version` on every program. **In the coreutils they
-are on `stdout`, as text** (the laptop polish's Part E): the answer to what was typed, not a
-diagnostic, so they are not drawn as one and can be piped. `nxsh` keeps no streams and writes its
-usage on its terminal instead ([`pipeline-stdio.md`](pipeline-stdio.md) § *A diagnostic, and its
-level*). **`--help` is a short overview**, a usage line, a sentence and the options, and **a
-coreutil prints its options from the table it parses them with** (`coreutils::usage`), so a flag
-is described once; its page in section 1 is the long form, and a test holds every flag the table
-has to the page's Options. The applications answer `--help` before they open a window. One
-deliberate deviation,
+`-f`, `--` to end option parsing, `--help` on every program in `/bin`, and `--version` on every
+coreutil; `nxsh`, `nxinstall` and the applications have no `--version`. **They are on `stdout`, as
+text** (the laptop polish's Part E): the answer to what was typed, not a diagnostic, so they are
+not drawn as one and can be piped. `nxsh` keeps no streams and writes its usage on its terminal
+instead ([`pipeline-stdio.md`](pipeline-stdio.md) § *A diagnostic, and its level*). **`--help` is
+a short overview**, a usage line, a sentence and the options, and **a coreutil's options are one
+table** (`coreutils::usage`), which it parses its command line with and prints its `--help` from,
+so a flag is described once. `with` is the exception: it reads its options by hand, the first word
+deciding, and a test holds its table to the arms that read them. A program's page in section 1 is
+the long form, and a test gives every flag in a table its own entry in the page's Options. The
+applications answer `--help` before they open a window. One deliberate deviation,
 flagged so it isn't mistaken for an oversight: GNU's bare `-` argument meaning "read from stdin"
 (`cat -`) has no equivalent here — piping is structural in this design (a stage's input *is* its
 stdin stream, not a flag-selected mode), so that specific idiom doesn't carry over.

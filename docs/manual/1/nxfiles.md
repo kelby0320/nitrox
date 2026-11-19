@@ -29,6 +29,10 @@ Properties. The folder's holds New File, New Folder, Paste and Show Hidden Files
 
 Cut, Copy and Paste move a path through the clipboard the windows share.
 
+## Options
+
+- `--help`: print the usage and exit, before any window opens.
+
 ## Menus
 
 | Menu | Item | Key |

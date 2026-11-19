@@ -19,8 +19,9 @@ A DEST that already exists is an error unless `--force` is given. A namespace bi
 the source of a move that has to copy, one across mounts: it would copy through the mount and then
 remove another server's files.
 
-If the copy works but the original cannot be removed, both now exist: `move` fails and writes no
-row. If the copy fails part way, what was copied stays, and the SOURCE is untouched.
+If the copy works but the original cannot be removed, both now exist, and `move` fails. If the
+copy fails part way, what was copied stays, and the SOURCE is untouched. A failure stops the run
+and writes no rows, not even for what moved before it; `list` shows where things are.
 
 ## Options
 

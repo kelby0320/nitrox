@@ -107,7 +107,7 @@ fn copy_any(stage: &Stage, src: &str, dst: &str, force: bool, done: &mut Vec<Cop
     let r = libfs::copy_recursive(&stage.namespace, src, dst, force, &mut |s, d, bytes| {
         done.push(Copied { source: String::from(s), destination: String::from(d), bytes });
     });
-    // A partial copy is reported by the rows already emitted, and the run fails.
+    // A failure ends the run before any row is written: `TODO(failed-run-rows)`.
     match r {
         Ok(()) => {}
         Err(TreeError::TooDeep) => stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE),
