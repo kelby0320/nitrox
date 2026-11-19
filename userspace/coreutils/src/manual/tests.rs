@@ -135,32 +135,51 @@ fn a_heading_that_does_not_name_its_page_is_its_whole_summary() {
     assert!(mentions("rsproto-auth", &summary(page, "rsproto-auth"), "protocol"));
 }
 
-/// Every page this system stages, at the width a terminal is assumed to have: no line wider, but
-/// a code block's, which is never wrapped.
+/// Runs `f` on a thread of its own and waits `secs` seconds for it, so a renderer that loops on
+/// `what` fails the test rather than hangs it, and one that panics on it says so.
+fn within<T: Send + 'static>(what: &str, secs: u64, f: impl FnOnce() -> T + Send + 'static) -> T {
+    use std::sync::mpsc::RecvTimeoutError;
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(f());
+    });
+    match rx.recv_timeout(std::time::Duration::from_secs(secs)) {
+        Ok(done) => done,
+        Err(RecvTimeoutError::Timeout) => panic!("{what} was not rendered within {secs} seconds"),
+        Err(RecvTimeoutError::Disconnected) => panic!("the renderer panicked on {what}"),
+    }
+}
+
+/// Every page in the manual's sections, found as they are staged, and every spec, staged or not,
+/// at the width a terminal is assumed to have: no line wider, but a code block's, which is never
+/// wrapped. A directory that cannot be read, or holds no page, fails rather than going unchecked.
 #[test]
+#[cfg_attr(miri, ignore = "renders every page and spec: tens of minutes interpreted, past its ten-second guard")]
 fn every_page_and_spec_renders_within_eighty_columns() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
+    let manual = root.join("manual");
+    let mut dirs: Vec<std::path::PathBuf> = std::fs::read_dir(&manual)
+        .unwrap_or_else(|e| panic!("{}: {e}", manual.display()))
+        .map(|e| e.expect("an entry of docs/manual").path())
+        .filter(|d| d.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.parse::<u8>().is_ok()))
+        .collect();
+    assert!(!dirs.is_empty(), "{} holds no section", manual.display());
+    dirs.push(root.join("spec"));
     let mut pages = Vec::new();
-    for dir in ["manual/1", "manual/2", "manual/5", "manual/7", "manual/8", "spec"] {
-        let Ok(entries) = std::fs::read_dir(root.join(dir)) else { continue };
-        for e in entries.flatten() {
-            if e.path().extension().is_some_and(|x| x == "md") {
-                pages.push(e.path());
+    for dir in &dirs {
+        let before = pages.len();
+        for e in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("{}: {e}", dir.display())) {
+            let path = e.unwrap_or_else(|e| panic!("{}: {e}", dir.display())).path();
+            if path.extension().is_some_and(|x| x == "md") {
+                pages.push(path);
             }
         }
+        assert!(pages.len() > before, "{} holds no page", dir.display());
     }
-    assert!(pages.len() > 30, "the specs were found: {}", pages.len());
     let mut wide = Vec::new();
     for p in &pages {
-        let text = std::fs::read_to_string(p).expect("readable");
-        // On a thread of its own, so a page the renderer loops on fails this rather than hangs it.
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(render_lines(&text, 80, false));
-        });
-        let lines = rx.recv_timeout(std::time::Duration::from_secs(10));
-        let lines = lines.unwrap_or_else(|_| panic!("{} was not rendered within ten seconds", p.display()));
-        for l in lines {
+        let text = std::fs::read_to_string(p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+        for l in within(&p.display().to_string(), 10, move || render_lines(&text, 80, false)) {
             if !l.code && l.text.chars().count() > 80 {
                 wide.push(alloc::format!("{}: {}", p.display(), l.text));
             }
@@ -173,11 +192,8 @@ fn every_page_and_spec_renders_within_eighty_columns() {
 /// paragraph's: the shell spec's took the parser round a loop that never moved.
 #[test]
 fn a_pipe_line_with_no_table_under_it_is_a_paragraph() {
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(plain("Before.\n\n| not a table\nstill the paragraph\n", 40));
-    });
-    let lines = rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the page was rendered, not looped on");
+    let lines =
+        within("a `|` line with no table under it", 5, || plain("Before.\n\n| not a table\nstill the paragraph\n", 40));
     assert_eq!(lines, ["    Before.", "", "    | not a table still the paragraph"]);
 }
 
