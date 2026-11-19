@@ -60,7 +60,7 @@ kernel_main
        ├─ read /system/current-generation, spawn + bind the system profile server
        ├─ spawn service-mgr; hand it a full-rights root,     ← THE HANDOFF
        │  the fs and profile endpoints and the clock node, down the terminal channel
-       └─ reap loop (orphans + the terminal channel)
+       └─ reap loop (its own children + the terminal channel)
                                     │
 service-mgr ────────────────────────┘
   ├─ read service declarations

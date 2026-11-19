@@ -159,8 +159,9 @@ serial login is unaffected. It is essential and `never`, and not critical.
 
 ## Started by init
 
-`init` starts these before `service-mgr` exists, in this order in a boot. They are not services:
-`service` does not list them, and cannot stop or start them. `init` closes its handle to each once
+`init` starts these: the root's filesystem server and the profile server, then `service-mgr`
+itself, and `eshell` only when the boot cannot go on, before `service-mgr` exists or when it asks
+for it. They are not services: `service` does not list them, and cannot stop or start them. `init` closes its handle to each once
 it has started it, and reports an exit it reaps on the console as `init: reaped pid=N code=C`;
 it does not restart one.
 

@@ -202,11 +202,23 @@ mod tests {
             .collect()
     }
 
-    /// The programs `src` starts with `call(root, "PATH"`, each by its path's file name.
+    /// The programs `src` starts with each call of `call` outside its definition and comments, each
+    /// by its path's file name: the first string in the call's arguments, or `?` for a call that
+    /// names none, which no section can match.
     fn started_by(src: &str, call: &str) -> Vec<String> {
-        let opening = format!("{call}(root, \"");
-        let paths = src.match_indices(&opening).filter_map(|(at, _)| src[at + opening.len()..].split('"').next());
-        paths.map(|p| p.rsplit('/').next().unwrap_or(p).to_string()).collect()
+        let opening = format!("{call}(");
+        let mut out = Vec::new();
+        for (at, _) in src.match_indices(&opening) {
+            let line = src[..at].rsplit('\n').next().unwrap_or_default();
+            if line.trim_start().starts_with("//") || line.ends_with("fn ") {
+                continue;
+            }
+            let args = &src[at + opening.len()..];
+            let args = &args[..args.find(')').unwrap_or(args.len())];
+            let path = args.split('"').nth(1).filter(|_| args.contains('"')).unwrap_or("?");
+            out.push(path.rsplit('/').next().unwrap_or(path).to_string());
+        }
+        out
     }
 
     /// The release image's declared services, in the file's order, each with its `endpoint`.
@@ -238,7 +250,8 @@ mod tests {
         assert_eq!(names, declared.iter().map(|d| d.0.as_str()).collect::<Vec<_>>(), "The services");
         for ((name, text), (_, endpoint)) in services.iter().zip(&declared) {
             let endpoint = endpoint.as_deref().unwrap_or_else(|| panic!("{name} declares no endpoint"));
-            assert!(text.contains(&format!("`{endpoint}`")), "{name}'s section does not say it serves `{endpoint}`");
+            let opens = format!("Serves `{endpoint}`");
+            assert!(text.trim_start().starts_with(&opens), "{name}'s section does not open \"{opens}\"");
         }
         for (heading, crate_dir, call, least) in
             [("Started by init", "init", "spawn_program", 4), ("The sessions", "service-mgr", "spawn_supervisor", 2)]
@@ -255,12 +268,13 @@ mod tests {
 
     #[test]
     fn a_section_and_a_start_are_read_as_written() {
-        let page = "# s\n\n## The services\n\n### a\n\nserves `/x`.\n\n### b\nmore\n\n## Next\n\n### c\n";
-        assert_eq!(sections_under(page, "The services"), [("a", "\nserves `/x`.\n"), ("b", "more\n")]);
+        let page = "# s\n\n## The services\n\n### a\n\nServes `/x`.\n\n### b\nmore\n\n## Next\n\n### c\n";
+        assert_eq!(sections_under(page, "The services"), [("a", "\nServes `/x`.\n"), ("b", "more\n")]);
         assert_eq!(sections_under(page, "Absent"), []);
         let src = "fn spawn_program(\n    root: R, path: &str,\n) {}\nspawn_program(root, \"/initramfs/sbin/x\", g);\n\
-                   spawn_program(other, \"/bin/no\");\nspawn_program(root, \"/bin/y\", None);";
-        assert_eq!(started_by(src, "spawn_program"), ["x", "y"]);
+                   // spawn_program(root, \"/bin/said\");\nspawn_program(&other, \"/bin/z\");\n\
+                   spawn_program(\n    root,\n    \"/bin/y\",\n    None,\n);\nspawn_program(root, path, SysCaps::empty());";
+        assert_eq!(started_by(src, "spawn_program"), ["x", "z", "y", "?"]);
         let auth = declared_services().into_iter().find(|d| d.0 == "auth-service");
         assert_eq!(auth, Some(("auth-service".to_string(), Some("/svc/auth".to_string()))));
     }

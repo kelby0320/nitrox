@@ -53,6 +53,11 @@ libviews = { path = "../libviews" }
 # out of `libviews`).
 libprompt = { path = "../libprompt" }
 
+[dev-dependencies]
+# The keymap the input server reads keys with: a test holds each chord's key name to what that key
+# types.
+libinput = { path = "../libinput" }
+
 # The pure half — the desktop-entry parser, the Applications menu's filter, and the top bar and
 # its menus as element trees (`panel`) — so it can be host-tested.
 # Same split as `init`, `service-mgr`, `nxterm`, `nxfiles` and `nxedit`.

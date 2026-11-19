@@ -10,7 +10,7 @@
 "userspace/compositor/src/input/tests.rs" = 1716
 "userspace/compositor/src/main.rs" = 1915
 "userspace/compositor/src/tests.rs" = 1548
-"userspace/desktop-shell/src/main.rs" = 1342
+"userspace/desktop-shell/src/main.rs" = 1338
 "userspace/fs-server-ext4/src/ext4.rs" = 1846
 "userspace/fs-server-ext4/src/lib.rs" = 1764
 "userspace/libdraw/src/compose.rs" = 1500

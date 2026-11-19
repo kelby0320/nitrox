@@ -1,6 +1,6 @@
 //! The desktop's chords, registered from [`CHORDS`]; `desktop(7)`'s chord table is held to it.
 
-use librsproto::surface::{MOD_META, MOD_SHIFT, MgrHotkey};
+use librsproto::surface::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT, MgrHotkey};
 
 /// `EV_KEY` codes the chords use; named here, as `libkern::abi` lists only the keys the ABI needs.
 const KEY_1: u16 = 2;
@@ -97,12 +97,17 @@ impl Chord {
     }
 
     /// How a person writes it, `Super+Shift+1`: from what is registered, so the two cannot differ.
+    /// A modifier or key it has no name for is a `?`.
     pub fn keys(&self) -> alloc::string::String {
         let mut out = alloc::string::String::new();
-        for (bit, name) in [(MOD_META, "Super+"), (MOD_SHIFT, "Shift+")] {
+        let named = [(MOD_META, "Super+"), (MOD_CTRL, "Ctrl+"), (MOD_ALT, "Alt+"), (MOD_SHIFT, "Shift+")];
+        for (bit, name) in named {
             if self.mods & bit != 0 {
                 out.push_str(name);
             }
+        }
+        if self.mods & !named.iter().fold(0, |all, (bit, _)| all | bit) != 0 {
+            out.push_str("?+");
         }
         out.push_str(key_name(self.code).unwrap_or("?"));
         out

@@ -762,31 +762,27 @@ pub extern "C" fn _start(notif: u64, session_ns: u64, setup: u64, arg0: u64) -> 
             hotkey_done = true;
             sent_request = true;
             use librsproto::surface::{MgrHotkey, OP_MGR_REGISTER_HOTKEY};
-            let mut minimizes = false;
+            // The summary says only what was registered: the gates take it for the chords' presence.
+            let (mut minimizes, mut refused) = (false, false);
             for chord in chords::CHORDS {
                 let mut body = [0u8; core::mem::size_of::<MgrHotkey>()];
-                if chord.hotkey().write(&mut body).is_none() {
-                    // A body that would not serialise would leave a gate waiting on a line nobody
-                    // printed.
-                    Line::new()
-                        .s(b"desktop-shell: the ")
-                        .s(chord.keys().as_bytes())
-                        .s(b" chord would not serialise")
-                        .end();
-                    continue;
-                }
                 let mut reply = [0u8; 64];
-                if m.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_err() {
-                    Line::new().s(b"desktop-shell: registering ").s(chord.keys().as_bytes()).s(b" was refused").end();
+                let registered = chord.hotkey().write(&mut body).is_some()
+                    && m.request(OP_MGR_REGISTER_HOTKEY, &body, None, &mut reply).is_ok();
+                if !registered {
+                    Line::new().s(b"desktop-shell: registering ").s(chord.keys().as_bytes()).s(b" failed").end();
+                    refused = true;
                 } else if chord.action == Action::Minimize {
                     minimizes = true;
                 }
             }
-            Line::new()
-                .s(b"desktop-shell: Super+1..")
-                .u(chords::CHORD_DESKTOPS as u64)
-                .s(b" switches, Super+Shift+N moves, Super+R names, Super+A opens applications")
-                .end();
+            if !refused {
+                Line::new()
+                    .s(b"desktop-shell: Super+1..")
+                    .u(chords::CHORD_DESKTOPS as u64)
+                    .s(b" switches, Super+Shift+N moves, Super+R names, Super+A opens applications")
+                    .end();
+            }
             if minimizes {
                 log::write(b"desktop-shell: Super+H minimizes the focused window\n");
             }
