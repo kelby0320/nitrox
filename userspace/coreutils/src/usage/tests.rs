@@ -57,7 +57,6 @@ fn source(name: &str) -> alloc::string::String {
 /// Every flag a program parses has its own bullet in its page's Options: a flag added without its
 /// paragraph fails here, though another bullet mention it in passing.
 #[test]
-#[cfg_attr(miri, ignore = "reads the pages from the repository")]
 fn every_flag_a_program_parses_is_on_its_page() {
     let manual = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs/manual/1");
     let mut missing = alloc::vec::Vec::new();
@@ -89,7 +88,6 @@ fn every_flag_a_program_parses_is_on_its_page() {
 /// declare would never be set, as `parse` refuses it, and one it declared and never asked for is
 /// shown and documented and does nothing. `with` reads its own, and is held below.
 #[test]
-#[cfg_attr(miri, ignore = "reads the programs' sources")]
 fn every_flag_a_program_asks_for_is_in_its_table() {
     let mut asked = 0;
     for u in PROGRAMS {
@@ -112,7 +110,6 @@ fn every_flag_a_program_asks_for_is_in_its_table() {
 /// Each program parses and answers `--help` and `--version` from its own table, and names no
 /// other's: a table borrowed from another program would pass every test above.
 #[test]
-#[cfg_attr(miri, ignore = "reads the programs' sources")]
 fn every_program_uses_its_own_table() {
     let consts: alloc::vec::Vec<alloc::string::String> = PROGRAMS.iter().map(|u| u.name.to_uppercase()).collect();
     for (u, own) in PROGRAMS.iter().zip(&consts) {
@@ -122,11 +119,10 @@ fn every_program_uses_its_own_table() {
         for call in calls {
             assert!(src.contains(&format!("{own}.{call}")), "{} does not call {own}.{call}", u.name);
         }
-        for other in consts.iter().filter(|c| *c != own) {
-            let named = src
-                .match_indices(&format!("{other}."))
-                .any(|(i, _)| !src[..i].ends_with(|c: char| c.is_alphanumeric() || c == '_'));
-            assert!(!named, "{} uses {other}", u.name);
+        // The whole name before each `.`, read once a source: another program's table is a use.
+        for (i, _) in src.match_indices('.') {
+            let name = &src[src[..i].trim_end_matches(|c: char| c.is_alphanumeric() || c == '_').len()..i];
+            assert!(name == own || !consts.iter().any(|c| c == name), "{} uses {name}", u.name);
         }
     }
 }
@@ -134,7 +130,6 @@ fn every_program_uses_its_own_table() {
 /// `with` reads its options by hand, as the first word, so its table is held to the arms that read
 /// them, both ways.
 #[test]
-#[cfg_attr(miri, ignore = "reads the program's source")]
 fn withs_table_is_the_options_it_reads() {
     let src = source("with");
     let arms: alloc::collections::BTreeSet<&str> =
