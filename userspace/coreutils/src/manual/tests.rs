@@ -138,6 +138,7 @@ fn a_heading_that_does_not_name_its_page_is_its_whole_summary() {
 /// Every page this system stages, at the width a terminal is assumed to have: no line wider, but
 /// a code block's, which is never wrapped.
 #[test]
+#[cfg_attr(miri, ignore = "reads the pages from the repository")]
 fn every_page_and_spec_renders_within_eighty_columns() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../docs");
     let mut pages = Vec::new();
