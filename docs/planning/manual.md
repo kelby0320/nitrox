@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18; G.6 built 2026-11-18.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18; G.6 built 2026-11-18; G.7 built 2026-11-19.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -672,6 +672,44 @@ its page's Options, a program asking for a flag its table lacks, a flag dropped 
   - the typed stream, the pipeline's stdio and the protocols are section 7.
 
 **The gate**: `test-interactive` runs `man syscalls` and `man desktop`.
+
+**Built 2026-11-19** (`7187f365`, `589fe00c`, `eafca03f`).
+- **The desktop's chords are one table**, `desktop_shell::chords::CHORDS`: each chord's id,
+  modifiers, key, action and what it does. The shell registers every row and dispatches on the
+  row's action, and a chord's spelling is built from what it registers.
+- **`intro(7)` is where to start**: how the system differs from a Unix (authority a handle, a
+  namespace each, no root, grants and `with`, tables in pipelines, no signals) and what to read
+  next. **`boot(7)`** follows a boot from the firmware to the two logins, says who restarts what
+  (nothing, in the release image), and what the emergency shell can do. **`services(8)`** has a
+  section for each service, what it serves and where, what breaks without it, and whether a person
+  can stop, start or restart it; and one for each program `init` starts and each session
+  supervisor. **`desktop(7)`** covers the bars, windows, desktops, the overview, the menus and the
+  chords.
+- **The pages are the implementer's, from the sources, and each claim was checked against the code
+  by a fresh agent**: twelve claims were false and twelve more loosely put, each corrected before
+  landing.
+
+**Departures, for the maintainer's eye:**
+- **`man desktop` shows `desktop(1)`**, the command, since section 1 comes first; the gate types
+  `man 7 desktop`.
+- **The services' check reaches the session supervisors** that `service-mgr` starts, beside the
+  programs `init` starts, and **holds each service's section to its endpoint**, so a path that
+  moves fails it.
+- **Two claims in the architecture docs were false**, found by the check of the pages: that the
+  kernel reparents an orphan to `init`, which it never does, and that the emergency shell can edit
+  `init.toml` and reboot, where its five commands only look. Corrected in `overview.md`,
+  `service-manager.md`, `boot-flow.md`, `init-toml-schema.md`, and `init`'s comments and rules.
+- **Size lowered**: `desktop-shell`'s `main.rs` from 1,388 lines to 1,342.
+
+**Tests**: every chord its own id, keys and action; each desktop number reached by both its chords;
+`desktop(7)`'s chord table row for row, in order; and services(8)'s sections, both ways, against
+the release image's declarations, `init`'s starts and `service-mgr`'s supervisors. **Controls**: a
+chord's text changed, a page row deleted and a chord registered twice each fail the chord tests;
+a service's section removed, an endpoint not named and a stray section under *Started by init*
+each fail the services' check.
+
+**The gate**: `test-interactive` runs `man syscalls` and `man 7 desktop`, each paged and left (64
+steps).
 
 ### What Part G does not do
 
