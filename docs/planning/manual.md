@@ -1,6 +1,6 @@
 # A manual
 
-**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18; G.6 built 2026-11-18; G.7 built 2026-11-19.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
+**Status: detailed 2026-11-17; G.1 built 2026-11-17; G.2 built 2026-11-17; G.3 built 2026-11-17; G.4 built 2026-11-18; G.5 built 2026-11-18; G.6 built 2026-11-18; G.7 built 2026-11-19; Miri at its end 2026-11-19; Part G done 2026-11-19.** Part G of [`pre-phase-7.md`](pre-phase-7.md): the system's
 workings written down for the person using it and the programmer writing for it, read in the
 terminal with `man` and a pager, from pages on the root filesystem whose source is in the
 repository.
@@ -714,6 +714,34 @@ each fail the services' check.
 
 **The gate**: `test-interactive` runs `man syscalls` and `man 7 desktop`, each paged and left (64
 steps).
+
+### Miri at Part G's end
+
+**Run 2026-11-19, at `a0734839`**: the job's thirteen targets whose code Part G changed, under
+Stacked Borrows through `cargo xtask miri`, in 48 minutes; `coreutils` and `libstream` under Tree
+Borrows as well, in 13.
+- **Thirteen, not the five this plan named.** Its rule, the job's targets Part G changes, measured
+  from #450's merge, reaches eight more: `libprompt`, `librsproto`, `libsession`, `libos`,
+  `profile-server`, `view-broker`, `desktop-shell` and `desktop-session-mgr`. `init` and
+  `service-mgr` changed only in comments, and the kernel not at all.
+- **No undefined behaviour in either model.** 1,142 tests pass, seven ignored with their reasons.
+  The one integer-to-pointer cast is `libos`'s mapping, which Part E's run recorded.
+- **One test failed on its own deadline**, and has failed CI's nightly Miri job since G.1 merged.
+  `every_page_and_spec_renders_within_eighty_columns` renders each staged page on a thread of its
+  own and fails a page not rendered in ten seconds, a guard against a renderer that loops.
+  Interpreted, a page can take longer; which one ran out differed by run: `disk(1)` and `move(1)`
+  here, `services.toml(5)` and `nxfiles(1)` on the nightly job, 2026-11-18 and 2026-11-19. It reads
+  every page from the repository, as `usage`'s test of each flag on its page does, which Miri
+  already skips for that reason. It is skipped the same way (`f3e8ecdd`), and still runs natively.
+  The renderer holds no `unsafe`, and its other 24 tests run under Miri on pages of their own; the
+  crate's other deadline, five seconds for the line that once looped the parser, takes a third of
+  a second interpreted.
+- **Part G's new `unsafe`** is the `_start` of `man`, `page` and `terminal`, which no host test
+  reaches, and one pager test's helper, which ran under both models.
+- **Not run**, as the job leaves them out: `libterm`, which holds no `unsafe` and which G.2 and
+  G.3 changed, and the three applications.
+
+Part G's condition is met: G.7 merged, #457, and what Miri reports is triaged.
 
 ### What Part G does not do
 

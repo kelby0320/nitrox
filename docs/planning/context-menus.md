@@ -1,6 +1,6 @@
 # Context menus
 
-**Status: detailed 2026-11-16; F.1 to F.5 built 2026-11-16.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
+**Status: detailed 2026-11-16; F.1 to F.5 built 2026-11-16; Miri at its end 2026-11-17, clean; Part F done 2026-11-17.** Part F of [`pre-phase-7.md`](pre-phase-7.md): a menu on the right
 button, in Files, the editor and the terminal.
 
 ## Why

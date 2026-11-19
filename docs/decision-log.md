@@ -38771,3 +38771,25 @@ G.6 merged, #456. G.7, `manual.md` § G.7, built on `pre-phase-7/part-g7-system-
   `init-toml-schema.md`, and `init`'s comments and rules file.
 - **`man desktop` is the command's page**, as section 1 is looked in first; the gate types
   `man 7 desktop`, and `desktop(1)` points at it.
+
+## 2026-11-19 — Before Phase 7: Part G's Miri, and Part G done
+
+**Part G is done**: G.7 merged, #457, and what Miri reports at Part G's end is triaged
+(`manual.md` § Miri at Part G's end), on `pre-phase-7/part-g-miri` from `main` at `a0734839`.
+
+- **Thirteen targets, not the plan's five.** The plan named `coreutils`, `libline`, `libstream`,
+  `tty-server` and `nxsh`, by the rule "the job's targets Part G changes". Measured from #450's
+  merge, the rule reaches eight more: `libprompt`, `librsproto`, `libsession`, `libos`,
+  `profile-server`, `view-broker`, `desktop-shell` and `desktop-session-mgr`. The rule was kept
+  over the list. All thirteen ran under Stacked Borrows, and `coreutils` and `libstream` under Tree
+  Borrows as well.
+- **No undefined behaviour in either model**: 1,142 tests pass, and the one integer-to-pointer
+  cast is `libos`'s mapping, as at Part E's end.
+- **CI's nightly Miri job has failed since G.1 merged**, on a test's own deadline:
+  `every_page_and_spec_renders_within_eighty_columns` fails a page not rendered in ten seconds,
+  and interpreted, a page can take longer. It reads every page from the repository, as a test in
+  `usage` does that Miri already skips for that reason, and is now skipped the same way (`f3e8ecdd`);
+  it still runs natively. The job's failures before it, 2026-11-14 to 2026-11-16, were the `libos`
+  model's undefined behaviour that Part E's run found, fixed with #444; the 2026-11-17 run passed.
+- **Part F's record**: its Miri run, clean, was logged with G.1 on 2026-11-17, but no status line
+  said Part F was done. `pre-phase-7.md`, `context-menus.md` and the implementation plan now do.
