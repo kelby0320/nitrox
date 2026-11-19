@@ -1,5 +1,6 @@
 //! The process **setup message** — how a shell hands a pipeline stage its standard
-//! streams and `argv`. See `docs/spec/pipeline-stdio.md`.
+//! streams and `argv`, and `answer_help`, the `--help` of a program handed them. See
+//! `docs/spec/pipeline-stdio.md`.
 //!
 //! The pure, transport-agnostic half: the `arg0` bootstrap descriptor, the TSM1 payload
 //! codec, and the mapping between a stream **presence bitmap** and the ordered
@@ -219,8 +220,16 @@ impl SetupPayload {
     }
 }
 
+/// Whether `argv` asks for `--help`, as a coreutil reads it: an argument after the program's name,
+/// and before any `--`, that is `--help`.
+pub fn asks_for_help(argv: &[String]) -> bool {
+    argv.iter().skip(1).take_while(|a| a.as_str() != "--").any(|a| a == "--help")
+}
+
+#[cfg(all(test, feature = "io"))]
+pub(crate) use self::io_stage::say_help;
 #[cfg(feature = "io")]
-pub use self::io_stage::{StageSetup, StageStreams, open_pipe, receive_setup, send_stage_setup};
+pub use self::io_stage::{StageSetup, StageStreams, answer_help, open_pipe, receive_setup, send_stage_setup};
 
 /// The sender (a shell spawning a stage) and receiver ([`receive_setup`]) sides of
 /// the setup message, over real IPC, behind `io`. Like [`channel::IpcPort`](crate::channel)
@@ -228,7 +237,7 @@ pub use self::io_stage::{StageSetup, StageStreams, open_pipe, receive_setup, sen
 #[cfg(feature = "io")]
 mod io_stage {
     use super::{STREAM_MASK, SetupPayload, split_handles};
-    use crate::channel::{recv_msg, send_msg};
+    use crate::channel::{ChannelSink, IpcPort, MsgPort, recv_msg, send_msg};
     use crate::wire::{Record, Result, WireError};
     use alloc::boxed::Box;
     use alloc::string::String;
@@ -308,6 +317,38 @@ mod io_stage {
         /// The terminal this stage was handed, if its parent gave it one; otherwise it resolves
         /// `/dev/tty`. See [`SetupPayload::terminal`].
         pub terminal: Option<Handle<Channel, Only>>,
+    }
+
+    /// When `argv` asks for `--help` ([`asks_for_help`](super::asks_for_help)): `lines` said, and
+    /// the program ended with 0. `take` hands the streams over only then, so a program that goes on
+    /// keeps them for its run.
+    pub fn answer_help(argv: &[String], take: impl FnOnce() -> Option<StageStreams>, lines: &[&str]) {
+        if !super::asks_for_help(argv) {
+            return;
+        }
+        say_help(take().unwrap_or_default(), lines);
+        libos::exit(0)
+    }
+
+    /// `lines` on `stdout` as text, which a shell prints a line a row. With no `stdout`, or one the
+    /// write fails on, they are a notice on `stderr`, as a coreutil's `--help` is, and with neither
+    /// they go to the kernel log.
+    pub(crate) fn say_help(streams: StageStreams, lines: &[&str]) {
+        let wrote = streams.stdout.is_some_and(|out| {
+            let mut sink = ChannelSink::new(IpcPort::owning(out), libkern::IPC_PAYLOAD_SIZE);
+            crate::table::write_text_fallback(&mut sink, lines, 0).and_then(|()| sink.finish()).is_ok()
+        });
+        if wrote {
+            return;
+        }
+        let mut text = lines.join("\n");
+        text.push('\n');
+        let noted = streams.stderr.is_some_and(|err| {
+            IpcPort::owning(err).send(&crate::diag::frame(crate::diag::Level::Notice, text.as_bytes()), false).is_ok()
+        });
+        if !noted {
+            libos::log::write(text.as_bytes());
+        }
     }
 
     /// Receive a setup message on `endpoint`, the stage's bootstrap endpoint: `None` if none came

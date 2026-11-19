@@ -363,6 +363,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
             }
             _ => (Vec::new(), libstream::wire::Record::default()),
         };
+    libstream::setup::answer_help(&argv, || _streams.take().map(|(s, _)| s), nxfiles::HELP);
     let home = home_of(&env);
     // `argv[1]` is where the first window starts; home, which the sidebar's places and every later
     // window keep, is not the argument (it would offer `Documents/Documents`).

@@ -30,8 +30,8 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::MOVE;
 use libfs::FileError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
@@ -43,21 +43,6 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-const FORCE: Flag = Flag::new("force", 'f', "replace an existing destination");
-
-const HELP: &[u8] = b"usage: move [--force] SOURCE... DEST\n\
-    \n\
-    Relocate files. Re-points the name when source and destination share a\n\
-    mount; copies and removes the original when they do not.\n\
-    Emits Table<{from: String, to: String, method: String}> on stdout,\n\
-    where method is \"rename\" or \"copy\".\n\
-    \n\
-      -f, --force   replace an existing destination\n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"move (nitrox coreutils) 0.1.0\n";
 
 struct Moved {
     from: String,
@@ -71,15 +56,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[FORCE]) {
+    let args = match MOVE.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"move: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(MOVE.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(MOVE.version().as_bytes());
     }
     if args.operands.len() < 2 {
         stage.die(b"move: need a source and a destination (try --help)\n", EXIT_USAGE);

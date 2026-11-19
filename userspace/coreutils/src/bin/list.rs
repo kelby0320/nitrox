@@ -20,8 +20,8 @@ extern crate alloc;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::LIST;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
 use libos::exit;
@@ -35,19 +35,6 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const RECURSIVE: Flag = Flag::new("recursive", 'r', "list subdirectories recursively");
-
-const HELP: &[u8] = b"usage: list [--recursive] [path...]\n\
-    \n\
-    Emit a directory listing as a typed stream (TSM1) on stdout:\n\
-    Table<{name: String, size: Int, kind: String, modified: Int}>\n\
-    \n\
-      -r, --recursive   list subdirectories recursively\n\
-          --help        show this help and exit\n\
-          --version     show version information and exit\n";
-
-const VERSION: &[u8] = b"list (nitrox coreutils) 0.1.0\n";
-
 const DEFAULT_PATH: &[u8] = b"/";
 
 /// Recursion depth cap: a symlink loop must stop with an error, not truncate silently.
@@ -59,15 +46,15 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[RECURSIVE]) {
+    let args = match LIST.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"list: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(LIST.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(LIST.version().as_bytes());
     }
 
     // Several operands list each in turn, into one stream: a stage emits one table.

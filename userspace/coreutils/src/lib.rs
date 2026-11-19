@@ -23,6 +23,7 @@ pub mod manual;
 pub mod pager;
 pub mod stage;
 pub mod text;
+pub mod usage;
 /// Calendar arithmetic and duration parsing, re-exported from [`libtime`], which
 /// `desktop-shell` also uses.
 pub use libtime as time;

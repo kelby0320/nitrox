@@ -121,6 +121,83 @@ mod tests {
         }
     }
 
+    /// Every program in `/bin` has a page in section 1, where a person who ran it looks. No service
+    /// is in `/bin`; one there would be described on the services' page instead.
+    #[test]
+    fn every_program_in_bin_has_a_page() {
+        let programs = crate::profile_programs();
+        let missing: Vec<&str> =
+            programs.iter().copied().filter(|p| !repo_root().join(format!("docs/manual/1/{p}.md")).exists()).collect();
+        assert!(programs.len() > 20 && missing.is_empty(), "no page in section 1: {missing:?}");
+    }
+
+    /// The text of the `HELP` a program's source declares, from `const HELP` to the `;` ending it.
+    fn help_const(src: &str) -> Option<&str> {
+        let at = src.find("const HELP")?;
+        Some(&src[at..][..src[at..].find(";\n")?])
+    }
+
+    /// The flags `text` names: each `--word`, and each `-x` standing alone, that starts a word.
+    fn flags_named(text: &str) -> std::collections::BTreeSet<String> {
+        let b = text.as_bytes();
+        let mut out = std::collections::BTreeSet::new();
+        for i in (0..b.len())
+            .filter(|&i| b[i] == b'-' && (i == 0 || !(b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'-')))
+        {
+            let word =
+                |from: usize| from + b[from..].iter().take_while(|c| c.is_ascii_lowercase() || **c == b'-').count();
+            if b.get(i + 1) == Some(&b'-') && b.get(i + 2).is_some_and(u8::is_ascii_lowercase) {
+                out.insert(text[i..word(i + 2)].to_string());
+            } else if b.get(i + 1).is_some_and(u8::is_ascii_lowercase)
+                && !b.get(i + 2).is_some_and(u8::is_ascii_alphanumeric)
+            {
+                out.insert(text[i..i + 2].to_string());
+            }
+        }
+        out
+    }
+
+    /// The spellings each bullet of a page's Options is about: before the `:` that starts its
+    /// paragraph, each code span's first word.
+    fn options_spellings(page: &str) -> Vec<String> {
+        let options = page.split("\n## Options\n").nth(1).map_or("", |rest| rest.split("\n## ").next().unwrap_or(rest));
+        let terms = options.lines().filter_map(|l| l.strip_prefix("- `")).filter_map(|l| l.split_once("`: "));
+        terms.flat_map(|(t, _)| t.split("`, `").map(|s| s.split(' ').next().unwrap_or(s).to_string())).collect()
+    }
+
+    /// Every flag a program outside the coreutils names in its `--help` has its own bullet in its
+    /// page's Options. The coreutils' flags are their tables', held by the tables' tests.
+    #[test]
+    fn every_flag_a_programs_help_names_is_on_its_page() {
+        let mut named = 0;
+        let mut missing = Vec::new();
+        for p in crate::profile_programs().into_iter().filter(|p| !crate::build::COREUTILS.contains(p)) {
+            let dir = repo_root().join(format!("userspace/{p}/src"));
+            let sources: Vec<String> =
+                ["main.rs", "lib.rs"].iter().filter_map(|f| fs::read_to_string(dir.join(f)).ok()).collect();
+            let Some(help) = sources.iter().find_map(|s| help_const(s)) else {
+                missing.push(format!("{p}: no HELP"));
+                continue;
+            };
+            let page = fs::read_to_string(repo_root().join(format!("docs/manual/1/{p}.md"))).unwrap_or_default();
+            let spellings = options_spellings(&page);
+            for flag in flags_named(help) {
+                named += 1;
+                if !spellings.contains(&flag) {
+                    missing.push(format!("{p} {flag}"));
+                }
+            }
+        }
+        assert!(missing.is_empty(), "{missing:?}");
+        assert!(named >= 6, "{named} flags found: the scan has missed the programs' HELP");
+    }
+
+    #[test]
+    fn a_flag_is_read_where_it_starts_a_word() {
+        let named = flags_named("usage: nxsh [-c SOURCE]\n\x20 -h, --help  read-only, a --- and -- `x`, -cx");
+        assert_eq!(named.into_iter().collect::<Vec<_>>(), ["--help", "-c", "-h"]);
+    }
+
     /// One flat directory of `<name>.<section>.md`, as the profile server projects and `man` reads.
     #[test]
     fn the_pages_are_staged_flat_by_name_and_section() {

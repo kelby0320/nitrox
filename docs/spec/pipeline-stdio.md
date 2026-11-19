@@ -198,8 +198,10 @@ kernel log.
 **What was asked for is not a diagnostic.** A program's `--help` and `--version` are its answer:
 the coreutils (`Stage::answer`) write them to `stdout` as a `TEXT_FALLBACK` stream
 (`typed-stream-format.md`), which the shell prints as lines and a pipeline can take, and send them
-as a notice only without a `stdout`; `nxinstall`, which has no `--version`, answers `--help` the
-same way. **`nxsh` is the exception**: a shell keeps none of its streams, so `nxsh --help` writes on
+as a notice only without a `stdout` or when the write fails; `nxinstall`, which has no `--version`,
+answers `--help` the same way, and so do the applications, `nxedit`, `nxfiles` and `nxterm`, before
+they open a window (`libstream::setup::answer_help`, which takes their streams only when asked).
+**`nxsh` is the exception**: a shell keeps none of its streams, so `nxsh --help` writes on
 the terminal it was handed, and through `kprint` only without one, and cannot be piped. **Progress
 stays on `stderr`**, as notices: `stdout` is the pipeline's value, which the shell shows only when
 the pipeline ends.

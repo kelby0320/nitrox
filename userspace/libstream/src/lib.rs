@@ -12,8 +12,8 @@
 //!
 //! The **wire core** ([`wire`]) is `core + alloc` only: the byte-level codec over the
 //! transport-agnostic [`wire::ByteSink`] / [`wire::ByteSource`] seams. `TableWriter`/
-//! `TableReader` layer on top; the channel adapter, the only part that touches a syscall,
-//! is separate again.
+//! `TableReader` layer on top; the channel adapter and the setup message's sending and
+//! receiving, the only parts that touch a syscall, are separate again, behind `io`.
 //!
 //! ## Terminology (three things the spec calls "record")
 //!

@@ -73,5 +73,15 @@ fn place_of(key: u64) -> Option<usize> {
     key.checked_sub(SIDEBAR_ROW_KEY).map(|i| i as usize)
 }
 
+/// What `--help` prints, a line each, on `stdout`.
+pub const HELP: &[&str] = &[
+    "usage: nxfiles [PATH]",
+    "",
+    "A window onto the files under PATH, or under your home. `man nxfiles` says",
+    "what its menus and keys do.",
+    "",
+    "      --help  show this help and exit",
+];
+
 #[cfg(test)]
 mod tests;

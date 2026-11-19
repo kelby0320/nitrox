@@ -40,6 +40,16 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 const BUFFERS: usize = 2;
 
+/// What `--help` prints, a line each, on `stdout`.
+const HELP: &[&str] = &[
+    "usage: nxedit [PATH]",
+    "",
+    "A text editor's window, on the file at PATH, or on a new one named when it",
+    "is saved. `man nxedit` says what its menus and keys do.",
+    "",
+    "      --help  show this help and exit",
+];
+
 fn fail(msg: &[u8]) -> ! {
     log::write(msg);
     // Under the test-harness kernel this terminates QEMU; elsewhere it returns.
@@ -183,6 +193,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, endpoint: u64, arg0: u64) -> 
         }
         _ => (Vec::new(), libstream::wire::Record::default()),
     };
+    libstream::setup::answer_help(&argv, || _held.take().map(|(s, _)| s), HELP);
     // `argv[1]`, or an untitled buffer whose name is asked for in the status strip.
     let path = argv.get(1).cloned().unwrap_or_default();
     // Where an untitled buffer is saved; `/home` outside a session.

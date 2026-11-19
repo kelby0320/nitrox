@@ -2345,6 +2345,19 @@ when the toolkit is designed** — retrofitting three shipped apps is far worse 
 them right. Natural trigger: the second or third GUI app, i.e. the point where one library
 would be resident more than once.
 
+**What a failed run did — `TODO(failed-run-rows)`.** `copy`, `mkdir`, `move`, `remove` and `touch`
+act on each operand in turn and write their rows once every operand is done, so a failure part way
+ends the program before any row: `remove a b missing` deletes `a` and `b`, and says only that
+`missing` is not there. Writing the rows done so far before failing would not reach the person on
+its own, as a pipeline with a failed stage raises its error and drops its value
+([`shell-language.md`](../spec/shell-language.md) §1), so only a stage downstream would see them.
+Two shapes: each program says what it did in notices before its error, which the shell shows on a
+failed pipeline; or the shell shows a failed pipeline's value beside its error, and the programs
+write the rows they have, a change to the language's fail-loud rule that reaches every program.
+Until then the five pages say a failed run writes no rows, and `list` shows what is left. Trigger:
+a person losing track of what a failed destructive run did, or the shell's failure display being
+reworked.
+
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Runtime libraries

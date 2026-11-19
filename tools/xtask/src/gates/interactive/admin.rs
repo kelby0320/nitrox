@@ -162,9 +162,21 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     if help.contains("\x1b[91m") || help.contains("\x1b[93m") {
         return Err(format!("`disk --help` was drawn as a diagnostic, not as output: {help:?}").into());
     }
-    s.send("format(\"help-rows={}\", (disk --help | count))")?;
-    s.expect("help-rows=21")?;
+    s.send("format(\"help-rows={}\", (disk --help | count) > 10)")?;
+    s.expect("help-rows=true")?;
     s.expect("/home>")?;
+    // Its last row is `--version`'s, alone, so the help was neither cut short nor run on.
+    let last_from = s.transcript().len();
+    s.send("disk --help | last 1")?;
+    s.expect("show version information and exit")?;
+    s.expect("/home>")?;
+    if s.transcript()[last_from..].contains("show this help and exit") {
+        return Err(format!(
+            "`disk --help | last 1` showed more than the last row: {:?}",
+            &s.transcript()[last_from..]
+        )
+        .into());
+    }
     //      (b) **`--mount` without the grant is refused before the service is asked**: the
     //          session's `/dev/storage/admin` has nothing answering, and `disk` names `with`.
     s.send("disk --mount /dev/blk/1")?;

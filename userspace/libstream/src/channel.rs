@@ -133,6 +133,7 @@ impl<P: MsgPort> ChannelReceiver<P> {
 
 #[cfg(feature = "io")]
 pub use self::io_port::{IpcPort, IpcPortRef};
+
 #[cfg(feature = "io")]
 pub(crate) use self::io_port::{recv_msg, send_msg};
 

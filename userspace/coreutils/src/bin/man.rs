@@ -13,10 +13,10 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::manual::{self, Found, Request};
 use coreutils::pager::{self, Shown};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::MAN;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
 use libos::{exit, log};
@@ -30,36 +30,21 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// The width a page is rendered at when its terminal cannot say, as the serial console cannot.
 const WIDTH: usize = 80;
 
-const FLAGS: [Flag; 1] =
-    [Flag { long: "keyword", short: 'k', help: "list the pages whose name or summary holds WORD" }];
-
-const HELP: &[u8] = b"usage: man [SECTION] NAME\n       man [--keyword WORD]\n\
-    \n\
-    Print a page of the manual, the first of that name in sections 1, 8, 2, 5, 7 or\n\
-    the one in SECTION. With no NAME, list every page as\n\
-    Table<{name: String, section: Int, summary: String}>.\n\
-    \n\
-      -k, --keyword     list the pages whose name or summary holds WORD\n\
-          --help        show this help and exit\n\
-          --version     show version information and exit\n";
-
-const VERSION: &[u8] = b"man (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &FLAGS) {
+    let args = match MAN.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"man: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(MAN.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(MAN.version().as_bytes());
     }
     let ops: Vec<&str> = args.operands.iter().map(String::as_str).collect();
     let request = manual::request(&ops, args.has("keyword")).unwrap_or_else(|e| stage.die(e.as_bytes(), EXIT_USAGE));

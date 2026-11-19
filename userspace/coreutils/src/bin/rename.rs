@@ -19,8 +19,8 @@ extern crate alloc;
 
 use alloc::string::String;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::RENAME;
 use libfs::FileError;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libos::boot::Start;
@@ -33,35 +33,21 @@ use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const FORCE: Flag = Flag::new("force", 'f', "replace an existing destination");
-
-const HELP: &[u8] = b"usage: rename [--force] OLD NEW\n\
-    \n\
-    Re-point a name at the same file. Never copies: a rename across mounts\n\
-    is an error (use `move`, which falls back to copy).\n\
-    Emits Table<{from: String, to: String}> on stdout.\n\
-    \n\
-      -f, --force   replace an existing NEW\n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"rename (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
 
-    let args = match parse(&stage.argv, &[FORCE]) {
+    let args = match RENAME.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"rename: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(RENAME.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(RENAME.version().as_bytes());
     }
     if args.operands.len() != 2 {
         stage.die(b"rename: need exactly OLD and NEW (try --help)\n", EXIT_USAGE);

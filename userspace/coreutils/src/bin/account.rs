@@ -33,8 +33,8 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use coreutils::args::{Flag, parse};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
+use coreutils::usage::ACCOUNT;
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{Rights, scrub};
 use libos::boot::Start;
@@ -60,55 +60,20 @@ const VIEWS: &str = "/dev/views";
 /// What a session channel to the broker is asked for.
 const SESSION: Rights = Rights::from_bits(Rights::SEND.bits() | Rights::RECV.bits() | Rights::WAIT.bits());
 
-const FLAGS: [Flag; 5] = [
-    Flag::long_only("list", "every account, its home, its sessions, and whether it administers"),
-    Flag::long_only("add", "add NAME, asking for its password twice (needs the accounts grant)"),
-    Flag::long_only("remove", "remove NAME (needs the accounts grant)"),
-    Flag::long_only("home", "with --remove: remove the account's home too"),
-    Flag::long_only("password", "change your own password, or set NAME's (needs the accounts grant)"),
-];
-
-/// `--users` is a flag of its own so that `FILE` is an operand, as `disk --mount DEVICE` is.
-const USERS: Flag = Flag::long_only("users", "with --password NAME: set it in FILE, a users file, directly");
-
-const HELP: &[u8] = b"usage: account --list\n\
-    \x20      account --password\n\
-    \x20      account --add NAME\n\
-    \x20      account --remove NAME [--home]\n\
-    \x20      account --password NAME [--users FILE]\n\
-    \n\
-    --list                  every account, its home, how many sessions it has open, and\n\
-    \x20                       whether it could administer, as a table\n\
-    --password              change your own password: the current one, then a new one twice\n\
-    --add NAME              add NAME, with a home at /home/NAME, asking for its password twice\n\
-    --remove NAME [--home]  remove NAME, keeping its home unless --home; refused while NAME\n\
-    \x20                       is logged in, or if nobody left could administer\n\
-    --password NAME         set NAME's password, asking for it twice\n\
-    --users FILE            with --password NAME: set it in FILE directly, for recovery from\n\
-    \x20                       the live image\n\
-    \n\
-    --add, --remove and --password NAME need the accounts grant: run them with `with admin`.\n\
-    \n\
-    \x20     --help    show this help and exit\n\
-    \x20     --version show version information and exit\n";
-
-const VERSION: &[u8] = b"account (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
-    let flags = [FLAGS[0], FLAGS[1], FLAGS[2], FLAGS[3], FLAGS[4], USERS];
-    let args = match parse(&stage.argv, &flags) {
+    let args = match ACCOUNT.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"account: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(ACCOUNT.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(ACCOUNT.version().as_bytes());
     }
     let ops: Vec<&str> = args.operands.iter().map(|s| s.as_str()).collect();
     let verbs = [args.has("list"), args.has("add"), args.has("remove"), args.has("password")];

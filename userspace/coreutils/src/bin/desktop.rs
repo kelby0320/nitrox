@@ -21,8 +21,8 @@ extern crate alloc;
 
 use alloc::string::String;
 
-use coreutils::args::parse;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Port, Stage};
+use coreutils::usage::DESKTOP;
 use libos::boot::Start;
 use libos::log::{self, Line};
 use libos::{Msg, exit};
@@ -31,33 +31,20 @@ use librsproto::desktop::{Desktop, DesktopError};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-const HELP: &[u8] = b"usage: desktop [switch N | name N LABEL]\n\
-    \n\
-    With no operands, list the session's desktops and mark the current one.\n\
-    switch N    make the Nth desktop current\n\
-    name N L    name the Nth desktop, which is what makes it persist\n\
-    \n\
-    N is a position as the desktop indicator counts them, starting at 1.\n\
-    \n\
-          --help    show this help and exit\n\
-          --version show version information and exit\n";
-
-const VERSION: &[u8] = b"desktop (nitrox coreutils) 0.1.0\n";
-
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     // SAFETY: the kernel's bootstrap registers, read once, here.
     let start = unsafe { Start::from_registers(rdi, rsi, rdx, rcx) };
     let stage = Stage::enter(start);
-    let args = match parse(&stage.argv, &[]) {
+    let args = match DESKTOP.parse(&stage.argv) {
         Ok(a) => a,
         Err(_) => stage.die(b"desktop: unrecognized option (try --help)\n", EXIT_USAGE),
     };
     if args.help() {
-        stage.answer(HELP);
+        stage.answer(DESKTOP.help().as_bytes());
     }
     if args.version() {
-        stage.answer(VERSION);
+        stage.answer(DESKTOP.version().as_bytes());
     }
 
     // **Every diagnostic here goes to the debug console as well as to the stage**: a windowed

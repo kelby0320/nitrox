@@ -38709,3 +38709,35 @@ G.4 merged, #454. G.5, `manual.md` § G.5, built on `pre-phase-7/part-g5-guide` 
   the copy's table row before its count, and the gate read it as the answer. The gate now waits for
   the prompt and finds the count as a whole number between, so a line landing before, inside or
   after the row cannot be read for it (`042edb98`).
+
+## 2026-11-18 — Before Phase 7, G.6: the commands
+
+G.5 merged, #455. G.6, `manual.md` § G.6, built on `pre-phase-7/part-g6-commands` (`198fc6fe`, `27bab753`).
+
+- **Every program in `/bin` has a page in section 1**, 24 new, written by the implementer from each
+  program's source, its help and the spec's row, and read against the source before they landed:
+  two claims went (`Ctrl+L` clearing `nxterm`'s screen, which nothing does) or were made exact
+  (`move` and a binding), and two names were brought up to date (the desktop switcher, `date
+  --set`'s grant beside `with`'s).
+- **A coreutil's usage and flags are one table, `coreutils::usage`**, which parses its command
+  line and prints its `--help`: the usage line, a sentence and the options, a flag's help written
+  once. The tables sit together so one test reaches all 21: each `--help` within 80 columns, each
+  flag in its page's Options section, and each flag a program asks for declared. `with` reads its
+  options by hand and is held to its table both ways.
+- **The applications answer `--help`** before they open a window, through
+  `libstream::setup::answer_help`, which takes their streams only when asked so they otherwise
+  stay open, and says the text as a notice when `stdout` will not take it, as a coreutil does;
+  `nxsh`'s is a short overview where it was a usage line.
+- **No service lives in `/bin`**, so the plan's "or a service on the services' page" has nothing to
+  excuse; the check is that every program `profile_programs` ships has a page.
+- **A failed run of `copy`, `mkdir`, `move`, `remove` or `touch` writes no rows**, which the review
+  found where three pages and their sources said the rows already written told what was done: each
+  writes its rows once every operand is done, and a failure ends it first. Writing them first would
+  show a person nothing, as a failed pipeline raises its error and drops its value. On the
+  maintainer's call the five pages say so, and that `list` shows what is left, and saying what a
+  failed run did is deferred, `TODO(failed-run-rows)`.
+- **A flag is held to its own row and its own bullet**: in `--help` a line that starts with it, and
+  on its page an Options bullet about it, where a mention in another's satisfied both tests. A
+  coreutil parses with its own table, names no other's, and asks for every flag its table
+  declares. The other programs' `--help` flags, `nxsh`'s, `nxinstall`'s and the applications', are
+  held to their pages by an xtask test that reads each `HELP`.
