@@ -12,7 +12,8 @@ servers share, then FAT's, with fs-3's two halves and the trials' doc claims. Gr
 2026-10-24: the block layer's bounds, AHCI's recovery, a kept USB slot's commands, the shutdown's
 flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, which frees no
 thread in place now, and the deadline heap's slots. On 2026-10-27 ten later findings moved to
-Part I with the safety survey's defects that repeat them.** Part D of
+Part I with the safety survey's defects that repeat them. Part H detailed 2026-11-19: four of its
+fifty found fixed by later work, and ticked.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -462,7 +463,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Moved to Part I on 2026-10-27 with the safety survey's kmem-d1, which repeats it.
   Fixed in `165dae67`, as kmem-d1; fails without it:
   `the_last_page_the_vmap_hands_out_is_mapped_under_every_root`.
-- [ ] **kmem-10** `kernel/src/sched/ipc.rs:499` — When a server's endpoint closes
+- [x] **kmem-10** `kernel/src/sched/ipc.rs:499` — When a server's endpoint closes
   (`ipc_endpoint_closing`, line 480) or its registration drops (`us_reg_detach`), only pending
   lookups are drained, never `pending_fill`. A Model B page-cache fill whose server dies or never
   replies is never completed. A server replying OBJECT_KIND_FILE gets a client that maps the
@@ -475,6 +476,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   then the server end dropped, gave "lookup signalled=true, fill signalled=false". Only
   `take_pending_fill_matching` ever takes `pending_fill`. A boot with a Model B test server was
   not run. Lenses: logic, error-paths. Medium. **Later**, as kobj-10.
+  Fixed in `7938344d`, with kobj-10 and the survey's kobj-d3: both teardown paths fail a pending
+  fill, found so in Part H's detail pass; fails without it:
+  `a_dying_server_fails_its_fills_and_frees_their_cycle` and `a_registration_dropped_fails_its_fills`.
 - [x] **kmem-11** `kernel/src/mm/addr_space.rs:631` — No test pins `page_flags_for`'s WRITABLE,
   NO_EXECUTE and USER translation, and this function builds every user PTE. A regression that
   drops NX, makes read-only mappings writable or marks kernel mappings user-accessible would
@@ -561,7 +565,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   Fixed in `e56c6612`; fails without it: `an_order_past_the_largest_block_is_refused`. Its second
   mutation, the bitmap reservation's rounding, is equivalent: Limine's usable entries are
   page-aligned, so both choose the same region.
-- [ ] **kmem-19** `kernel/src/object/file_object.rs:437` — `resize`'s
+- [x] **kmem-19** `kernel/src/object/file_object.rs:437` — `resize`'s
   `g.retired.try_reserve(gone)?`, the all-or-nothing allocation before pages are removed, can be
   deleted with every `file_object` test still passing. Without it, the later
   `let _ = g.retired.try_push(p.frame)` drops its Result when the vector cannot grow, so the
@@ -569,6 +573,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   reserve, a truncate that cannot grow `retired` returns Err and changes nothing. No test covers
   that failure. Demonstrated: removing the reserve and running `object::file_object` survived.
   Lens: tests. Low. **Later.**
+  Fixed in `ac2ed261`: the push after the reservation is `push_within_capacity(..) else
+  unreachable!`, so removing the reservation fails six `file_object` tests, found so in Part H's
+  detail pass. A refused reservation stays untested: nothing on the host makes one fail.
 
 What held up: user copies (`validate_user_range` with `checked_add` against `USER_VIRT_END`,
 zero-size and empty-slice cases, `lookup_recovery` matching only the two registered PCs, `clac` and
@@ -1199,7 +1206,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   changed to `i * 16`, and the rsproto tests all passed. Restored. tests. High.
   **Fix**, with kobj-3.
   Fixed in `e56c6612`; fails without it: `each_block_run_is_read_at_its_own_offset`.
-- [ ] **proto-5** `userspace/librsproto/src/namespace.rs:113` — The length checks in
+- [x] **proto-5** `userspace/librsproto/src/namespace.rs:113` — The length checks in
   `parse_resolve_grow_size`, `parse_resolve_rename` (both the tail+4 and tail+4+dest_len checks)
   and `file::parse_rename_request` have no test with a truncated or overrunning body. If one
   were dropped, a client with a namespace handle could send a cut-short RESOLVE_RENAME,
@@ -1207,6 +1214,9 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   range and panic. Test gap; the code is correct today. Demonstrated: each check replaced with
   `if false` individually, and every `cargo test -p librsproto --lib` run still passed.
   Restored. tests. High. **Later.**
+  Fixed in `662163e6`: the parsers read through a bounded `Reader`, and
+  `parsers_survive_truncation_and_corruption` feeds each every prefix and corruption, found so in
+  Part H's detail pass; each named check, rewritten for today's code, fails it.
 - [ ] **proto-6** `userspace/libgpt/src/table.rs:261` — The guards in `read()` on the header_size
   range, entry_len == 128, count in 1..=1024 and `front.len() < end` are all untested. A disk
   with a valid-CRC header whose array_lba or count points past the buffer storage-service reads
@@ -1898,7 +1908,7 @@ Found 21, refuted by a boot 0, reported 16.
   boot-probe client that holds two media sessions should get WouldBlock on a third resolve.
   Lens: trust-boundary. Medium. **Later.**
 
-- [ ] **sup-7** `userspace/storage-service/src/main.rs:483` — storage-service reads `init.toml`
+- [x] **sup-7** `userspace/storage-service/src/main.rs:483` — storage-service reads `init.toml`
   differently from init. It stops at the first NUL and maps the object's whole size. Init
   (init/src/main.rs:182, 191) maps exactly one page and trims only trailing NULs. This breaks
   `userspace/init/CLAUDE.md`'s rule that it "must read the file exactly as init does". A NUL
@@ -1909,6 +1919,9 @@ Found 21, refuted by a boot 0, reported 16.
   storage-service. Demonstrated: a temporary libinittoml test, since removed, put a manifest with
   a NUL in a comment between two mounts into a 4096-byte page and sliced it with each rule. It
   printed `init mounts ["/", "/data"]` and `storage mounts ["/"]`. Lens: logic. Low. **Later.**
+  Fixed in `e6a4ecf2`, as the survey's sup-d8: `init` and storage-service both read by
+  `libinittoml::manifest::text`, over the whole object, found so in Part H's detail pass; the
+  bash's manifest now gives both `["/"]`.
 
 - [ ] **sup-8** `userspace/service-mgr/src/main.rs:280` — `skipped_critical` counts every skipped
   declaration that says `critical = true`, including a Duplicate (or a NoExecutable re-entered
