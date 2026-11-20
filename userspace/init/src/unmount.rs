@@ -112,7 +112,9 @@ mod tests {
         mock::mount("/m", 1, 0);
         let (ours, theirs) = Handle::<Channel, Only>::pair(4).unwrap();
         assert_eq!(flush_then_ask(&ns, "/m", (&ours).into(), soon()), Ok(true));
-        assert!(theirs.recv(&mut Msg::new()).is_ok(), "a finished flush is followed by the request");
+        let mut sent = Msg::new();
+        assert!(theirs.recv(&mut sent).is_ok(), "a finished flush is followed by the request");
+        assert_eq!(decode(sent.payload()).unwrap().request_id, REQUEST_ID, "the id its answer must carry");
     }
 
     #[test]

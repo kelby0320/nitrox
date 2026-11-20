@@ -849,6 +849,16 @@ backoff_max = \"2s\"\n";
         assert_eq!(at(100_000_000, 56), cap, "100 ms, attempt 56");
     }
 
+    /// **Which exits each policy restarts**: on-failure restarting a clean exit would loop.
+    #[test]
+    fn each_policy_restarts_the_exits_it_names() {
+        let codes = [0, 1, -1, i32::MIN];
+        let restarts = |p: RestartPolicy| codes.map(|c| p.restarts(c));
+        assert_eq!(restarts(RestartPolicy::Never), [false; 4]);
+        assert_eq!(restarts(RestartPolicy::OnFailure), [false, true, true, true]);
+        assert_eq!(restarts(RestartPolicy::Always), [true; 4]);
+    }
+
     /// **A restart setting that does not read keeps its default**: never restart, back off doubling.
     #[test]
     fn a_restart_setting_that_does_not_read_keeps_its_default() {

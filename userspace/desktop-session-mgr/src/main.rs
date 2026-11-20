@@ -83,14 +83,15 @@ fn run_session(
     root: &Handle<Namespace, NsReadOnly>,
     notif: &Handle<Notify, Only>,
     eps: &Endpoints,
-    views_sup: Option<&Endpoint>,
+    views_sup: &mut Option<Endpoint>,
     user: &[u8],
     home: &[u8],
 ) {
     Line::new().s(b"desktop-session-mgr: login ok -> home=").s(home).end();
     // Before the namespace: the broker's base is part of what it binds.
     let mut views_base = [0u8; 24];
-    let opened = views_sup.and_then(|sup| libsession::open_views_session(sup, user, &mut views_base));
+    let opened =
+        eps.views.as_ref().and_then(|_| libsession::open_views_session_from(root, views_sup, user, &mut views_base));
     let base_len = opened.map_or(0, |v| v.1);
     let views_base = core::str::from_utf8(&views_base[..base_len]).unwrap_or("");
     let views = if opened.is_some() { borrowed(&eps.views) } else { None };
@@ -121,7 +122,7 @@ fn run_session(
     });
     let Some(built) = built else {
         log::write(b"desktop-session-mgr: session namespace FAIL\n");
-        if let (Some((id, _)), Some(sup)) = (opened, views_sup) {
+        if let (Some((id, _)), Some(sup)) = (opened, views_sup.as_ref()) {
             libsession::close_views_session(sup, id);
         }
         return;
@@ -190,7 +191,7 @@ fn run_session(
             borrowed(&eps.services),
         ],
     );
-    if let (Some((id, _)), Some(sup)) = (opened, views_sup) {
+    if let (Some((id, _)), Some(sup)) = (opened, views_sup.as_ref()) {
         libsession::close_views_session(sup, id);
     }
     // The leader is reaped, so this drops the last reference to the namespace.
@@ -227,11 +228,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     let storage = next();
     let services = next();
     let eps = Endpoints { fs, profile, tty, draw, clipboard, views, devices, storage, services };
-    let views_sup = if eps.views.is_some() {
-        resolve::<Channel, Only, _>(&root, "/svc/views/session", Rights::SEND | Rights::RECV | Rights::WAIT).ok()
-    } else {
-        None
-    };
+    let mut views_sup = None;
     // Resolved once at startup: re-resolving per attempt would mint a session per keystroke.
     let auth = resolve::<Channel, Only, _>(&root, "/svc/auth", Rights::SEND | Rights::RECV | Rights::WAIT);
     let auth_ch = match auth {
@@ -352,7 +349,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
                 (ul, authenticate_on(&auth_ch, &user[..ul], &pass[..pl], &mut home))
             };
             if let Some(hl) = authed {
-                run_session(&root, &notif, &eps, views_sup.as_ref(), &user[..ul], &home[..hl]);
+                run_session(&root, &notif, &eps, &mut views_sup, &user[..ul], &home[..hl]);
             } else {
                 log::write(b"desktop-session-mgr: login denied\n");
             }

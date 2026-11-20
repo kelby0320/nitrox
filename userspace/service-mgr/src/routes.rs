@@ -19,19 +19,25 @@ pub type BindNs = Handle<Namespace, NsMutable>;
 /// How deep each route is: a full ring answers the resolver `WouldBlock` at once.
 pub const SERVE_DEPTH: u32 = 64;
 
-/// The most requests a pass takes from one channel, so a client that keeps its ring full cannot
-/// hold this manager from its other work: a ring left non-empty signals the next wait at once.
+/// The most messages a pass takes from one channel, requests or not, so a client that keeps its ring
+/// full cannot hold this manager from its other work: a ring left non-empty signals the next wait.
 pub const PER_PASS: usize = 16;
+
+/// How deep a control channel is: shallower than [`PER_PASS`], so one look finds a peer gone.
+pub const CONTROL_DEPTH: u32 = 10;
 
 /// **A route**, reaching **one** server: one that reached any server by the suffix could not be
 /// handed to a session, since `desktop-shell` could bind it at a base of its choosing.
 pub struct Route {
+    /// Its server's index among the declarations.
     pub svc: usize,
     /// `None` for the server's own path; `Some(suffix)` for an endpoint it mints for sessions.
     pub through: Option<&'static str>,
     /// Where in the registry each resolve continues: `/<name>` or `/<name>.<suffix>`.
     pub base: String,
+    /// The end a resolve reaches: bound at the server's path, and copied to the login supervisors.
     pub client: Endpoint,
+    /// The end this manager answers on.
     pub serve: Endpoint,
     /// A derived route's endpoint as the server minted it, bound at `base`.
     pub target: Option<Endpoint>,
@@ -41,7 +47,10 @@ pub struct Route {
 
 /// Every route, kept for the boot, by its index.
 #[derive(Default)]
-pub struct Routes(pub Vec<Route>);
+pub struct Routes(
+    /// Each route, at the index [`Routes::route`] gave it.
+    pub Vec<Route>,
+);
 
 impl core::ops::Index<usize> for Routes {
     type Output = Route;
@@ -137,35 +146,79 @@ pub fn wait_codes(notif: &Handle<Notify, Only>, routes: &Routes, registry: Optio
     }
 }
 
-/// Up to [`PER_PASS`] requests from `ch`, and whether its peer has gone with none left.
+/// The requests among up to [`PER_PASS`] messages on `ch`, and whether its peer went, none left.
 pub fn take(ch: &Endpoint) -> (Vec<(u16, u64, Vec<u8>)>, bool) {
-    let mut taken = Vec::new();
-    while taken.len() < PER_PASS {
-        match recv_request(ch) {
-            Ok(Some(request)) => taken.push(request),
-            Ok(None) => return (taken, false),
-            Err(()) => return (taken, true),
+    let (mut msg, mut taken) = (Msg::new(), Vec::new());
+    for _ in 0..PER_PASS {
+        match ch.recv(&mut msg) {
+            Ok(_sent) => {
+                taken.extend(librsproto::decode(msg.payload()).ok().map(|m| (m.op, m.request_id, m.body.to_vec())))
+            }
+            Err(e) if e.code() == KError::PeerClosed => return (taken, true),
+            Err(_) => return (taken, false),
         }
     }
     (taken, false)
 }
 
-/// One message on `ch`, its handles closed: `Err(())` once **a peer that has gone** is all that is
-/// left, as a closed channel stays signalled and a caller must drop it or the wait loop would
-/// spin; `None` when none is queued. A route's cannot close.
-#[allow(clippy::result_unit_err, reason = "its one error is the peer gone, which each caller drops alike")]
-pub fn recv_request(ch: &Endpoint) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
-    let mut msg = Msg::new();
-    loop {
-        let _sent = match ch.recv(&mut msg) {
-            Ok(sent) => sent,
-            Err(e) if e.code() == KError::PeerClosed => return Err(()),
-            Err(_) => return Ok(None),
-        };
-        if let Ok(m) = librsproto::decode(msg.payload()) {
-            return Ok(Some((m.op, m.request_id, m.body.to_vec())));
+/// **Serve each channel in `list` that `pick` names**: `each`, which must leave `list` as it is, is
+/// handed what it asked and its index; one whose peer has gone is then taken out, `gone` told.
+pub fn serve_each<M>(
+    m: &mut M,
+    list: fn(&mut M) -> &mut Vec<Endpoint>,
+    pick: impl Fn(u64) -> bool,
+    mut each: impl FnMut(&mut M, usize, (u16, u64, Vec<u8>)),
+    mut gone: impl FnMut(&mut M, u64),
+) {
+    let mut k = 0;
+    while k < list(m).len() {
+        let id = list(m)[k].raw().0;
+        let (asked, closed) = if pick(id) { take(&list(m)[k]) } else { (Vec::new(), false) };
+        for request in asked {
+            each(m, k, request);
+        }
+        if closed {
+            list(m).remove(k);
+            gone(m, id);
+        } else {
+            k += 1;
         }
     }
+}
+
+/// Whether `ch`'s peer has gone: drain the endpoint until it answers.
+///
+/// `sys_channel_recv` answers `WouldBlock` when the ring is merely empty and the peer is alive,
+/// `PeerClosed` when it is empty and the peer is gone; that is what makes a control channel an exit
+/// discriminator (see `Mgr::poll`). **A drain, not a single receive**, because a receive that
+/// returns `0` has *consumed* a message: a queued message would otherwise mask the close behind it.
+/// A service that is not a server cannot send here — its control end is granted `RECV | WAIT` and
+/// no `SEND` — but **a server can**, and this is where a `Ready` lands that came after its
+/// deadline.
+///
+/// **At most [`PER_PASS`] messages**: a peer gone left no more than [`CONTROL_DEPTH`], and one still
+/// sending is alive, its death seen at the look its code brings ([`wake::deaths`](crate::wake::deaths)).
+///
+/// A message found here is reported, and **every handle it carried is closed**: a late `Ready`
+/// carries the server's endpoint, which nothing binds now, and a server whose endpoint has
+/// closed ends itself — its exit is then attributed here, as any other's.
+pub fn channel_peer_closed(ch: &Endpoint) -> bool {
+    let mut msg = Msg::new();
+    for _ in 0..PER_PASS {
+        // What came closes as `sent` drops, at the end of this pass.
+        let sent = match ch.recv(&mut msg) {
+            Ok(sent) => sent,
+            Err(e) if e.code() == KError::PeerClosed => return true,
+            Err(_) => return false, // WouldBlock (alive and quiet), or an error we cannot act on
+        };
+        let count = sent.len();
+        Line::new()
+            .s(b"service-mgr: unexpected message on a control channel (dropped, and ")
+            .u(count as u64)
+            .s(b" handle(s) it carried closed)")
+            .end();
+    }
+    false
 }
 
 #[cfg(test)]

@@ -32,12 +32,12 @@ use librsproto::server;
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::handoff::{Clock, hand_on, recv_handoff, send_handle};
 use service_mgr::registry;
-use service_mgr::routes::{Routes, SERVE_DEPTH, take};
+use service_mgr::routes::{CONTROL_DEPTH, Routes, SERVE_DEPTH, channel_peer_closed, serve_each, take};
 use service_mgr::service_toml::{self, RestartPolicy, ServiceDecl};
 use service_mgr::{services, wake};
 
 mod reaping;
-use reaping::{Ready, Reaping, channel_peer_closed, drain_codes, take_ready};
+use reaping::{Ready, Reaping, drain_codes, take_ready};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -99,7 +99,7 @@ fn create_control_channel() -> Option<(Endpoint, Endpoint)> {
     // than the number of them does not block — it **drops the last handle silently**, and the
     // send reports success. Nine handoffs go to `desktop-session-mgr`, so it is ten deep for one
     // spare. `libsession::run_leader` carries the same warning.
-    Handle::pair(10).ok()
+    Handle::pair(CONTROL_DEPTH).ok()
 }
 
 /// Send `payload` and `carried` on `ch` as an unframed message of its own; on a refusal nothing
@@ -1302,65 +1302,38 @@ impl Mgr {
     /// the one slot about to be freed. Only the handles `pick` names, by value, are read.
     fn serve_services(&mut self, pick: impl Fn(u64) -> bool) {
         let picked = |h: &Endpoint| if pick(h.raw().0) { take(h) } else { (Vec::new(), false) };
-        let mut k = 0;
-        while k < self.services.admin_sessions.len() {
-            let session = self.services.admin_sessions[k].raw().0;
-            let (asked, closed) = picked(&self.services.admin_sessions[k]);
-            for (op, request_id, body) in asked {
-                self.admin_request(session, op, request_id, &body);
+        let id = |list: &[Endpoint], k: usize| list[k].raw().0;
+        let admin = |m: &mut Mgr, k, (op, request_id, body): (u16, u64, Vec<u8>)| {
+            m.admin_request(id(&m.services.admin_sessions, k), op, request_id, &body)
+        };
+        // **What it asked goes on, unanswered.** Dropping the request instead would drop a
+        // restart's start with its answer, and leave the service stopped.
+        serve_each(
+            self,
+            |m| &mut m.services.admin_sessions,
+            &pick,
+            admin,
+            |m, session| m.held.iter_mut().filter(|h| h.session == session).for_each(|h| h.session = 0),
+        );
+        // A shutdown already asked goes on: it was answered when it began.
+        let power = |m: &mut Mgr, k, (op, request_id, body): (u16, u64, Vec<u8>)| {
+            m.power_request(id(&m.services.power_sessions, k), op, request_id, &body)
+        };
+        serve_each(self, |m| &mut m.services.power_sessions, &pick, power, |_, _| {});
+        let admin_end = |m: &mut Mgr, k, (op, request_id, _): (u16, u64, Vec<u8>)| {
+            let (held, max) = (m.services.admin_sessions.len(), services::MAX_ADMIN_SESSIONS);
+            if let Some(s) = open_session(&m.services.admin_ends[k], op, request_id, held, max) {
+                m.services.admin_sessions.push(s);
             }
-            if !closed {
-                k += 1;
-                continue;
+        };
+        serve_each(self, |m| &mut m.services.admin_ends, &pick, admin_end, |_, _| {});
+        let power_end = |m: &mut Mgr, k, (op, request_id, _): (u16, u64, Vec<u8>)| {
+            let (held, max) = (m.services.power_sessions.len(), services::MAX_POWER_SESSIONS);
+            if let Some(s) = open_session(&m.services.power_ends[k], op, request_id, held, max) {
+                m.services.power_sessions.push(s);
             }
-            self.services.admin_sessions.remove(k);
-            // **What it asked goes on, unanswered.** Dropping the request instead would drop a
-            // restart's start with its answer, and leave the service stopped.
-            for h in self.held.iter_mut().filter(|h| h.session == session) {
-                h.session = 0;
-            }
-        }
-        let mut k = 0;
-        while k < self.services.power_sessions.len() {
-            let session = self.services.power_sessions[k].raw().0;
-            let (asked, closed) = picked(&self.services.power_sessions[k]);
-            for (op, request_id, body) in asked {
-                self.power_request(session, op, request_id, &body);
-            }
-            // A shutdown already asked goes on: it was answered when it began.
-            k += !closed as usize;
-            if closed {
-                self.services.power_sessions.remove(k);
-            }
-        }
-        let mut k = 0;
-        while k < self.services.admin_ends.len() {
-            let (asked, closed) = picked(&self.services.admin_ends[k]);
-            for (op, request_id, _) in asked {
-                let (held, max) = (self.services.admin_sessions.len(), services::MAX_ADMIN_SESSIONS);
-                if let Some(s) = open_session(&self.services.admin_ends[k], op, request_id, held, max) {
-                    self.services.admin_sessions.push(s);
-                }
-            }
-            k += !closed as usize;
-            if closed {
-                self.services.admin_ends.remove(k);
-            }
-        }
-        let mut k = 0;
-        while k < self.services.power_ends.len() {
-            let (asked, closed) = picked(&self.services.power_ends[k]);
-            for (op, request_id, _) in asked {
-                let (held, max) = (self.services.power_sessions.len(), services::MAX_POWER_SESSIONS);
-                if let Some(s) = open_session(&self.services.power_ends[k], op, request_id, held, max) {
-                    self.services.power_sessions.push(s);
-                }
-            }
-            k += !closed as usize;
-            if closed {
-                self.services.power_ends.remove(k);
-            }
-        }
+        };
+        serve_each(self, |m| &mut m.services.power_ends, &pick, power_end, |_, _| {});
         let (asked, closed) = self.services.serve.as_ref().map_or((Vec::new(), false), picked);
         for (op, request_id, body) in asked {
             let minted =

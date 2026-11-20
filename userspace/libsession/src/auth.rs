@@ -1,8 +1,8 @@
 //! Authenticating against auth-service, and a session's registration with the view broker.
 
 use core::sync::atomic::{AtomicU64, Ordering};
-use libkern::{Secret, scrub};
-use libos::{Channel, Msg, Only, Ref};
+use libkern::{KError, Rights, Secret, scrub};
+use libos::{CanLookup, Channel, Handle, Msg, Namespace, Only, Ref};
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
 use librsproto::{OP_AUTHENTICATE, decode};
 
@@ -76,6 +76,26 @@ pub fn open_views_session<'a>(
     base_out[..3].copy_from_slice(b"/s/");
     base_out[3..3 + d.len()].copy_from_slice(d);
     Some((id, 3 + d.len()))
+}
+
+/// [`open_views_session`] over `sup`, the broker's supervisor endpoint, **resolved from `root` again
+/// when there is none or its broker has gone**, told by reading what a failed call left, at most 64.
+pub fn open_views_session_from<'a, M: CanLookup + 'a>(
+    root: impl Into<Ref<'a, Namespace, M>>,
+    sup: &mut Option<Handle<Channel, Only>>,
+    principal: &[u8],
+    base_out: &mut [u8; 24],
+) -> Option<(u64, usize)> {
+    let held = sup.as_ref().and_then(|s| open_views_session(s, principal, base_out));
+    let mut msg = Msg::new();
+    let gone = |s: &Handle<Channel, Only>| {
+        (0..64).find_map(|_| s.recv(&mut msg).err()).is_some_and(|e| e.code() == KError::PeerClosed)
+    };
+    if held.is_some() || !sup.as_ref().is_none_or(gone) {
+        return held;
+    }
+    *sup = crate::resolve(root, "/svc/views/session", Rights::SEND | Rights::RECV | Rights::WAIT).ok();
+    open_views_session(sup.as_ref()?, principal, base_out)
 }
 
 /// Tell the view broker that session `id` has ended. **The supervisor's job**: a program in a view

@@ -100,34 +100,3 @@ pub(crate) fn drain_codes(notif: Option<&Handle<Notify, Only>>, codes: &mut Vec<
         codes.push(code);
     }
 }
-
-/// Whether `ch`'s peer has gone: drain the endpoint until it answers.
-///
-/// `sys_channel_recv` answers `WouldBlock` when the ring is merely empty and the peer is alive,
-/// `PeerClosed` when it is empty and the peer is gone; that is what makes a control channel an exit
-/// discriminator (see [`Mgr::poll`]). **A drain, not a single receive**, because a receive that
-/// returns `0` has *consumed* a message: a queued message would otherwise mask the close behind it.
-/// A service that is not a server cannot send here — its control end is granted `RECV | WAIT` and
-/// no `SEND` — but **a server can**, and this is where a `Ready` lands that came after its
-/// deadline.
-///
-/// A message found here is reported, and **every handle it carried is closed**: a late `Ready`
-/// carries the server's endpoint, which nothing binds now, and a server whose endpoint has
-/// closed ends itself — its exit is then attributed here, as any other's.
-pub(crate) fn channel_peer_closed(ch: &Endpoint) -> bool {
-    let mut msg = Msg::new();
-    loop {
-        // What came closes as `sent` drops, at the end of this pass.
-        let sent = match ch.recv(&mut msg) {
-            Ok(sent) => sent,
-            Err(e) if e.code() == KError::PeerClosed => return true,
-            Err(_) => return false, // WouldBlock (alive and quiet), or an error we cannot act on
-        };
-        let count = sent.len();
-        Line::new()
-            .s(b"service-mgr: unexpected message on a control channel (dropped, and ")
-            .u(count as u64)
-            .s(b" handle(s) it carried closed)")
-            .end();
-    }
-}

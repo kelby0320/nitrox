@@ -5,6 +5,7 @@
 //! `cargo test`. See `docs/architecture/service-manager.md`.
 
 #![cfg_attr(not(test), no_std)]
+#![deny(missing_docs)]
 
 extern crate alloc;
 
@@ -309,7 +310,9 @@ pub mod services {
     /// What `decide` needs of the service a request names.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]
     pub struct Found {
+        /// Its declaration says `essential`: it is never stopped or restarted on request.
         pub essential: bool,
+        /// Its process runs.
         pub running: bool,
         /// Whether its policy has a restart scheduled: it exited, and its backoff is not over.
         pub restart_due: bool,

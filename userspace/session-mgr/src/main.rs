@@ -115,7 +115,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     let notif = notif_handle.as_ref();
     let root: Option<Handle<Namespace, NsReadOnly>> = start.root.take();
     let ctrl: Option<Endpoint> = start.take_handle0();
-    // Positional: service-mgr sends an empty message for an endpoint that did not come up, so
+    // Positional: service-mgr sends an empty message for an endpoint it does not have, so
     // none shifts. All but the first two are `service-mgr`'s routes, which outlive a restart.
     let fs_endpoint = recv_handoff(ctrl.as_ref(), notif);
     let profile_endpoint = recv_handoff(ctrl.as_ref(), notif);
@@ -141,13 +141,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         log::write(b"session-mgr: no profile endpoint -- sessions will have no /bin\n");
     }
     log::write(b"session-mgr: received fs + profile endpoints; auth resolved from /svc/auth\n");
-    // Resolved once. A broker session opened per login and closed at logout is the broker's only
-    // way to know it ended.
-    let views_sup =
-        views_endpoint.as_ref().and_then(|_| resolve::<Channel, Only, _>(&root, "/svc/views/session", rights).ok());
-    if views_endpoint.is_some() && views_sup.is_none() {
-        log::write(b"session-mgr: /svc/views/session resolve FAIL; sessions will have no `with`\n");
-    }
+    let mut views_sup = None;
 
     let mut home = [0u8; 256];
     let mut user = [0u8; 64];
@@ -158,9 +152,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
             Some((hl, ul)) => 'session: {
                 Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
                 let mut views_base = [0u8; 24];
-                let views = views_sup
-                    .as_ref()
-                    .and_then(|sup| libsession::open_views_session(sup, &user[..ul], &mut views_base));
+                let views = views_endpoint.as_ref().and_then(|_| {
+                    libsession::open_views_session_from(&root, &mut views_sup, &user[..ul], &mut views_base)
+                });
+                if views_endpoint.is_some() && views.is_none() {
+                    log::write(b"session-mgr: no view broker session -- this session has no `with`\n");
+                }
                 let built = core::str::from_utf8(&home[..hl]).ok().and_then(|home| {
                     build_namespace(&Members {
                         root_ns: Some(root.as_ref()),
