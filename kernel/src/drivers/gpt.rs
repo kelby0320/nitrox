@@ -177,7 +177,7 @@ fn publish_partition(disk: &Ref<DeviceNode>, p: &partitions::Part, names: Names,
             p.count,
             mbr_kind
         );
-        crate::device::register_partition(node_ref, disk, "mbr");
+        crate::device::register_partition(node_ref, disk, "mbr", [0; 16]);
         return true;
     };
     // **The label, by name**: a partition is found by its label (`init.toml`'s `gpt-partlabel:`),
@@ -198,7 +198,7 @@ fn publish_partition(disk: &Ref<DeviceNode>, p: &partitions::Part, names: Names,
         record(PartEntry { node: node_ref.clone(), by_partuuid: uuid, by_partlabel, boot_medium });
     }
     // The device table owns the node (it also resolves at /dev/blk/<n>) and records its disk.
-    crate::device::register_partition(node_ref, disk, "gpt");
+    crate::device::register_partition(node_ref, disk, "gpt", *guid);
     true
 }
 

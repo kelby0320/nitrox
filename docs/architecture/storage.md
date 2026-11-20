@@ -152,12 +152,13 @@ source names a partition by one of the two schemes `init` accepts
   of its partitions. Matching only the first published would take a SATA partition that copies
   the live root's label for `init`'s root, call the boot an installed one, and mount the real
   root again.
-- **`gpt-partuuid:<uuid>`** is read from the parent disk's own table, since the registry does not
-  carry a partition's GUID. The kernel publishes a disk's partitions in table order, skipping unused
-  entries, so the k-th entry in use is the k-th partition record under that disk. Its name and size
-  confirm the match, and a position they contradict is no match. The UUID is compared in the form
-  the kernel names the path with, exactly, as `init`'s lookup is. Two disks carrying it are chosen
-  between as for a label.
+- **`gpt-partuuid:<uuid>`** is the GPT partition whose registry record carries that unique GUID
+  (`device-node.md`), compared in the form the kernel names the path with, exactly, as `init`'s
+  lookup is. An MBR partition has none. Two disks carrying it are chosen between as for a label.
+  **The service reads no table of its own**: until pre-Phase-7 Part H.3 it read the parent disk's
+  through `libgpt`, which reads some tables differently from the kernel, and an unlabelled root, a
+  ninth partition or a table whose CRC failed left `init`'s root unmatched and nothing
+  auto-mounted.
 
 **`init`'s mounts stay `init`'s**: reported, never mounted again, never unmounted by this service.
 `init` unmounts them itself at a shutdown (Part E.4a).

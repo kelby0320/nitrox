@@ -13,7 +13,8 @@ USB devices arrived with Phase 6 Part A.3 (2026-10-02): the `UsbDevice` kind, an
 `port` and `speed`. USB disks, MBR partitions and the `BOOT` flag arrived with Phase 6 Part D
 (2026-10-06). `/dev/registry/io` and a node's I/O counters arrived with Phase 6 Part H.2
 (2026-10-08); its version 2, with the pages the page cache's fills bring in, with Part H.4
-(2026-10-09).
+(2026-10-09). A record's `guid`, a GPT partition's unique GUID, arrived with registry version 3
+(pre-Phase-7 Part H.3, 2026-11-20).
 
 ## The DeviceNode object
 
@@ -290,14 +291,14 @@ kernel in **the root namespace only**, with `/dev/blk`'s rights. (Administration
 #[repr(C)]
 pub struct RegistryHeader {   // 24 bytes, align 8
     pub magic: u32,           // REGISTRY_MAGIC, "DREG" little-endian
-    pub version: u32,         // REGISTRY_VERSION = 2 (Phase 6 Part C; 1 had no generation)
+    pub version: u32,         // REGISTRY_VERSION = 3 (2 had no guid; 1, no generation)
     pub count: u32,           // how many records follow: THE LENGTH
-    pub record_size: u32,     // size_of::<DeviceRecord>() = 144
+    pub record_size: u32,     // size_of::<DeviceRecord>() = 160
     pub generation: u64,      // bumped once by every change: a registration, or a departure
 }
 
 #[repr(C)]
-pub struct DeviceRecord {     // 144 bytes, align 8
+pub struct DeviceRecord {     // 160 bytes, align 8
     pub id: u32,              // its place in the table: /dev/registry/<id>
     pub class: u32,           // DeviceClass
     pub kind: u32,            // DeviceKind, below
@@ -316,8 +317,15 @@ pub struct DeviceRecord {     // 144 bytes, align 8
     pub driver: [u8; 16],                                   // the publishing or claiming driver
     pub name: [u8; 72],       // model and serial, label, module path, USB product and serial,
                               // or "keyboard"
+    pub guid: [u8; 16],       // a GPT partition's unique GUID, in the table's byte order; else 0
 }
 ```
+
+**A GPT partition's record carries its unique GUID**, the one `/dev/disk/by-partuuid/<uuid>` names
+it by, in the table's byte order: the first three fields little-endian, as the entry stores them.
+Every other node's, an MBR partition's included, is zero. A reader matching `gpt-partuuid:` reads
+it here, as the storage service does, rather than read the disk's table itself: two readers of one
+table can disagree on an entry the kernel published.
 
 `DeviceKind`: `Unknown` 0, `PciFunction` 1, `Disk` 2, `Partition` 3, `RamDisk` 4, `Keyboard` 5,
 `Mouse` 6, `Console` 7, `UsbDevice` 8. A value a reader does not name reads as `Unknown`.

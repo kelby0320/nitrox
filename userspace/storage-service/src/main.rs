@@ -64,7 +64,7 @@ use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_READY, OP_UNMOUNT, RS_FLAG_
 use storage_service::fit::{SCRATCH, ScratchRead, scratch_read};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
-use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
+use storage_service::sources::{InitMount, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
 use storage_service::watch::{Sent, Watches};
@@ -973,22 +973,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     };
 
     let mut devices = Vec::new();
-    let mut tables = Vec::new();
     let mut nodes = Vec::new();
     for (record, node) in held {
         let io = DeviceIo::new(&node, &record, &scratch);
-        if matches!(record.kind(), DeviceKind::Disk | DeviceKind::RamDisk)
-            && let Some(t) = read_table(&io, record.id)
-        {
-            tables.push(t);
-        }
         devices.push(Device { found: probe_record(&io, &record), record });
         nodes.push((record.id, node));
     }
     let records: Vec<DeviceRecord> = devices.iter().map(|d| d.record).collect();
 
     let init_list: Option<Vec<InitMount>> = match read_manifest(&root) {
-        Ok(m) => Some(init_mounts(&m, &records, &tables)),
+        Ok(m) => Some(init_mounts(&m, &records)),
         Err(why) => {
             Line::new()
                 .s(b"storage-service: init.toml could not be read (")

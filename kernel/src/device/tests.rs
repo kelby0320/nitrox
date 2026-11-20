@@ -57,13 +57,18 @@ fn booted() -> (Registry, Ref<DeviceNode>, Ref<DeviceNode>) {
     let disk = block(pci_at(0, 0x1f, 2), BlockKind::Disk, b"QEMU HARDDISK (QM00001)", 1 << 20);
     assert!(r.add_block(disk.clone(), "ahci"));
     assert!(r.add_block(block(ResourceDescriptor::ZERO, BlockKind::RamDisk, b"module 0 (root.img)", 64), "ramdisk"));
-    assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"nitrox-root", 1 << 19), &disk, "gpt"));
+    let root = block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"nitrox-root", 1 << 19);
+    assert!(r.add_block_child(root, &disk, "gpt", ROOT_GUID));
     assert!(r.add_char(char_node(), DeviceKind::Console, NOT_SERVED, "console"));
     let keyboard = char_node();
     assert!(r.add_char(keyboard.clone(), DeviceKind::Keyboard, 0, "i8042"));
     assert!(r.add_char(char_node(), DeviceKind::Mouse, 1, "i8042"));
     (r, disk, keyboard)
 }
+
+/// The root partition's unique GUID in [`booted`].
+const ROOT_GUID: [u8; 16] =
+    [0x7a, 0x5f, 0x1e, 0x0b, 0x2d, 0x3c, 0x8f, 0x4e, 0x9a, 0x6b, 0x5c, 0x4d, 0x3e, 0x2f, 0x1a, 0x0b];
 
 fn text(bytes: &[u8], len: u32) -> &str {
     core::str::from_utf8(&bytes[..len as usize]).unwrap()
@@ -105,6 +110,26 @@ fn a_record_per_node_with_its_kind_served_index_and_parent() {
     assert_eq!(text(&recs[5].driver, 3), "gpt");
     assert_eq!(text(&recs[7].name, recs[7].name_len), "keyboard");
     assert_eq!(recs[4].vendor, 0xFFFF, "the RAM disk is no PCI device");
+}
+
+/// **A GPT partition's record carries its unique GUID**, which `by-partuuid` names it by, and no
+/// other node's carries one: a reader matching `gpt-partuuid:` needs no table of its own.
+#[test]
+fn a_partitions_record_carries_its_unique_guid_and_no_other_does() {
+    init_global_heap();
+    let (mut r, _, _) = booted();
+    let stick = block(ResourceDescriptor::ZERO, BlockKind::Disk, b"stick", 1 << 15);
+    assert!(r.add_block(stick.clone(), "usb-storage"));
+    let part = block(ResourceDescriptor::ZERO, BlockKind::Partition, b"partition 1 (unlabelled)", 1 << 14);
+    assert!(r.add_block_child(part, &stick, "mbr", [0; 16]));
+    let recs = r.records(|_| None).unwrap();
+    for x in recs.iter() {
+        let partition = DeviceKind::from_u32(x.kind) == DeviceKind::Partition && x.driver[..3] == *b"gpt";
+        assert_eq!(x.guid, if partition { ROOT_GUID } else { [0; 16] }, "record {}", x.id);
+    }
+    let snapshot = r.snapshot_bytes(|_| None).unwrap();
+    let at = core::mem::size_of::<RegistryHeader>() + 5 * core::mem::size_of::<DeviceRecord>() + 144;
+    assert_eq!(snapshot[at..at + 16], ROOT_GUID, "at its offset in the snapshot");
 }
 
 /// **A USB keyboard or mouse takes the next index after every input node's**: 2 and 3 beside
@@ -274,7 +299,7 @@ fn a_disks_children_are_its_present_partitions() {
     assert!(r.depart(5));
     assert!(r.node(disk_id).is_some(), "departing a partition leaves its disk");
     assert!(r.children(disk_id).unwrap().is_empty(), "a departed partition is no child");
-    assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"new", 1 << 18), &disk, "gpt"));
+    assert!(r.add_block_child(block(pci_at(0, 0x1f, 2), BlockKind::Partition, b"new", 1 << 18), &disk, "gpt", [7; 16]));
     let after = r.children(disk_id).unwrap();
     assert_eq!(after.len(), 1);
     assert!(after[0] > 8, "published afresh, at a new id: {}", after[0]);
@@ -341,7 +366,7 @@ fn a_disk_under_a_usb_device_departs_with_it() {
     let at = r.len() as u32;
     assert!(r.add_block_under(stick.clone(), kbd, "usb-storage"));
     let part = block(ResourceDescriptor::ZERO, BlockKind::Partition, b"partition 1 (unlabelled)", 1 << 14);
-    assert!(r.add_block_child(part, &stick, "mbr"));
+    assert!(r.add_block_child(part, &stick, "mbr", [0; 16]));
     let recs = r.records(|_| None).unwrap();
     assert_eq!((recs[at as usize].parent, recs[at as usize + 1].parent), (kbd, at));
     r.depart(kbd);

@@ -118,7 +118,7 @@ All bodies are little-endian.
 
 ### `Arrived` (`0x0F00`) — manager → owner
 
-**Unsolicited, `request_id` 0.** Body: the device's registry record, exactly 144 bytes, as
+**Unsolicited, `request_id` 0.** Body: the device's registry record, exactly 160 bytes, as
 `/dev/registry` serves it (`DeviceRecord` in
 [`device-node.md`](device-node.md#the-registry-devregistry)). `handles[0]`: the device's node,
 with `READ | WRITE | DUPLICATE | INSPECT | TRANSFER` — `/dev/blk`'s authority, the most any class

@@ -10,7 +10,7 @@ use libstream::wire::{Table, Value};
 use crate::labels;
 use crate::mounts::{Plan, Refusal, Server, at, automount, explicit, in_use};
 use crate::probe::{Found, fat_label, probe};
-use crate::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot, partuuid, source_device};
+use crate::sources::{InitMount, init_known, init_mounts, live_boot, partuuid, source_device};
 use crate::suffix::{self, Asked, session_only};
 use crate::table::{self, By, Device, Mounted};
 
@@ -115,6 +115,7 @@ pub(crate) fn rec(id: u32, kind: DeviceKind, served: u32, parent: u32, name: &st
         block_count: blocks,
         driver: [0; 16],
         name: [0; 72],
+        guid: [0; 16],
     };
     r.name[..name.len()].copy_from_slice(name.as_bytes());
     r
@@ -140,12 +141,26 @@ fn guid(first: u8) -> [u8; 16] {
     g
 }
 
-fn release_tables() -> Vec<DiskTable> {
-    let entry = |g: u8, name: &str, blocks: u64| TableEntry { guid: guid(g), name: name.as_bytes().to_vec(), blocks };
-    std::vec![
-        DiskTable { disk: 3, entries: std::vec![entry(0x10, "ESP", 65_536), entry(0x20, "nitrox-root", 196_541)] },
-        DiskTable { disk: 5, entries: std::vec![entry(0x30, "nitrox-live", 131_000)] },
-    ]
+/// `r` as the kernel publishes a GPT entry: its driver `gpt`, and its unique GUID [`guid`]`(g)`.
+fn gpt(mut r: DeviceRecord, g: u8) -> DeviceRecord {
+    r.driver[..3].copy_from_slice(b"gpt");
+    r.guid = guid(g);
+    r
+}
+
+/// [`release_records`], each partition a GPT entry: the ESP `0x10`, the root `0x20`, the RAM
+/// disk's `0x30`.
+fn release_gpt_records() -> Vec<DeviceRecord> {
+    let parts = [(2, 0x10), (3, 0x20), (4, 0x30)];
+    let mut records = release_records();
+    for (at, g) in parts {
+        records[at] = gpt(records[at], g);
+    }
+    records
+}
+
+fn uuid(g: u8) -> String {
+    std::format!("gpt-partuuid:{}", partuuid(&guid(g)))
 }
 
 fn mount(point: &str, source: &str, mode: Mode, device: Option<u32>) -> InitMount {
@@ -167,12 +182,11 @@ fn a_label_source_is_the_first_partition_with_that_name() {
     let mut records = release_records();
     records.insert(0, rec(2, DeviceKind::Disk, 9, NO_PARENT, "nitrox-root", 1)); // a disk, not a partition
     records.push(rec(9, DeviceKind::Partition, 5, 3, "nitrox-root", 1)); // published later
-    let tables = release_tables();
-    assert_eq!(source_device("gpt-partlabel:nitrox-root", &records, &tables), Some(7));
-    assert_eq!(source_device("gpt-partlabel:ESP", &records, &tables), Some(6));
-    assert_eq!(source_device("gpt-partlabel:nothing", &records, &tables), None);
-    assert_eq!(source_device("gpt-partlabel:", &records, &tables), None);
-    assert_eq!(source_device("device-path:/dev/blk/3", &records, &tables), None, "not a scheme init accepts");
+    assert_eq!(source_device("gpt-partlabel:nitrox-root", &records), Some(7));
+    assert_eq!(source_device("gpt-partlabel:ESP", &records), Some(6));
+    assert_eq!(source_device("gpt-partlabel:nothing", &records), None);
+    assert_eq!(source_device("gpt-partlabel:", &records), None);
+    assert_eq!(source_device("device-path:/dev/blk/3", &records), None, "not a scheme init accepts");
 }
 
 /// As the kernel binds a name two partitions carry: the boot medium's, whichever was published
@@ -181,49 +195,55 @@ fn a_label_source_is_the_first_partition_with_that_name() {
 fn a_name_two_partitions_carry_is_the_boot_mediums() {
     let mut records = release_records();
     records[3] = rec(7, DeviceKind::Partition, 3, 3, "nitrox-live", 196_541);
-    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(8), "the RAM disk's, published after");
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records), Some(8), "the RAM disk's, published after");
     records[1] = rec(5, DeviceKind::Disk, 1, NO_PARENT, "root.img", 131_072);
-    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(7), "neither on it: the first");
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records), Some(7), "neither on it: the first");
     records[1].flags = libkern::device::BOOT;
-    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(8), "the disk started from");
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records), Some(8), "the disk started from");
     records[1].driver[..crate::mounts::USB_STORAGE.len()].copy_from_slice(crate::mounts::USB_STORAGE);
-    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records, &[]), Some(7), "a stick's is named nothing");
+    assert_eq!(source_device("gpt-partlabel:nitrox-live", &records), Some(7), "a stick's is named nothing");
 
-    let tables = release_tables();
-    let mut copied = release_tables();
-    let ram_root = copied[1].entries[0].guid;
-    copied[0].entries[1].guid = ram_root;
-    let uuid = std::format!("gpt-partuuid:{}", partuuid(&ram_root));
-    assert_eq!(source_device(&uuid, &release_records(), &tables), Some(8));
-    assert_eq!(source_device(&uuid, &release_records(), &copied), Some(8), "the SATA root copying its GUID");
+    let mut copied = release_gpt_records();
+    copied[3].guid = guid(0x30);
+    assert_eq!(source_device(&uuid(0x30), &release_gpt_records()), Some(8));
+    assert_eq!(source_device(&uuid(0x30), &copied), Some(8), "the SATA root copying its GUID");
+    copied[1].driver[..crate::mounts::USB_STORAGE.len()].copy_from_slice(crate::mounts::USB_STORAGE);
+    assert_eq!(source_device(&uuid(0x30), &copied), Some(7), "a stick's is named nothing");
 }
 
+/// **A GUID names the GPT partition whose record carries it**, however the kernel names the
+/// partition and however many the disk holds, as `init` finds it at `by-partuuid`. Read from a
+/// table of its own, an unlabelled root, one named outside ASCII, a ninth partition, an entry not
+/// 128 bytes or a table whose CRC failed went unmatched, and nothing was auto-mounted.
 #[test]
-fn a_uuid_source_is_found_through_its_disks_table() {
-    let (records, tables) = (release_records(), release_tables());
-    let uuid = |g: u8| std::format!("gpt-partuuid:{}", partuuid(&guid(g)));
-    assert_eq!(source_device(&uuid(0x10), &records, &tables), Some(6));
-    assert_eq!(source_device(&uuid(0x20), &records, &tables), Some(7));
-    assert_eq!(source_device(&uuid(0x30), &records, &tables), Some(8), "the RAM disk's partition");
-    assert_eq!(source_device(&uuid(0x40), &records, &tables), None, "no table has it");
+fn a_uuid_source_is_the_partition_whose_record_carries_it() {
+    let mut records = release_gpt_records();
+    assert_eq!(source_device(&uuid(0x10), &records), Some(6));
+    assert_eq!(source_device(&uuid(0x20), &records), Some(7));
+    assert_eq!(source_device(&uuid(0x30), &records), Some(8), "the RAM disk's partition");
+    assert_eq!(source_device(&uuid(0x40), &records), None, "no partition carries it");
     let upper = uuid(0x20).to_uppercase().replace("GPT-PARTUUID", "gpt-partuuid");
-    assert_eq!(source_device(&upper, &records, &tables), None, "init's lookup is exact, and so is this");
+    assert_eq!(source_device(&upper, &records), None, "init's lookup is exact, and so is this");
+    records[3] = gpt(rec(7, DeviceKind::Partition, 3, 3, "partition 2 (unlabelled)", 196_541), 0x20);
+    assert_eq!(source_device(&uuid(0x20), &records), Some(7), "unlabelled, or named outside ASCII");
+    for n in 0..7 {
+        records.push(gpt(rec(10 + n, DeviceKind::Partition, 5 + n, 3, "", 8), 0x80 + n as u8));
+    }
+    assert_eq!(source_device(&uuid(0x86), &records), Some(16), "the disk's ninth partition");
+    records[3].guid = guid(0x21);
+    assert_eq!(source_device(&uuid(0x20), &records), None, "its label is no GUID");
 }
 
+/// **An MBR entry has no GUID, and a GPT one with a zero GUID is still bound by it**, as the
+/// kernel binds every GPT entry it publishes and none of an MBR's.
 #[test]
-fn a_uuid_whose_partition_disagrees_is_unmatched() {
-    let records = release_records();
-    let uuid = std::format!("gpt-partuuid:{}", partuuid(&guid(0x20)));
-    let mut renamed = release_tables();
-    renamed[0].entries[1].name = b"other".to_vec();
-    assert_eq!(source_device(&uuid, &records, &renamed), None, "the name differs");
-    let mut resized = release_tables();
-    resized[0].entries[1].blocks += 1;
-    assert_eq!(source_device(&uuid, &records, &resized), None, "the size differs");
-    // A table with more entries than the kernel published partitions for: nothing at position 2.
-    let mut longer = release_tables();
-    longer[0].entries.insert(0, TableEntry { guid: guid(0x50), name: b"lost".to_vec(), blocks: 1 });
-    assert_eq!(source_device(&uuid, &records, &longer), None);
+fn a_uuid_names_a_gpt_entry_and_no_mbr_one() {
+    let zero = std::format!("gpt-partuuid:{}", partuuid(&[0; 16]));
+    let mut records = release_records();
+    records[3].driver[..3].copy_from_slice(b"mbr");
+    assert_eq!(source_device(&zero, &records), None, "an MBR entry");
+    records[3].driver[..3].copy_from_slice(b"gpt");
+    assert_eq!(source_device(&zero, &records), Some(7), "a GPT entry whose GUID is zero");
 }
 
 #[test]
@@ -231,8 +251,12 @@ fn init_toml_is_matched_to_its_devices() {
     let toml = "[[mount]]\nfs_server = \"fs-server-ext4\"\ndevice = \"gpt-partlabel:nitrox-root\"\n\
                 mount_point = \"/\"\nmode = \"rw\"\nrequired_for = \"boot\"\n";
     let m = manifest::parse(toml).unwrap();
-    let mounts = init_mounts(&m, &release_records(), &release_tables());
+    let mounts = init_mounts(&m, &release_records());
     assert_eq!(mounts, [mount("/", "gpt-partlabel:nitrox-root", Mode::Rw, Some(7))]);
+    let by_uuid = toml.replace("gpt-partlabel:nitrox-root", &uuid(0x20));
+    let mounts = init_mounts(&manifest::parse(&by_uuid).unwrap(), &release_gpt_records());
+    assert_eq!(mounts, [mount("/", &uuid(0x20), Mode::Rw, Some(7))]);
+    assert!(init_known(Some(&mounts)), "a root named by its GUID is known");
 }
 
 #[test]

@@ -75,18 +75,6 @@ pub(super) fn take_block(root: &Root) -> Result<(Chan, Vec<(DeviceRecord, Node)>
     }
 }
 
-pub(super) fn read_table(io: &DeviceIo, disk: u32) -> Option<DiskTable> {
-    let mut front = alloc::vec![0u8; libgpt::table::FRONT_BYTES];
-    io.read_at(0, &mut front).ok()?;
-    let t = libgpt::table::read(&front).ok()?;
-    let entries = t
-        .partitions()
-        .iter()
-        .map(|p| TableEntry { guid: p.unique_guid, name: p.name().to_vec(), blocks: p.blocks() })
-        .collect();
-    Some(DiskTable { disk, entries })
-}
-
 /// `init`'s manifest, or why it could not be read: each way it can fail says so.
 pub(super) fn read_manifest(root: &Root) -> Result<manifest::Manifest, &'static [u8]> {
     // `INSPECT` as well as `MAP_READ`: the object's size comes from `stat`.

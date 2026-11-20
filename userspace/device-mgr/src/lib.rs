@@ -551,6 +551,7 @@ mod tests {
             block_count: 0,
             driver: [0; 16],
             name: [0; 72],
+            guid: [0; 16],
         };
         r.name[..name.len()].copy_from_slice(name.as_bytes());
         r

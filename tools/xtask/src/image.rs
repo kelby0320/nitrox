@@ -351,6 +351,10 @@ pub(crate) fn live_test_initramfs_path() -> PathBuf {
 
 pub(crate) const ROOT_PARTLABEL: &str = "nitrox-root";
 
+/// **A test disk names its root by its GUID**, which its table is built with, so every boot of one
+/// holds `gpt-partuuid:` from `init`'s mount to the storage service's knowing it is `init`'s.
+pub(crate) const TEST_ROOT_PARTUUID: &str = "0b1e5f7a-2d3c-4e8f-9a6b-5c4d3e2f1a0b";
+
 /// The root partition's label inside `root.img`: **distinct on purpose**, so an installed machine
 /// and a stick never answer to one name.
 pub(crate) const LIVE_ROOT_PARTLABEL: &str = "nitrox-live";
@@ -507,12 +511,14 @@ fn test_preamble() -> String {
 pub(crate) fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
     let mut buf = Vec::new();
     let mut init_toml = String::from(INIT_TOML);
+    let disk = format!("device = \"gpt-partlabel:{ROOT_PARTLABEL}\"");
+    if init_toml.matches(&disk).count() != 1 {
+        return Err(format!("INIT_TOML no longer names its root as {disk:?} exactly once").into());
+    }
     if root == RootDevice::Live {
-        let disk = format!("device = \"gpt-partlabel:{ROOT_PARTLABEL}\"");
-        if init_toml.matches(&disk).count() != 1 {
-            return Err(format!("INIT_TOML no longer names its root as {disk:?} exactly once").into());
-        }
         init_toml = init_toml.replace(&disk, &format!("device = \"gpt-partlabel:{LIVE_ROOT_PARTLABEL}\""));
+    } else if mode.stages_test_data() {
+        init_toml = init_toml.replace(&disk, &format!("device = \"gpt-partuuid:{TEST_ROOT_PARTUUID}\""));
     }
     if mode.stages_test_data() {
         init_toml = format!("{}{init_toml}{TEST_BINDS_TOML}", test_preamble());
@@ -570,7 +576,8 @@ pub(crate) fn assemble_image(
     // 2. GPT: an ESP (FAT32, `ESP_SIZE_MIB` from 1 MiB) and the ext4 `nitrox-root` filling the
     // rest. The GPT driver binds every non-empty entry (no type-GUID filter) as
     // `/dev/disk/by-partlabel/nitrox-root`.
-    run(Command::new("sgdisk")
+    let mut sgdisk = Command::new("sgdisk");
+    sgdisk
         .arg("--clear")
         .arg("-n")
         .arg(format!("1:2048:+{ESP_SIZE_MIB}M")) // ESP: LBA 2048 (1 MiB), bounded
@@ -583,8 +590,11 @@ pub(crate) fn assemble_image(
         .arg("-t")
         .arg("2:8300") // Linux filesystem
         .arg("-c")
-        .arg("2:nitrox-root")
-        .arg(out))?;
+        .arg("2:nitrox-root");
+    if mode.stages_test_data() {
+        sgdisk.arg("-u").arg(format!("2:{TEST_ROOT_PARTUUID}"));
+    }
+    run(sgdisk.arg(out))?;
 
     let (esp_lba, esp_sectors) = partition_extent(out, 1)?;
     let (root_lba, root_sectors) = partition_extent(out, 2)?;

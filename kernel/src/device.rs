@@ -50,6 +50,8 @@ struct Entry {
     driver: &'static str,
     /// For a USB device, what its record carries that its node cannot say.
     usb: Option<UsbFacts>,
+    /// A GPT partition's unique GUID, in the table's byte order; zero for every other node.
+    guid: [u8; 16],
     /// The device has left: its record says so, and its paths answer `NotFound`.
     departed: bool,
     /// **The disk the machine started from**: its GPT's GUID is the one Limine
@@ -188,6 +190,7 @@ impl Registry {
             usb: None,
             departed: false,
             boot: false,
+            guid: [0; 16],
         })
     }
 
@@ -202,10 +205,20 @@ impl Registry {
 
     /// Append a block node that belongs to `parent`, a node already in the table: a partition and
     /// its disk. A `parent` the table does not hold records no parent.
-    pub fn add_block_child(&mut self, node: Ref<DeviceNode>, parent: &Ref<DeviceNode>, driver: &'static str) -> bool {
+    pub fn add_block_child(
+        &mut self,
+        node: Ref<DeviceNode>,
+        parent: &Ref<DeviceNode>,
+        driver: &'static str,
+        guid: [u8; 16],
+    ) -> bool {
         let parent =
             self.entries.iter().position(|e| e.node.as_ptr() == parent.as_ptr()).map_or(NO_PARENT, |i| i as u32);
-        self.add_block_under(node, parent, driver)
+        let added = self.add_block_under(node, parent, driver);
+        if added && let Some(e) = self.entries.last_mut() {
+            e.guid = guid;
+        }
+        added
     }
 
     /// **Append a block node under the entry `parent`**, by id: a USB disk under its `UsbDevice`
@@ -218,12 +231,22 @@ impl Registry {
             BlockKind::RamDisk => DeviceKind::RamDisk,
             BlockKind::Unknown => DeviceKind::Unknown,
         };
-        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false })
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false, guid: [0; 16] })
     }
 
     /// Append a character node: the console, or an i8042 device at `/dev/input/raw/<served>`.
     pub fn add_char(&mut self, node: Ref<DeviceNode>, kind: DeviceKind, served: u32, driver: &'static str) -> bool {
-        self.push(Entry { node, kind, served, parent: NO_PARENT, driver, usb: None, departed: false, boot: false })
+        self.push(Entry {
+            node,
+            kind,
+            served,
+            parent: NO_PARENT,
+            driver,
+            usb: None,
+            departed: false,
+            boot: false,
+            guid: [0; 16],
+        })
     }
 
     /// Append a keyboard or mouse a USB device provides, under `parent`, the
@@ -239,7 +262,7 @@ impl Registry {
     ) -> Option<u32> {
         let served = self.next_input_index();
         let parent = parent.unwrap_or(NO_PARENT);
-        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false })
+        self.push(Entry { node, kind, served, parent, driver, usb: None, departed: false, boot: false, guid: [0; 16] })
             .then_some(served)
     }
 
@@ -266,7 +289,8 @@ impl Registry {
         let id = self.entries.len() as u32;
         let usb = Some(facts);
         let kind = DeviceKind::UsbDevice;
-        let entry = Entry { node, kind, served: NOT_SERVED, parent, driver, usb, departed: false, boot: false };
+        let entry =
+            Entry { node, kind, served: NOT_SERVED, parent, driver, usb, departed: false, boot: false, guid: [0; 16] };
         self.push(entry).then_some(id)
     }
 
@@ -348,6 +372,7 @@ impl Registry {
                 func: d.func,
                 ..DeviceRecord::default()
             };
+            r.guid = e.guid;
             if e.departed {
                 r.flags |= DEPARTED;
             }
@@ -513,9 +538,10 @@ pub fn register(node: Ref<DeviceNode>, driver: &'static str) {
     announce();
 }
 
-/// Append a partition of `disk`. The table takes ownership of `node`.
-pub fn register_partition(node: Ref<DeviceNode>, disk: &Ref<DeviceNode>, driver: &'static str) {
-    if !DEVICES.lock().add_block_child(node, disk, driver) {
+/// Append a partition of `disk`, with its unique GUID if it is a GPT entry. The table takes
+/// ownership of `node`.
+pub fn register_partition(node: Ref<DeviceNode>, disk: &Ref<DeviceNode>, driver: &'static str, guid: [u8; 16]) {
+    if !DEVICES.lock().add_block_child(node, disk, driver, guid) {
         crate::kprintln!("device: table full; dropping a registered partition");
     }
     announce();

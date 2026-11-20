@@ -17,11 +17,9 @@ pub mod sources {
     //! succeeded, and its source names a partition by one of two schemes.
     //! - `gpt-partlabel:<label>`: the partition record whose name is the label, chosen as the
     //!   kernel binds `/dev/disk/by-partlabel/<label>` ([`name_rank`]).
-    //! - `gpt-partuuid:<uuid>`: a partition's unique GUID, which the registry does not carry, so it
-    //!   is read from the parent disk's table. The kernel publishes partitions in table order,
-    //!   skipping unused entries, so the k-th entry in use is the k-th partition record under that
-    //!   disk; its name and size confirm it, and it is unmatched if they differ. Two disks
-    //!   carrying it are chosen between as for a label.
+    //! - `gpt-partuuid:<uuid>`: the GPT partition record whose unique GUID it is, chosen as the
+    //!   kernel binds `/dev/disk/by-partuuid/<uuid>`. Read from the record and never from the
+    //!   disk's table, as a reader of its own would read some tables differently from the kernel.
     //!
     //! **A live boot is one whose root is on a RAM disk**, which makes the machine's own disks the
     //! install target: an internal disk is auto-mounted read-only there (a removable one writable).
@@ -30,26 +28,6 @@ pub mod sources {
     use alloc::vec::Vec;
     use libinittoml::manifest::{Manifest, Mode};
     use libkern::device::{DeviceKind, DeviceRecord, NO_PARENT};
-
-    /// One entry in use in a disk's partition table, as much of it as matching needs.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct TableEntry {
-        /// The partition's unique GUID, in the table's byte order.
-        pub guid: [u8; 16],
-        /// Its label.
-        pub name: Vec<u8>,
-        /// Blocks it covers.
-        pub blocks: u64,
-    }
-
-    /// A disk's partition table: the disk's registry id, and its entries in use, in array order.
-    #[derive(Clone, Debug, PartialEq, Eq)]
-    pub struct DiskTable {
-        /// The disk's registry id.
-        pub disk: u32,
-        /// Its entries in use.
-        pub entries: Vec<TableEntry>,
-    }
 
     /// One of `init`'s mounts, and the device it is on.
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -65,7 +43,7 @@ pub mod sources {
     }
 
     /// `init`'s mounts, each matched to its device.
-    pub fn init_mounts(manifest: &Manifest, records: &[DeviceRecord], tables: &[DiskTable]) -> Vec<InitMount> {
+    pub fn init_mounts(manifest: &Manifest, records: &[DeviceRecord]) -> Vec<InitMount> {
         manifest
             .mounts
             .iter()
@@ -73,31 +51,23 @@ pub mod sources {
                 mount_point: m.mount_point.clone(),
                 source: m.device.clone(),
                 mode: m.mode,
-                device: source_device(&m.device, records, tables),
+                device: source_device(&m.device, records),
             })
             .collect()
     }
 
     /// The registry id of the partition `source` names, found as `init` would resolve it.
-    pub fn source_device(source: &str, records: &[DeviceRecord], tables: &[DiskTable]) -> Option<u32> {
-        let partitions = || records.iter().filter(|r| r.kind() == DeviceKind::Partition);
-        if let Some(label) = source.strip_prefix("gpt-partlabel:") {
-            if label.is_empty() {
-                return None;
-            }
-            let named = partitions().filter(|r| r.name() == label.as_bytes());
-            return named
-                .filter_map(|r| Some((name_rank(records, r.parent)?, r.id)))
-                .min_by_key(|&(k, _)| k)
-                .map(|(_, id)| id);
-        }
-        let uuid = source.strip_prefix("gpt-partuuid:")?;
-        let carrying = |t: &DiskTable| t.entries.iter().position(|e| partuuid(&e.guid) == uuid);
-        let found = tables.iter().filter_map(|t| Some((name_rank(records, t.disk)?, t, carrying(t)?)));
-        let (_, t, k) = found.min_by_key(|&(rank, ..)| rank)?;
-        let entry = &t.entries[k];
-        let part = partitions().filter(|r| r.parent == t.disk).nth(k)?;
-        (part.name() == entry.name.as_slice() && part.block_count == entry.blocks).then_some(part.id)
+    pub fn source_device(source: &str, records: &[DeviceRecord]) -> Option<u32> {
+        let names =
+            |r: &DeviceRecord| match (source.strip_prefix("gpt-partlabel:"), source.strip_prefix("gpt-partuuid:")) {
+                (Some(label), _) => !label.is_empty() && r.name() == label.as_bytes(),
+                // Every GPT entry the kernel publishes is bound by its GUID, a zero one too; an MBR
+                // entry has none.
+                (_, Some(uuid)) => r.driver() == b"gpt" && partuuid(&r.guid) == uuid,
+                _ => false,
+            };
+        let named = records.iter().filter(|r| r.kind() == DeviceKind::Partition && names(r));
+        named.filter_map(|r| Some((name_rank(records, r.parent)?, r.id))).min_by_key(|&(k, _)| k).map(|(_, id)| id)
     }
 
     /// **Whose partitions the kernel names first** (`gpt::bind_order`): `0` the boot medium's, the

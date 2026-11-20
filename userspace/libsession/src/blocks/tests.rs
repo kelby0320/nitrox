@@ -18,7 +18,7 @@ const DEVICE: Rights = Rights::from_bits(
 );
 
 fn record(id: u32, kind: DeviceKind, served: u32, flags: u8) -> DeviceRecord {
-    let mut r = DeviceRecord::read(&[0u8; 144]).unwrap();
+    let mut r = DeviceRecord::read(&[0u8; size_of::<DeviceRecord>()]).unwrap();
     (r.id, r.kind, r.served, r.flags) = (id, kind.as_u32(), served, flags);
     r
 }
@@ -28,7 +28,7 @@ fn snapshot(records: &[DeviceRecord]) -> Vec<u8> {
     out[0..4].copy_from_slice(&REGISTRY_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&REGISTRY_VERSION.to_le_bytes());
     out[8..12].copy_from_slice(&(records.len() as u32).to_le_bytes());
-    out[12..16].copy_from_slice(&144u32.to_le_bytes());
+    out[12..16].copy_from_slice(&(size_of::<DeviceRecord>() as u32).to_le_bytes());
     for r in records {
         out.extend_from_slice(r.as_bytes());
     }
