@@ -1905,7 +1905,7 @@ Found 21, refuted by a boot 0, reported 16.
   Ready deadline is acted on. storage-service and device-mgr take one message per handle per
   pass. Unverified: a two-thread flood client on `/dev/tty` while `service --stop` is issued would
   show whether the stop is answered before the flood ends. Lens: logic. Medium. **Later.**
-  Fixed in `d1749b5b`: every route and every `/svc/services` handle is read at most `routes::PER_PASS` (16) a pass through `routes::take`, a ring left non-empty signalling the next wait; fails without it: `a_pass_answers_a_bounded_number_of_resolves_a_route` and `a_pass_takes_a_bounded_number_of_requests_from_a_channel`.
+  Fixed in `d1749b5b`: every route and every `/svc/services` handle is read at most `routes::PER_PASS` (16) a pass through `routes::take`, a ring left non-empty signalling the next wait; fails without it: `a_pass_answers_a_bounded_number_of_resolves_a_route` and `a_pass_takes_a_bounded_number_of_requests_from_a_channel`. Since `afd8f700` the bound counts every message, decoded or not, and holds a look at a control channel too; fails without it: `a_pass_counts_the_messages_that_do_not_decode` and `a_look_at_a_control_channel_is_bounded_and_sees_past_a_full_ring`.
 
 - [ ] **sup-5** `userspace/storage-service/src/main.rs:642` — every resolve of `info/<name>.tsm`,
   including any session's `/dev/storage/all.tsm`, calls `refresh_unmounted`. That re-probes every
@@ -1998,7 +1998,7 @@ Found 21, refuted by a boot 0, reported 16.
   `/dev/devices` until reboot. Routes exist so that a restart reaches every session. Unverified:
   boot with storage-service failing its Ready, start it from an admin session, log in, and
   resolve `/storage`. Lens: trust-boundary. Low. **Later.**
-  Fixed in `1e904345`: a login supervisor's copy finds or makes the route, which answers `NotFound` until its server registers; fails without it: `a_route_copied_before_its_server_is_up_reaches_it_once_it_is`.
+  Fixed in `1e904345`: a login supervisor's copy finds or makes the route, which answers `NotFound` until its server registers; fails without it: `a_route_copied_before_its_server_is_up_reaches_it_once_it_is`. Since `afd8f700` the login supervisors resolve the view broker's supervisor channel again at a login that has none, or whose broker has gone; fails without it: `a_broker_up_late_or_restarted_is_reached_at_the_next_login`.
 
 - [ ] **sup-12** `userspace/storage-service/src/probe.rs:125` — `partition_entries`, which decides
   whether a whole disk's own filesystem is ignored, has conditions no test pins: the 0xAA half of

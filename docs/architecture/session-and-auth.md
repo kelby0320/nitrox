@@ -271,7 +271,10 @@ property of the namespace object; see
 **Each login opens a session with the view broker, and the session's base is its identity**
 (administration Part A.4). Before building the namespace, the supervisor — `session-mgr` or
 `desktop-session-mgr`; both do — sends `OpenSession` for the principal it authenticated, over a
-channel it resolved once at `/svc/views/session`, and gets an id. It binds the broker's forwarding
+channel it resolved at `/svc/views/session`, and gets an id. **That channel is resolved again at a
+login that has none, or whose broker has gone** (`libsession::open_views_session_from`), so a broker
+that came up after the supervisor, or restarted, is reached at the next login; one that refuses is
+not resolved again. It binds the broker's forwarding
 endpoint at `/dev/views` with the subtree base `/s/<id>`, so every resolve of `/dev/views` from the
 session reaches the broker with the suffix `s/<id>`, which no program in the session can change.
 `desktop-shell` binds the same endpoint, at the same base, into every application namespace it

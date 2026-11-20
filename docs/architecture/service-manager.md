@@ -182,7 +182,9 @@ the compositor — never the server's own endpoint, so a session built before a 
 new server too; `desktop-shell` passes the same handles into every application. **A server not up
 when the chain starts is handed too**: its route is made then and answers `NotFound` until the
 server registers, as while one restarts. Until pre-Phase-7 Part H.2 only a live route was copied,
-and a server that came up late was out of every session's reach until a reboot. `boot-probe`
+and a server that came up late was out of every session's reach until a reboot. The view broker's
+supervisor channel, which the login supervisors resolve themselves, is resolved again at a login
+that has none or whose broker has gone ([`session-and-auth.md`](session-and-auth.md)). `boot-probe`
 proves it with a copy of the root made before a restart, which holds the same binding and is never
 rebound.
 

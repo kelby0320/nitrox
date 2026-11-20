@@ -38905,4 +38905,14 @@ H.1 merged, #460. H.2 on `pre-phase-7/h2-supervisors`, as
   reach (sup-11).
 - **`init`'s unmount answer is held to its request** (sup-14), a change on its critical path.
 - **The test gaps beside them are held** (sup-15, sup-16).
+- **The review (#461) found sup-4's bound counted only the requests that decoded**, so junk queued
+  as fast as it was read still held a pass. A pass now takes at most `PER_PASS` messages, decoded or
+  not, and a look at a control channel as many, more than its 10 deep ring holds. The session lists'
+  walk moved into the library (`routes::serve_each`) so a host test holds it.
+- **The login supervisors resolve the view broker's supervisor channel again at a login** that has
+  none, or whose broker has gone (the maintainer's call, 2026-11-20). Resolved once at their start,
+  a broker that came up late or restarted left every session without `with` until a reboot, though
+  sup-11 hands its route. One that refuses is not resolved again.
+- **storage-service's unmount answer is held to its request in H.3**, which moves that code out of
+  a `main.rs` at its size entry, with a `lib.rs` at 1,000 lines.
 
