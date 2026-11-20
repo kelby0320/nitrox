@@ -43,9 +43,9 @@ pub extern "C" fn _start(rdi: u64, rsi: u64, rdx: u64, rcx: u64) -> ! {
     //      which also marks each file it resolves read-only.
     if read_only {
         let ro = ReadOnly(&cached);
-        server::serve_volume(&Ext4(&ro), control, disk.handle())
+        server::serve_volume(&Ext4::new(&ro), control, disk.handle())
     } else {
-        server::serve_volume(&Ext4(&cached), control, disk.handle())
+        server::serve_volume(&Ext4::new(&cached), control, disk.handle())
     }
 }
 

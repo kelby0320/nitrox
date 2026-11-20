@@ -666,8 +666,8 @@ impl Service {
             self.mounted.insert(i, x);
             return Err((KError::WouldBlock, b"a file on it is still open or mapped"));
         }
-        // 4. **The server records the filesystem clean and exits.** From here the mount is gone
-        //    whatever the answer: a server that could not record it exits too.
+        // 4. **The server records the unmount and exits**, clean unless found not clean or a change
+        //    failed. The mount is gone whatever the answer: a server that cannot record it exits.
         let told = server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok();
         let answer = if told && wait_until(&x.control, within(READY_TIMEOUT_NS)) {
             recv(&x.control).ok().flatten()
@@ -689,9 +689,8 @@ impl Service {
         {
             return Err((KError::IoError, b"the drive's cache could not be flushed"));
         }
-        // 6. **What is said of the filesystem is what the device says**, read again now: a
-        //    read-only mount wrote nothing, so one found not clean is not clean still. The QEMU
-        //    gates match this line.
+        // 6. **What is said of the filesystem is what the device says**, read again now: one found
+        //    not clean is not clean still, read-only or not. The QEMU gates match this line.
         let clean = self.read_found(x.device).and_then(|f| f.clean()) == Some(true);
         let mut l = Line::new();
         l.s(b"storage-service: unmounted ").untrusted(x.label.as_bytes());

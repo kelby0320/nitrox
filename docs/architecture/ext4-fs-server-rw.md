@@ -247,11 +247,16 @@ one, since its blocks read linearly as they are. An insert wrote over the tree's
 **A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
 (`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
 change, and a mount that cannot write that is refused (`Unservable::StateUnwritable`). An
-unmount sets the bit again as its last write (`mark_clean`), on `Meta::Unmount` from its
-supervisor on the control channel. The server then replies and exits
+unmount, on `Meta::Unmount` from its supervisor on the control channel, sets the bit again as its
+last write (`mark_unmounted`) **only if the mount found the filesystem clean and no change failed
+on the device or found it corrupt**; otherwise it leaves `s_state` as it was found, its error bit
+with it, or as the mount left it, not clean, as FAT does (pre-Phase-7 Part H.1). Until then a crash's
+damage, or a failed change's, was recorded clean at the next unmount and hidden from `e2fsck -p`.
+A state with its error bit set counts as not clean (`was_left_clean`), as `e2fsck -p` counts it.
+The server then replies and exits
 ([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found
-not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway;
-a repair tool is `TODO(fs-repair)`. **`init`'s mounts are unmounted by a shutdown** (administration
+not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway, and
+stays marked until something checks it; a repair tool is `TODO(fs-repair)`. **`init`'s mounts are unmounted by a shutdown** (administration
 Part E.4): a flush of the mount, then `Meta::Unmount`, last mounted first. A machine turned off
 without one is still reported on its next boot.
 

@@ -10,7 +10,7 @@ const NOW: i64 = 1_791_244_800;
 /// count off the two a directory never goes below.
 fn base() -> Vec<u8> {
     let rw = Failing::after(fixture(4096, b"seed\n"), u64::MAX);
-    let vol = Ext4(&rw);
+    let vol = Ext4::new(&rw);
     vol.mkdir_at(2, b"d", NOW).unwrap();
     vol.mkdir_at(2, b"e", NOW).unwrap();
     vol.mkdir_at(vol.resolve_dir(b"/d").unwrap(), b"sub", NOW).unwrap();
@@ -36,7 +36,7 @@ fn e2fsck(img: &[u8]) -> String {
 /// How many writes `op` makes on a device that refuses none.
 fn writes(base: &[u8], op: impl Fn(&Ext4<'_, Failing>)) -> u64 {
     let rw = Failing::after(base.to_vec(), u64::MAX);
-    op(&Ext4(&rw));
+    op(&Ext4::new(&rw));
     rw.writes.get()
 }
 
@@ -80,15 +80,15 @@ fn a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed() {
         for n in 0..=total {
             for once in [true, false] {
                 let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
-                let first = Ext4(&rw).rename_path(from, to, replace, NOW);
+                let first = Ext4::new(&rw).rename_path(from, to, replace, NOW);
                 if let Ok(Some(id)) = first {
-                    let _ = Ext4(&rw.image).release(id, NOW);
+                    let _ = Ext4::new(&rw.image).release(id, NOW);
                 }
                 let stopped = rw.image.0.into_inner();
                 let thens = ["asked again", "the old name removed", "the new name removed", "moved on", "moved into"];
                 for then in thens {
                     let rw = crate::test_support::RwImage(std::cell::RefCell::new(stopped.clone()));
-                    let vol = Ext4(&rw);
+                    let vol = Ext4::new(&rw);
                     match then {
                         "asked again" => {
                             if let Ok(Some(id)) = vol.rename_path(from, to, replace, NOW) {
@@ -124,7 +124,7 @@ fn a_rename_stopped_at_any_write_never_leaves_a_name_reaching_what_is_freed() {
 #[test]
 fn a_name_taken_away_returns_what_it_freed_whatever_write_is_refused_after() {
     let base = base();
-    let dst = Ext4(&crate::test_support::RwImage(std::cell::RefCell::new(base.clone())))
+    let dst = Ext4::new(&crate::test_support::RwImage(std::cell::RefCell::new(base.clone())))
         .map_file(b"/e/dst", &mut [BlockRun::default(); 4])
         .unwrap()
         .id;
@@ -139,8 +139,8 @@ fn a_name_taken_away_returns_what_it_freed_whatever_write_is_refused_after() {
         });
         for n in 0..total {
             let rw = Failing::once(base.clone(), n);
-            if let Ok(Some(id)) = op(&Ext4(&rw)) {
-                Ext4(&rw.image).release(id, NOW).unwrap();
+            if let Ok(Some(id)) = op(&Ext4::new(&rw)) {
+                Ext4::new(&rw.image).release(id, NOW).unwrap();
             }
             let text = e2fsck(&rw.image.0.borrow());
             let lost = format!("Unattached inode {dst}\n");
@@ -186,8 +186,8 @@ fn what_a_change_answers_is_what_it_did() {
         });
         for n in 0..total {
             let rw = Failing::once(base.clone(), n);
-            let answered = op(&Ext4(&rw));
-            let changed = done(&Ext4(&rw.image));
+            let answered = op(&Ext4::new(&rw));
+            let changed = done(&Ext4::new(&rw.image));
             assert_eq!(answered.is_ok(), changed, "{what}, write {n} of {total} refused: answered {answered:?}");
         }
     }
@@ -204,7 +204,7 @@ fn a_mkdir_stopped_at_any_write_leaves_no_count_short() {
     for n in 0..total {
         for once in [true, false] {
             let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
-            let vol = Ext4(&rw);
+            let vol = Ext4::new(&rw);
             let _ = vol.mkdir_at(vol.resolve_dir(b"/e").unwrap(), b"made", NOW);
             let text = e2fsck(&rw.image.0.borrow());
             let ok = NEVER.iter().all(|bad| !text.contains(bad)) && !fewer_links_than_names(&text);
@@ -220,14 +220,14 @@ fn long_name(i: u32) -> Vec<u8> {
 
 fn dir_inode(rw: &crate::test_support::RwImage, path: &[u8]) -> [u8; 256] {
     let sb = crate::ext4::read_superblock(rw).unwrap();
-    let ino = Ext4(rw).resolve_dir(path).unwrap() as u32;
+    let ino = Ext4::new(rw).resolve_dir(path).unwrap() as u32;
     crate::ext4::read_inode(rw, &sb, ino).unwrap()
 }
 
 /// `/g` on 1 KiB blocks: fifteen files with data, five full blocks, a tree of depth 1.
 fn full_directory() -> Vec<u8> {
     let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(1024, b"seed\n")));
-    let vol = Ext4(&rw);
+    let vol = Ext4::new(&rw);
     vol.mkdir_at(2, b"g", NOW).unwrap();
     for i in 0..15 {
         vol.create_file(b"/g", &long_name(i), NOW).unwrap();
@@ -274,7 +274,7 @@ fn a_directory_growth_stopped_at_any_write_leaves_it_able_to_grow() {
         for n in 0..total {
             for once in [true, false] {
                 let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
-                let _ = op(&Ext4(&rw));
+                let _ = op(&Ext4::new(&rw));
                 let how = if once { "once" } else { "and every one after" };
                 let text = e2fsck(&rw.image.0.borrow());
                 assert!(
@@ -282,7 +282,7 @@ fn a_directory_growth_stopped_at_any_write_leaves_it_able_to_grow() {
                     "the growing {what}, write {n} refused once:\n{text}"
                 );
                 let then = crate::test_support::RwImage(std::cell::RefCell::new(rw.image.0.into_inner()));
-                let vol = Ext4(&then);
+                let vol = Ext4::new(&then);
                 assert_eq!(
                     vol.create_file(b"/g", &long_name(16), NOW),
                     Ok(()),
@@ -305,7 +305,7 @@ fn a_directory_growth_stopped_at_any_write_leaves_it_able_to_grow() {
 #[test]
 fn a_file_grown_after_a_growth_lost_its_size_write_counts_its_blocks() {
     let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(1024, b"seed\n")));
-    let vol = Ext4(&rw);
+    let vol = Ext4::new(&rw);
     vol.create_file(b"/system", b"a", NOW).unwrap();
     vol.create_file(b"/system", b"b", NOW).unwrap();
     // Grown in turn a block at a time, so each of `a`'s blocks is an extent of its own.
@@ -320,9 +320,9 @@ fn a_file_grown_after_a_growth_lost_its_size_write_counts_its_blocks() {
     let grow = |vol: &Ext4<'_, Failing>| vol.grow_file(b"/system/a", 7 * 1024, NOW).map(drop);
     let total = writes(&base, |vol| grow(vol).unwrap());
     let lost = Failing::after(base, total - 1);
-    assert_eq!(grow(&Ext4(&lost)), Err(FsError::Io), "the size write, last, is lost");
+    assert_eq!(grow(&Ext4::new(&lost)), Err(FsError::Io), "the size write, last, is lost");
     let then = crate::test_support::RwImage(std::cell::RefCell::new(lost.image.0.into_inner()));
-    Ext4(&then).grow_file(b"/system/a", 9 * 1024, NOW).unwrap();
+    Ext4::new(&then).grow_file(b"/system/a", 9 * 1024, NOW).unwrap();
     crate::test_support::assert_e2fsck_clean(&then.0.borrow(), "grown-after-a-lost-size");
 }
 
@@ -345,12 +345,61 @@ impl BlockWriter for Recording {
 fn a_create_whose_inode_write_is_refused_gives_the_inode_back() {
     let base = fixture(4096, b"seed\n");
     let made = Recording(crate::test_support::RwImage(std::cell::RefCell::new(base.clone())), Default::default());
-    Ext4(&made).create_file(b"/system", b"new", NOW).unwrap();
-    let ino = Ext4(&made).map_file(b"/system/new", &mut [BlockRun::default(); 1]).unwrap().id as u32;
+    Ext4::new(&made).create_file(b"/system", b"new", NOW).unwrap();
+    let ino = Ext4::new(&made).map_file(b"/system/new", &mut [BlockRun::default(); 1]).unwrap().id as u32;
     let sb = crate::ext4::read_superblock(&made).unwrap();
     let at = crate::ext4::inode_offset(&made, &sb, ino).unwrap();
     let n = made.1.borrow().iter().position(|&off| off == at).expect("the create writes its inode") as u64;
     let rw = Failing::once(base, n);
-    assert_eq!(Ext4(&rw).create_file(b"/system", b"new", NOW), Err(FsError::Io));
+    assert_eq!(Ext4::new(&rw).create_file(b"/system", b"new", NOW), Err(FsError::Io));
     crate::test_support::assert_e2fsck_clean(&rw.image.0.borrow(), "inode-write-refused");
+}
+
+fn state(img: &[u8]) -> u16 {
+    u16::from_le_bytes([img[1024 + 58], img[1024 + 59]])
+}
+
+/// **An unmount records clean only what its mount found clean and no change failed on**: found not
+/// clean, or with errors, it is left as found, and after a failed change as the mount left it.
+#[test]
+fn an_unmount_records_clean_only_what_was_found_clean_and_never_failed() {
+    for found in [0x0001u16, 0x0000, 0x0002, 0x0003] {
+        let mut img = fixture(4096, b"seed\n");
+        img[1024 + 58..1024 + 60].copy_from_slice(&found.to_le_bytes());
+        let rw = crate::test_support::RwImage(std::cell::RefCell::new(img));
+        let vol = Ext4::new(&rw);
+        vol.mark_mounted().unwrap();
+        assert_eq!(state(&rw.0.borrow()), found & !1, "{found:#06x}: mounted, never clean");
+        vol.create_file(b"/system", b"made", NOW).unwrap();
+        assert_eq!(vol.mkdir_at(2, b"system", NOW), Err(FsError::Exists));
+        vol.mark_clean().unwrap();
+        assert_eq!(state(&rw.0.borrow()), found, "{found:#06x}: unmounted as found");
+        assert_eq!(vol.was_left_clean(), Ok(found == 1), "{found:#06x}");
+    }
+    type Change = fn(&Ext4<'_, Failing>) -> Result<(), FsError>;
+    let changes: [(&str, Change, FsError); 2] = [
+        ("a create the device refused", |v| v.create_file(b"/system", b"made", NOW), FsError::Io),
+        (
+            "a truncate over metadata",
+            |v| v.truncate_file(b"/system/current-generation", 0, NOW).map(drop),
+            FsError::Corrupt,
+        ),
+    ];
+    for (what, change, why) in changes {
+        let mut img = fixture(4096, b"seed\n");
+        if why == FsError::Corrupt {
+            let rw = crate::test_support::RwImage(std::cell::RefCell::new(img.clone()));
+            let sb = crate::ext4::read_superblock(&rw).unwrap();
+            let file = Ext4::new(&rw).map_file(b"/system/current-generation", &mut [BlockRun::default(); 1]);
+            let at = crate::ext4::inode_offset(&rw, &sb, file.unwrap().id as u32).unwrap() as usize;
+            img[at + 60..at + 64].copy_from_slice(&1u32.to_le_bytes()); // the descriptor table's block
+        }
+        let rw = if why == FsError::Io { Failing::once(img, 1) } else { Failing::after(img, u64::MAX) };
+        let vol = Ext4::new(&rw);
+        vol.mark_mounted().unwrap();
+        assert_eq!(change(&vol), Err(why), "{what}");
+        vol.create_file(b"/system", b"after", NOW).unwrap();
+        vol.mark_clean().unwrap();
+        assert_eq!(state(&rw.image.0.borrow()), 0x0000, "{what}: left as the mount left it");
+    }
 }

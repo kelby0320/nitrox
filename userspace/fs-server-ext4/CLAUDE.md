@@ -51,7 +51,8 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   growing or creating first; a `RESOLVE_RENAME` handled **before** the directory-session path,
   which infers "directory open" from the suffix naming a directory), `File::Forget` before an
   unlinked or replaced file's `release_inode`, and the control channel's `Meta::Unmount`, which
-  `mark_clean`s, replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
+  records the unmount (`mark_unmounted`: clean only if the mount found it clean and no change
+  failed), replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
   `libfsserver::disk::Disk`: a 4 KiB block per `sys_io_submit` into a one-page scratch
   `MemoryObject`, a write smaller than a block reading the block first (this said
   "sector-at-a-time" until 2026-10-06), and a grow's zeroes up to 64 KiB a submit

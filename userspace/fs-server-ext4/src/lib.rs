@@ -436,7 +436,7 @@ mod tests {
 
     impl<T: BlockReader + BlockWriter> Mutate for T {
         fn mark_mounted(&self) -> Result<(), FsError> {
-            ext4::mark_mounted(self)
+            ext4::mark_mounted(self).map(drop)
         }
         fn mark_clean(&self) -> Result<(), FsError> {
             ext4::mark_clean(self)

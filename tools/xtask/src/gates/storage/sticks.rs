@@ -484,11 +484,11 @@ pub(crate) fn check_fat_stick(stick: &Path, work: &Path) -> R<()> {
     Ok(())
 }
 
-/// The disk, once the machine has stopped: `e2fsck -fn` clean, the superblock marked clean, and
-/// the file holding the pattern.
+/// The disk, once the machine has stopped: `e2fsck -fn` clean, the superblock still marked not
+/// clean, as it was found, and the file holding the pattern.
 pub(crate) fn check_storage_disk(disk: &Path, work: &Path) -> R<()> {
     let fs_img = storage_root_fs(disk, work)?;
-    check_left_clean(&fs_img)?;
+    check_left_as_found(&fs_img)?;
     let path = format!("/{STORAGE_PATTERN_FILE}");
     let pattern: Vec<u8> = (0..STORAGE_PATTERN_LEN).map(storage_pattern_byte).collect();
     match debugfs_cat(&fs_img, &path)? {

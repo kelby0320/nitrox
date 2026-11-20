@@ -1,7 +1,6 @@
 //! **The system zone**: each group's superblock and descriptor copies, bitmaps and inode table,
-//! which no extent may map, no free give back and no allocation hand out. Linux builds it as a tree
-//! at mount; with no `alloc`, and `nxinstall` mounting nothing, each question reads one flex
-//! group's descriptors.
+//! which no extent may map, no free give back and no allocation hand out. With no `alloc` and no
+//! mount for `nxinstall`, each question reads the superblock and one flex group's descriptors.
 
 use super::*;
 

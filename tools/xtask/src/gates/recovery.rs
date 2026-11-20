@@ -14,10 +14,10 @@ const RECOVERED_PASSWORD: &str = "alice after recovery";
 /// cleanly unmounted. On serial, as the live `alice` (administrator of the live system, not the
 /// installed one): `with admin disk` mounts the disk's `nitrox-root` writable; `account --password
 /// alice --users /storage/nitrox-root/system/users` sets a new password in that disk's file; `with
-/// admin disk --unmount` leaves it clean; and the live `alice` still logs in with the old password.
-/// Between the boots the host checks the filesystem is clean and that `/system/users` differs from
-/// the shipped one in `alice`'s line alone. The second boot is that disk alone: the old password is
-/// refused, the new one taken. Neither boot printed either.
+/// admin disk --unmount` leaves it not clean, as found; and the live `alice` still logs in with
+/// the old password. Between the boots the host checks `e2fsck` finds nothing, the superblock
+/// still not clean, and `/system/users` changed in `alice`'s line alone. The second boot is that
+/// disk alone: the old password is refused, the new one taken. Neither printed either.
 pub(crate) fn cmd_check_recovery(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("e2fsck")?;
@@ -75,7 +75,7 @@ pub(crate) fn cmd_check_recovery(accel: Accel, size: DisplaySize) -> R<()> {
 
     println!("\nxtask: the machine is stopped; the disk, on the host:");
     let fs_img = storage_root_fs(&disk, &work)?;
-    check_left_clean(&fs_img)?;
+    check_left_as_found(&fs_img)?;
     let users = debugfs_cat(&fs_img, "/system/users")?.ok_or("the disk has no /system/users")?;
     check_recovered_users(&shipped, &users)?;
 
@@ -166,7 +166,7 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     println!("  ok: account --password alice --users set it in the disk's file");
 
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
-    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, not left clean"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
     s.expect("/home>")?;
 
@@ -177,7 +177,7 @@ fn run_recovery_steps(s: &mut Session) -> R<()> {
     s.expect("password:")?;
     s.send(DEMO_PASSWORD)?;
     s.expect("/home>")?;
-    println!("  ok: unmounted clean, and the live system's own alice logs in as before");
+    println!("  ok: unmounted, left not clean as it was found, and the live system's own alice logs in as before");
     Ok(())
 }
 

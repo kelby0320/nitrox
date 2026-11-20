@@ -23,7 +23,7 @@ use bitmap::Bitmap;
 pub use grow::{grow_file, grow_file_from};
 use insert::dir_insert;
 pub use listing::{read_dir, read_dir_stat};
-pub use state::{mark_clean, mark_mounted, volume_label, was_left_clean};
+pub use state::{mark_clean, mark_mounted, mark_unmounted, volume_label, was_left_clean};
 pub(crate) use superblock::{Superblock, read_superblock};
 pub use superblock::{block_size, check_device, check_writable};
 pub use unservable::Unservable;

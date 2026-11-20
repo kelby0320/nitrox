@@ -29,7 +29,7 @@ impl Rng {
 /// names of several lengths, so the directories hold more than `.` and `..`.
 fn populated(block_size: u32) -> Vec<u8> {
     let rw = RwImage(RefCell::new(fixture_blocks(block_size, 2 * 1024 * 1024 / block_size, 0, b"seed\n")));
-    let vol = Ext4(&rw);
+    let vol = Ext4::new(&rw);
     let d = {
         vol.mkdir_at(2, b"d", NOW).unwrap();
         vol.resolve_dir(b"/d").unwrap()
@@ -125,7 +125,7 @@ fn cut(at: &mut [u8], ino: u32, name_len: u8) {
 fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
     for bs in [1024u32, 4096] {
         let img = RwImage(RefCell::new(populated(bs)));
-        let vol = Ext4(&img);
+        let vol = Ext4::new(&img);
         let inner = vol.resolve_dir(b"/d/inner").unwrap() as u32;
         let (first, block) = records(&img, inner)[0];
         let end = (block + bs as u64) as usize;
@@ -146,7 +146,7 @@ fn a_record_whose_name_runs_past_its_block_is_an_error_to_rename_over() {
 #[test]
 fn a_loop_of_parent_records_is_corrupt_to_move_a_directory_into() {
     let img = RwImage(RefCell::new(populated(4096)));
-    let vol = Ext4(&img);
+    let vol = Ext4::new(&img);
     let inner = vol.resolve_dir(b"/d/inner").unwrap() as u32;
     let at = records(&img, inner)[1].0 as usize;
     img.0.borrow_mut()[at..at + 4].copy_from_slice(&inner.to_le_bytes());
@@ -161,7 +161,7 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
     for bs in [1024u32, 4096] {
         let base = populated(bs);
         let pristine = RwImage(RefCell::new(base.clone()));
-        let vol = Ext4(&pristine);
+        let vol = Ext4::new(&pristine);
         let dirs: Vec<u32> = [b"/" as &[u8], b"/system", b"/d", b"/d/inner"]
             .iter()
             .map(|p| vol.resolve_dir(p).unwrap() as u32)
@@ -208,7 +208,7 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
                 }
             }
             drop(v);
-            let vol = Ext4(&img);
+            let vol = Ext4::new(&img);
             let ran = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| exercise(&vol)));
             assert!(ran.is_ok(), "{bs}-byte blocks, seed {seed}: a request panicked on garbage");
         }
@@ -220,7 +220,7 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
 #[test]
 fn an_rmdir_takes_a_link_only_from_a_directory() {
     let img = RwImage(RefCell::new(populated(4096)));
-    let vol = Ext4(&img);
+    let vol = Ext4::new(&img);
     let file = vol.map_file(b"/system/a", &mut [BlockRun::default(); 4]).unwrap().id as u32;
     let inner = vol.resolve_dir(b"/d/inner").unwrap() as u32;
     let at = records(&img, inner)[1].0 as usize;
@@ -243,7 +243,7 @@ fn descriptor(bs: u32, group: u32) -> usize {
 fn a_group_wider_than_its_bitmap_block_is_refused() {
     for (bs, blocks, per_group) in [(4096u32, 4096u32, 65536u32), (1024, 16384, 16384)] {
         let img = RwImage(RefCell::new(fixture_blocks(bs, blocks, 0, b"g\n")));
-        let vol = Ext4(&img);
+        let vol = Ext4::new(&img);
         vol.create_file(b"/system", b"a", NOW).unwrap();
         vol.create_file(b"/system", b"b", NOW).unwrap();
         let mut v = img.0.borrow_mut();
@@ -275,7 +275,7 @@ fn a_superblock_is_held_to_its_groups_at_each_edge() {
             for &(off, value) in pokes {
                 v[1024 + off..1024 + off + 4].copy_from_slice(&value.to_le_bytes());
             }
-            Ext4(&crate::ReadOnly(&RwImage(RefCell::new(v)))).check()
+            Ext4::new(&crate::ReadOnly(&RwImage(RefCell::new(v)))).check()
         };
         let (bits, inodes) = (bs * 8, sb(&good, 0));
         assert_eq!(sb(&good, 32), bits, "mke2fs fills a group's bitmap");
@@ -295,7 +295,7 @@ fn a_record_naming_an_inode_past_the_last_is_corrupt() {
     for bs in [1024u32, 4096] {
         for past in [1u32, 0x8000_0000] {
             let img = RwImage(RefCell::new(populated(bs)));
-            let vol = Ext4(&img);
+            let vol = Ext4::new(&img);
             let inodes = rd_u32(&img.0.borrow(), 1024);
             let d = vol.resolve_dir(b"/d").unwrap();
             let at = records(&img, d as u32)
@@ -324,7 +324,7 @@ fn a_record_naming_an_inode_past_the_last_is_corrupt() {
 #[test]
 fn a_cursor_inside_a_record_resumes_at_the_next() {
     let img = RwImage(RefCell::new(fixture_blocks(4096, 4096, 0, b"g\n")));
-    let vol = Ext4(&img);
+    let vol = Ext4::new(&img);
     vol.mkdir_at(2, b"box", NOW).unwrap();
     let boxed = vol.resolve_dir(b"/box").unwrap();
     vol.mkdir_at(boxed, b"twelve bytes", NOW).unwrap();
@@ -352,7 +352,7 @@ fn a_cursor_inside_a_record_resumes_at_the_next() {
 #[test]
 fn a_control_character_in_an_existing_name_is_still_opened_and_replaced() {
     let img = RwImage(RefCell::new(populated(4096)));
-    let vol = Ext4(&img);
+    let vol = Ext4::new(&img);
     vol.create_file(b"/d", b"aXb", NOW).unwrap();
     vol.grow_file(b"/d/aXb", 5000, NOW).unwrap();
     let d = vol.resolve_dir(b"/d").unwrap();
@@ -373,7 +373,7 @@ fn a_control_character_in_an_existing_name_is_still_opened_and_replaced() {
 /// backups: `/d/x`, a file of one block, and `/e`, a directory whose one block is full.
 fn zoned() -> RwImage {
     let img = RwImage(RefCell::new(fixture_blocks(1024, 9216, 0, b"seed\n")));
-    let vol = Ext4(&img);
+    let vol = Ext4::new(&img);
     vol.mkdir_at(2, b"d", NOW).unwrap();
     vol.mkdir_at(2, b"e", NOW).unwrap();
     vol.create_file(b"/d", b"x", NOW).unwrap();
@@ -384,7 +384,6 @@ fn zoned() -> RwImage {
     img
 }
 
-/// One block of each kind of metadata in [`zoned`], by what it is.
 fn metadata(img: &RwImage) -> Vec<(&'static str, u64)> {
     let v = img.0.borrow();
     let gd = |g: usize, at: usize| rd_u32(&v, descriptor(1024, g as u32) + at) as u64;
@@ -402,7 +401,6 @@ fn metadata(img: &RwImage) -> Vec<(&'static str, u64)> {
     ]
 }
 
-/// Where `/d/x`'s inode is on the device.
 fn x_inode(img: &RwImage) -> usize {
     let sb = read_superblock(img).unwrap();
     inode_offset(img, &sb, dir_entry(img, b"/d", b"x")).unwrap() as usize
@@ -439,7 +437,7 @@ fn an_extent_over_metadata_is_never_mapped_or_freed() {
             if how.starts_with("a directory") {
                 // A second extent, past the directory's one block, over the metadata.
                 let sb = read_superblock(&img).unwrap();
-                let e = Ext4(&img).resolve_dir(b"/e").unwrap() as u32;
+                let e = Ext4::new(&img).resolve_dir(b"/e").unwrap() as u32;
                 let at = inode_offset(&img, &sb, e).unwrap() as usize + 40;
                 let mut v = img.0.borrow_mut();
                 v[at + 2..at + 4].copy_from_slice(&2u16.to_le_bytes());
@@ -459,7 +457,7 @@ fn an_extent_over_metadata_is_never_mapped_or_freed() {
             // reached.
             let cut = how == "truncated" || how.starts_with("grown");
             let before = cut.then(|| img.0.borrow().clone());
-            let got = way(&Ext4(&img));
+            let got = way(&Ext4::new(&img));
             assert_eq!(got, Err(FsError::Corrupt), "{what} ({block}), {how}");
             if let Some(before) = before {
                 assert!(*img.0.borrow() == before, "{what} ({block}), {how}: refused before any write");
@@ -470,9 +468,8 @@ fn an_extent_over_metadata_is_never_mapped_or_freed() {
     }
 }
 
-/// The inode `name` in the directory at `dir` names, read from its record.
 fn dir_entry(img: &RwImage, dir: &[u8], name: &[u8]) -> u32 {
-    let d = Ext4(img).resolve_dir(dir).unwrap() as u32;
+    let d = Ext4::new(img).resolve_dir(dir).unwrap() as u32;
     let found = records(img, d).into_iter().map(|r| r.0 as usize);
     let v = img.0.borrow();
     let at = found.into_iter().find(|&at| &v[at + 8..at + 8 + v[at + 6] as usize] == name);
@@ -485,7 +482,7 @@ fn dir_entry(img: &RwImage, dir: &[u8], name: &[u8]) -> u32 {
 fn a_free_bit_over_an_inode_table_is_refused_and_the_root_inode_kept() {
     for bs in [1024u32, 4096] {
         let img = RwImage(RefCell::new(fixture_blocks(bs, 4096, 0, b"seed\n")));
-        Ext4(&img).create_file(b"/system", b"new", NOW).unwrap();
+        Ext4::new(&img).create_file(b"/system", b"new", NOW).unwrap();
         let sb = read_superblock(&img).unwrap();
         let (bitmap, table) = {
             let v = img.0.borrow();
@@ -497,9 +494,9 @@ fn a_free_bit_over_an_inode_table_is_refused_and_the_root_inode_kept() {
         assert_eq!(crate::ext4::alloc_run(&img, &sb, table, 1), Err(FsError::Corrupt), "{bs}: the goal is the table");
         // Far enough to reach the table past the blocks `flex_bg` leaves free below it.
         let reach = (table as usize + 8) * bs as usize;
-        assert_eq!(Ext4(&img).grow_file(b"/system/new", reach, NOW), Err(FsError::Corrupt), "{bs}: a grow");
-        assert_eq!(Ext4(&img).check(), Ok(()), "{bs}: the root inode is a directory still");
-        assert!(Ext4(&img).resolve_dir(b"/system").is_ok(), "{bs}: and reaches its entries");
+        assert_eq!(Ext4::new(&img).grow_file(b"/system/new", reach, NOW), Err(FsError::Corrupt), "{bs}: a grow");
+        assert_eq!(Ext4::new(&img).check(), Ok(()), "{bs}: the root inode is a directory still");
+        assert!(Ext4::new(&img).resolve_dir(b"/system").is_ok(), "{bs}: and reaches its entries");
     }
 }
 
@@ -512,9 +509,9 @@ fn the_blocks_beside_metadata_map_free_and_allocate() {
         assert_eq!(crate::ext4::alloc_run(&img, &sb, block, 1), Ok((block, 1)), "{block} is allocated");
         repoint(&img, block);
         let mut runs = [BlockRun::default(); 4];
-        Ext4(&img).map_file(b"/d/x", &mut runs).unwrap();
+        Ext4::new(&img).map_file(b"/d/x", &mut runs).unwrap();
         assert_eq!(runs[0].device_lba, block, "{block} is mapped");
-        assert_eq!(Ext4(&img).truncate_file(b"/d/x", 0, NOW), Ok(None));
+        assert_eq!(Ext4::new(&img).truncate_file(b"/d/x", 0, NOW), Ok(None));
         assert!(!crate::ext4::block_in_use(&img, &sb, block), "{block} is freed");
     }
 }
@@ -524,14 +521,14 @@ fn the_blocks_beside_metadata_map_free_and_allocate() {
 #[test]
 fn a_layout_the_check_does_not_cover_is_served_read_only() {
     let made = zoned();
-    assert_eq!(Ext4(&made).check(), Ok(()), "mke2fs's own layout");
+    assert_eq!(Ext4::new(&made).check(), Ok(()), "mke2fs's own layout");
     // `s_log_groups_per_flex`: flex groups of one, so group 1 keeps its tables outside its own.
     for (log, why) in [(0u8, Unservable::Layout { group: 1 }), (6, Unservable::FlexTooWide { groups: 64 })] {
         let img = RwImage(RefCell::new(made.0.borrow().clone()));
         img.0.borrow_mut()[1024 + 372] = log;
         assert_eq!(crate::ext4::check_writable(&img), Err(why), "flex groups of 2^{log}");
-        assert_eq!(Ext4(&img).check(), Err(why), "2^{log}: the server's own check");
-        assert_eq!(Ext4(&crate::ReadOnly(&img)).check(), Ok(()), "2^{log}: served read-only");
+        assert_eq!(Ext4::new(&img).check(), Err(why), "2^{log}: the server's own check");
+        assert_eq!(Ext4::new(&crate::ReadOnly(&img)).check(), Ok(()), "2^{log}: served read-only");
         assert!(format!("{why}").starts_with("it can only be read here"), "{why}");
     }
 }
@@ -569,28 +566,28 @@ fn a_tree_over_metadata_is_never_read_as_a_node_or_freed() {
     let base = zoned();
     let sb = read_superblock(&base).unwrap();
     let table = rd_u32(&base.0.borrow(), descriptor(1024, 0) + 8) as u64;
-    let data = Ext4(&base).map_file(b"/d/x", &mut [BlockRun::default(); 1]).map(|_| ());
+    let data = Ext4::new(&base).map_file(b"/d/x", &mut [BlockRun::default(); 1]).map(|_| ());
     assert_eq!(data, Ok(()));
 
     // The index over the table's first block, inode 1's place made a leaf.
     let img = RwImage(RefCell::new(base.0.borrow().clone()));
     let phys = {
         let mut runs = [BlockRun::default(); 1];
-        Ext4(&img).map_file(b"/d/x", &mut runs).unwrap();
+        Ext4::new(&img).map_file(b"/d/x", &mut runs).unwrap();
         runs[0].device_lba
     };
     deepen(&img, table, phys);
     let node = img.0.borrow()[table as usize * 1024..][..1024].to_vec();
-    let mapped = Ext4(&img).map_file(b"/d/x", &mut [BlockRun::default(); 4]).map(drop);
+    let mapped = Ext4::new(&img).map_file(b"/d/x", &mut [BlockRun::default(); 4]).map(drop);
     assert_eq!(mapped, Err(FsError::Corrupt), "mapped through an index over the table");
-    assert_eq!(Ext4(&img).grow_file(b"/d/x", 9000, NOW), Err(FsError::Corrupt), "grown through it");
+    assert_eq!(Ext4::new(&img).grow_file(b"/d/x", 9000, NOW), Err(FsError::Corrupt), "grown through it");
     assert!(img.0.borrow()[table as usize * 1024..][..1024] == node[..], "the table is as it was");
 
     // A real leaf, mapping the table's first block, freed with the file.
     let img = RwImage(RefCell::new(base.0.borrow().clone()));
     let (leaf, _) = crate::ext4::alloc_run(&img, &sb, 0, 1).unwrap();
     deepen(&img, leaf, table);
-    assert_eq!(Ext4(&img).truncate_file(b"/d/x", 0, NOW), Err(FsError::Corrupt), "a leaf over the table");
+    assert_eq!(Ext4::new(&img).truncate_file(b"/d/x", 0, NOW), Err(FsError::Corrupt), "a leaf over the table");
     assert!(crate::ext4::block_in_use(&img, &sb, table), "the table's block stays marked");
 
     // An extent of two of the table's blocks, cut between them.
@@ -600,6 +597,6 @@ fn a_tree_over_metadata_is_never_read_as_a_node_or_freed() {
     img.0.borrow_mut()[at + 4..at + 8].copy_from_slice(&2048u32.to_le_bytes());
     img.0.borrow_mut()[at + 56..at + 58].copy_from_slice(&2u16.to_le_bytes());
     let before = img.0.borrow().clone();
-    assert_eq!(Ext4(&img).truncate_file(b"/d/x", 1024, NOW), Err(FsError::Corrupt), "a tail over the table");
+    assert_eq!(Ext4::new(&img).truncate_file(b"/d/x", 1024, NOW), Err(FsError::Corrupt), "a tail over the table");
     assert!(*img.0.borrow() == before, "refused before any write");
 }
