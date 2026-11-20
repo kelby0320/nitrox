@@ -190,7 +190,7 @@ pub(crate) mod test_support {
         static SEQ: AtomicU32 = AtomicU32::new(0);
         let id = SEQ.fetch_add(1, Ordering::Relaxed);
         let dir = std::env::temp_dir().join(format!("nitrox-ext4-fix-{}-{}", std::process::id(), id));
-        let sysdir = dir.join("system");
+        let sysdir = dir.join("tree").join("system"); // beside the image: around it, it held itself
         std::fs::create_dir_all(&sysdir).unwrap();
         std::fs::File::create(sysdir.join("current-generation")).unwrap().write_all(content).unwrap();
         let img = dir.join("rootfs.ext4");
@@ -203,7 +203,7 @@ pub(crate) mod test_support {
         }
         let status = cmd
             .arg("-d")
-            .arg(&dir)
+            .arg(dir.join("tree"))
             .arg(&img)
             .arg(blocks.to_string())
             .status()
