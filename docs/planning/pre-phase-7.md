@@ -1083,17 +1083,17 @@ specs staged as they are. Terminal only, and the shell first (the maintainer's c
 
 ## Part H — what the bash left
 
-**Added 2026-10-22, when Part D was triaged (the maintainer's call)**: the findings marked
-**later** in [`bug-bash.md`](bug-bash.md), which is their record. After Part G, so Part E is not
-held for them; before Phase 7, which builds on what they leave. Each is checked against `main`
-first, as Part E will have moved much of the code they name, then reproduced and fixed with a test
-that fails without it, as Part D's are. **Detailed 2026-11-19**, in
+**Added 2026-10-22, when Part D was triaged (the maintainer's call)**: the findings marked **later**
+in [`bug-bash.md`](bug-bash.md), which is their record. After Part G, so Part E is not held for
+them; before Phase 7, which builds on what they leave. Each is checked against `main` first, as Part
+E will have moved much of the code they name, then reproduced and fixed with a test that fails
+without it, as Part D's are. **Detailed 2026-11-19**, in
 [`what-the-bash-left.md`](what-the-bash-left.md): ten sub-parts, a PR each, measured on `main` at
-#458's merge. Of fifty open, four were fixed by later work, and fifteen defects and thirty-one test
-gaps remain. The ext4 defects first; then service-mgr; storage-service and the broker; every server
-the sessions share, held to a share a session (the maintainer's call); and the shell's `$env`,
-written through. Then the test gaps, by subsystem. The kernel's per-process quotas stay deferred,
-the maintainer's call.
+#458's merge. Of fifty-one open, four were fixed by later work, and fifteen defects and thirty-two
+test gaps remain. The ext4 defects first; then service-mgr; storage-service and the broker; every
+server the sessions share, held to a share a session (the maintainer's call); and the shell's
+`$env`, written through. Then the test gaps, by subsystem. The kernel's per-process quotas stay
+deferred, the maintainer's call.
 
 - **Supervisors, sessions and parsers**: one app holding every client slot of the view broker or
   the storage service (sec-4, sup-6), `service-mgr`'s backoff, and the rest of the class.

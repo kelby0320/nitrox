@@ -38810,13 +38810,14 @@ on `main` at `3c6919a4`.
   - Each test gap's mutations were run against the crate's whole suite.
   - Each defect was reproduced by a temporary host test where its code is reachable, and read
     otherwise.
-- **Of fifty open, four were fixed by later work**, and are ticked in `bug-bash.md`:
+- **Of fifty-one open, four were fixed by later work**, and are ticked in `bug-bash.md`. The
+  fifty-first is sched-10, marked fix and left open for Part H by Part D:
   - sup-7, by `e6a4ecf2`;
   - kmem-10, by `7938344d`;
   - proto-5, by `662163e6`;
   - kmem-19, by `ac2ed261`.
 
-  Five more are partly closed. **Fifteen defects and thirty-one test gaps remain**, every gap
+  Six more are partly closed. **Fifteen defects and thirty-two test gaps remain**, every gap
   holdable by host tests.
 - **Four reach further than the bash recorded.**
   - **sup-2 can match the wrong partition**: an entry off the disk shifts libgpt's index from the
@@ -38848,3 +38849,19 @@ on `main` at `3c6919a4`.
   - three kernel files.
 
   The same moves put code that only a boot could reach under a host test over `libos`'s mock.
+- **After review** (#459), the plan's specs were corrected where a test or fix written to their
+  words would have gone wrong.
+  - **sched-10 is in**, which the inventory had left out. Its last mutation now aborts the kernel's
+    suite by accident, and H.7 tests the poll itself.
+  - **ext4's metadata check is made per group, with no table**, as the library has no `alloc` and
+    `nxinstall` writes with no mount.
+    - It is made at allocation as well as at reading and freeing.
+    - **A writable mount whose layout the per-group check does not cover is served read-only**,
+      with its reason.
+  - **A cut before a growth recounts `i_blocks` from the tree.** On disk nothing says whether
+    blocks past the size were counted. `grow_file_from` has the same flaw today.
+  - **The fs-9 test names the e2fsck lines it forbids and those it accepts** as the failed-write
+    TODO's cost.
+  - **ext4 keeps a volume found unclean, or one whose change failed, unclean**, as FAT does.
+  - **`$env` is judged by the record an assignment would leave**, not by its syntax.
+  - **A reclaimed session's client is told to resolve again**, not handed `PeerClosed`.

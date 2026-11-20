@@ -23,8 +23,9 @@ sub-parts, a PR each.**
 
 ### What the pass found
 
-Fifty findings were open: those marked later, less the eleven Part I fixed (ten moved there, and
-kmem-26 with kmem-9) and the four Part E fixed.
+Fifty-one findings were open. Fifty were marked later, less the eleven Part I fixed (ten moved
+there, and kmem-26 with kmem-9) and the four Part E fixed. The fifty-first is sched-10, marked fix
+in Part D, which left it "open, for Part H" for the one mutation it could not catch.
 Parts D, E, I and J changed much of the code they name, so each was checked against today's `main`
 before it was planned. Seven agents each took a group, in worktrees of their own, without a boot.
 - **A test gap:** each mutation the finding names was applied to today's code and run against the
@@ -46,7 +47,10 @@ What they found is below.
    - **kmem-19:** the push after the reservation is `push_within_capacity(..) else unreachable!`
      (`ac2ed261`), so removing the reservation now fails 6 tests. The refused reservation stays
      untested, as nothing on the host can make a vector's reservation fail.
-2. **Five are partly closed**, and what is left is planned below.
+2. **Six are partly closed**, and what is left is planned below.
+   - **sched-10:** removing `wait_on`'s poll path, the mutation Part D could not catch, now aborts
+     the kernel's suite, by accident: J.15's `armed` test polls, and the poll falls through to a
+     deadline with no slot promised. Nothing tests the poll itself.
    - **kmem-14:** zeroing is in `Frame::alloc_zeroed` (Part J). An object made from `alloc` is
      caught only by test order.
    - **fs-13:** its adjacent defect, an over-long suffix opening a directory, is fixed
@@ -61,7 +65,9 @@ What they found is below.
        same write, found by losing each write in turn (`Failing::after`).
      - **fs-11:** a crafted stick's extent over the inode table is served by `map_file` before any
        unlink. The kernel's write-back of that file would write into the inode table, and an
-       unlink frees the block to the next create, which zeroed the root inode in the reproduction.
+       unlink, a truncate or a growth's cut frees the block to the next allocation, which zeroed
+       the root inode in the reproduction. A bitmap bit cleared over the inode table has
+       `alloc_run` hand the block out the same way.
    - **service-mgr: sup-3, sup-4, sup-8, sup-10 and sup-11.**
      - **sup-3:** at the defaults, the backoff is 0 for attempts 55 to 63.
      - **sup-4:** a route is drained with no bound, by reading.
@@ -86,7 +92,7 @@ What they found is below.
    - fs-16, pr365-7, pr365-8.
 
    **Every one of them, and every partial one above, can be held by host tests; none needs a
-   boot.**
+   boot.** sched-10's poll path, which Part D found no host test could reach, is reached now.
 5. **Four findings reach further than the bash recorded.**
    - **sup-2 can match the wrong partition, not only none.**
      - An entry off the disk is skipped by the kernel and kept by libgpt, which shifts libgpt's
@@ -96,9 +102,12 @@ What they found is below.
      - The real root looks free to automount, and mounting it a second time puts two writers on
        one ext4. No shipped manifest uses `gpt-partuuid:`.
    - **sup-8's sibling is an appended block that boots.** A name skipped first, for a bad
-     endpoint, does not stop a later block of the same name. `[service.x]` with a bad endpoint,
-     then `[service.x] executable = "/evil"`, takes `/evil`. Today the critical count sends that
-     boot to `eshell`, so a fix that only stopped counting duplicates would let it boot.
+     endpoint, does not stop a later block of the same name, once another declaration lies between
+     them: the duplicate check reads only the names taken. `[service.x]` with a bad endpoint, then
+     `[service.y]`, then `[service.x] executable = "/evil"`, takes `/evil`. When the first `x` is
+     critical, its skip sends the boot to `eshell`; when it is not, `/evil` boots today. A fix that
+     stopped counting the skip of a name later taken would let it boot either way. Two adjacent
+     headers are one declaration, whose first `executable` wins, and are not this.
    - **nxsh-1 has four more stale readers:**
      - a bare `cd` goes to the old `HOME`;
      - `~` expands to the old `HOME`;
@@ -106,7 +115,7 @@ What they found is below.
      - `$env = {}` is accepted, and the next stage still gets the whole record.
    - **The slot class is wider than sec-4 and sup-6.** Every server that any session can reach
      shares one pool, with no per-session bound and no idle reclaim:
-     - the root filesystem, 31 sessions (`libfsserver`);
+     - the root filesystem, 30 sessions, as `init` keeps its control channel (`libfsserver`);
      - tty-server, 14 terminals;
      - the clipboard, 30;
      - the profile server, 31;
@@ -123,8 +132,8 @@ What they found is below.
      then be given syscaps its parent lacks. The memory-object reply's rights intersection has the
      same gap.
    - **A kernel test flake.** PID 4491 is used by two kernel tests, and each ends by closing every
-     handle that PID owns. In about one full run in 37, run concurrently, one closes the other's
-     handles.
+     handle that PID owns. Run concurrently, one closes the other's handles: one agent saw it once
+     in about 37 full runs.
    - **Drivers:**
      - `xhci/desc.rs` has seven arm-length guards untested, each a panic on a short descriptor.
      - `hid/descriptor.rs`'s `id_slot` bound panics if loosened.
@@ -132,8 +141,12 @@ What they found is below.
        hardware returns.
    - **ext4:**
      - `on_device` admits block 1 on a 1 KiB-block filesystem, the primary superblock.
-     - `mark_clean` writes `STATE_CLEAN` at unmount whatever failed, by reading. FAT leaves a
-       volume marked after a failed change.
+     - `mark_clean` writes `STATE_CLEAN` at unmount whatever the mount found and whatever
+       failed: a volume found unclean, or one whose create was refused, is recorded clean. FAT
+       keeps both marked.
+     - `create_file` leaks the inode when the inode's own write is refused.
+     - `grow_file_from` leaves `i_blocks` short when a file whose size write was lost is grown
+       again.
    - **Equivalent guards:** two guards no test can kill, as the code after each refuses the same
      inputs: FAT's numeric-tail leading-zero check, and the FSInfo hint's validity check at load.
    - **Stale words:**
@@ -224,7 +237,7 @@ before H.10 tests its other bounds.
 
 Part H is done when H.10 has merged and what Miri reports is triaged.
 
-### H.1 ext4: a directory that cannot grow, and an extent over metadata
+### H.1 ext4: a directory that cannot grow, an extent over metadata, and a volume recorded clean
 
 **fs-9.** `dir_insert` grows a directory by a block:
 1. `append_block` maps block N past the end;
@@ -240,50 +253,113 @@ its journal, and on a failed update remounts read-only rather than healing.
 - **The fix cuts the tree at the size before it grows**, as `grow_file_from` already does for a
   file: `extent::truncate(rw, sb, dir_inode, nblocks, ..)` before `append_block`. That covers a
   lost write and a crash alike, since a growth always starts by cutting what lies past the end.
-  About three lines, at the cost of one cached leaf read.
+- **A cut that freed anything recounts `i_blocks` from the tree.** The cut subtracts what it frees,
+  but on disk nothing says whether blocks past the size were ever counted:
+  - Linux's `fallocate` with `KEEP_SIZE` counts them;
+  - a lost inode write after `extent::append` wrote a leaf does not.
+
+  So neither subtracting nor not subtracting is right, and the cut alone leaves `i_blocks` two
+  sectors short after a crash between the leaf write and the size write. The recount walks the
+  tree:
+  - data extents, written and unwritten;
+  - the tree's own nodes;
+  - the xattr block, if `i_file_acl` is set.
+
+  It takes a block of stack a level, as `free_tree` does, and a growth that cut nothing pays
+  nothing. **`grow_file_from` has the same flaw today**: a file grown again after its size write
+  was lost is left `i_blocks` short. It takes the recount too.
 - **A refused size write is undone as the block write's is.** The size goes back, and the tree is
   cut.
+- **A create whose inode write is refused frees the inode.** `create_file` returns without
+  `free_inode` today, the same class as the growth.
 - **`dir_insert` moves out of `ext4.rs` first**, into `ext4/`, as `ext4.rs` is at its entry.
-- **Test, in `volume/crash_tests.rs`:** a full directory with a depth-1 tree, built cheaply (1 KiB
-  blocks and long names). Each write of the growing create is lost in turn, once and from then on,
-  and after each a create and a mkdir succeed and `e2fsck -n` is clean. Today it fails at once(9),
-  after(8) and after(9).
+- **Test, in `volume/crash_tests.rs`:**
+  - **The fixture:** a full directory with a depth-1 tree on 1 KiB blocks, files with 250-byte
+    names, three to a block, each with a data block between the directory's, so its next create
+    grows it.
+  - **The stops:** each of the growing create's eleven writes is lost in turn, once and from then
+    on. After each, on its own copy of the image, a create and a mkdir, both with 250-byte names,
+    must succeed, as a short name fits a full block's slack and never grows it.
+  - **e2fsck may never show:**
+    - `end of extent exceeds`;
+    - `i_blocks is`;
+    - `i_size is`;
+    - a bitmap difference with `+`;
+    - the crate's `NEVER` set;
+    - an unattached inode, when the write was lost once.
+  - **e2fsck may show**, as `TODO(ext4-failed-write-undo)`'s recorded cost:
+    - a bitmap difference with `-`;
+    - a free count one above what is counted;
+    - from then on, an unattached zero-length inode, since a crash between an inode's write and its
+      link cannot be undone without a journal.
+  - **Today it fails at once(9), after(8) and after(9)**, the later operations refused. With the
+    cut and no recount, `i_blocks` shows at all three.
+  - **`grow_file_from`'s recount** gets a test of its own: a depth-1 file whose final inode write
+    was lost, grown again, and checked by e2fsck.
 - **`deferred-decisions.md`'s `ext4-failed-write-undo` entry** is corrected: a lost write cost a
   directory more than free space until this.
-- **`mark_clean`'s unconditional `STATE_CLEAN`** is checked against FAT's marking.
-  - If a failed change can leave the volume recorded clean, it is fixed here, with a test.
-  - If not, the reason goes in the PR.
 
-**fs-11.** `on_device` bounds an extent only to the device. A crafted stick's extent over a
-group's inode table:
+**fs-11.** `on_device` bounds an extent only to the device, and `alloc_run` only to the bitmap. A
+crafted stick's extent over a group's inode table:
 - is served to the kernel by `map_file`, so write-back of that file writes into the inode table;
-- is freed by an unlink, so the next create takes the block and zeroes it.
+- is freed by an unlink, a truncate, a growth's cut past the size, or a directory growth's cut,
+  so the next allocation takes the block and zeroes it.
 
-Linux checks every extent against its system zone (`ext4_sb_block_valid`): each group's
-superblock and descriptor copies, its two bitmaps and its inode table.
-- **The zone is built once, at mount, as a sorted table of merged ranges**, in a new
-  `ext4/zone.rs`.
-  - With `flex_bg` a group's tables lie in a few groups together, so adjacent ranges merge into
-    few.
-  - A check is then a binary search, where walking the descriptors per check would read 59 blocks
-    on a 931 GiB disk.
-  - The table's size follows the group count: a few entries a group at most, and far fewer with
-    `flex_bg`.
-- **The zone is checked where an extent is read and where a run is freed:**
-  - the leaf and index sites in `extent.rs`;
-  - `ext4::free_run`.
+A crafted stick whose bitmap marks an inode-table block free has it handed out by `alloc_run` the
+same way. Either way the root inode was zeroed in the reproductions, and e2fsck could not proceed.
 
-  Each answers `Corrupt`.
+Linux checks extents, frees and allocations against its system zone (`ext4_sb_block_valid`): each
+group's superblock and descriptor copies, its two bitmaps and its inode table.
+- **The check needs no table, and no state from a mount.** The library has no `alloc`, `Ext4`
+  holds only its reader, and `nxinstall` calls the library's functions with no mount at all. So
+  the check is made per group:
+  - the superblock and descriptor-table copies a group holds are computed from the superblock's
+    own fields (`sparse_super`, the table's blocks, `s_reserved_gdt_blocks`);
+  - the group's bitmaps and inode table are read from its descriptor, through the metadata cache;
+  - with `flex_bg`, from the descriptors of its flex group, one block of them.
+
+  A run touches at most two groups at 4 KiB blocks.
+- **A writable mount checks that the layout is one the per-group check covers.** That means every
+  group's metadata lies in its own group, or in its flex group's first group, which is what
+  Nitrox's `mkfs` and `mke2fs` make. A filesystem whose layout is otherwise (a fallback of
+  `mke2fs`, or one `resize2fs` moved) is served read-only, with the reason, as `writable()` serves
+  a feature it does not keep. A read-only mount neither allocates nor frees. The check is never
+  skipped silently.
+- **Where it is made:**
+  - **where an extent is read:** the leaf and index sites in `extent.rs`, so `map_file` never
+    hands the kernel a metadata extent;
+  - **where a run is freed:** `ext4::free_run`, which every free goes through, the cuts,
+    `free_tree`, `fold`, the give-backs and `free_block` among them;
+  - **where a run is allocated:** `alloc_run`, which refuses a free bit over metadata as
+    `Corrupt`.
 - **`on_device` refuses block `first_data_block`** and below, as Linux does, which shuts out the
   primary superblock on a 1 KiB-block filesystem.
-- **Test, in `volume/hostile_tests.rs`:** an extent pointed at each kind of metadata block,
-  including a backup superblock on a fixture of several groups.
-  - `map_file` answers `Corrupt`.
-  - An unlink and release leave the block's bit set.
-  - The neighbour case: an extent at the first block past the inode table maps and frees as
-    before.
+- **Test, in `volume/hostile_tests.rs`:**
+  - an extent pointed at each kind of metadata block, including a backup superblock on a fixture
+    of several groups:
+    - `map_file` answers `Corrupt`;
+    - an unlink and release, a truncate, a growth over the extent past the size, and a directory
+      growth over one past its size each leave the block's bit set;
+  - a bitmap bit cleared over an inode-table block, then an allocation whose goal is that block:
+    refused, and the root inode intact;
+  - the neighbour case: an extent at the first block past the inode table maps, frees and
+    allocates as before;
+  - a writable mount of a layout outside the rule is served read-only, with its reason.
 - **Not here:** an extent over another file's blocks. Linux does not check that either; only an
   fsck's scan can.
+
+**A volume recorded clean.** ext4's unmount writes `STATE_CLEAN` whatever it found and whatever
+failed.
+- A filesystem found not cleanly unmounted (the mount only logs "serving it anyway") is recorded
+  clean at its unmount, which hides the crash's damage from the next `e2fsck -p`.
+- So is one whose change failed during the mount.
+
+FAT keeps a `found_dirty` for both. ext4's volume does the same: it remembers a state found
+unclean, and marks itself on a change that fails. Its unmount then leaves the state as it was
+found, the error bit included. Tests:
+- a volume found unclean stays unclean after a mount and an unmount;
+- one whose create was refused stays unclean;
+- one found clean, with nothing failed, is recorded clean.
 
 **Gates:** `check-storage`, `check-media` and `check-install`, which write ext4. No new gate.
 
@@ -307,9 +383,12 @@ already takes for its tests.
 - **sup-8 and its sibling: a duplicate is checked against every name seen, taken or skipped.** A
   name's first block decides, whether it was taken or skipped, so an appended block can no longer
   replace it. A critical declaration skipped as a duplicate no longer counts as unreadable.
-  - Test, three manifests: a whole duplicate boots; an appended block boots; a block skipped
-    first, then a good one of the same name, takes neither and sends the boot to `eshell`, the
-    first being critical.
+  - Test, over the parser and `unfit`:
+    - a whole duplicate of a critical declaration boots, and so does an appended block;
+    - a block skipped for its endpoint, another declaration, then a good block of the same name:
+      neither block is taken, whether the first is critical or not, and a critical first sends the
+      boot to `eshell`. The declaration between is what tells the fix from today's code, since
+      adjacent headers already take neither.
 - **sup-10: the exit-code grace waits its whole length.** `wait_codes` loops until the
   notification queue fires or `until` passes, as `lookup_serving` does. Test over the mock: a
   route's resolve during the grace no longer ends it. `mock::sleeps()` pins it, and a five-line
@@ -325,9 +404,10 @@ already takes for its tests.
     restart already looks like.
   - Test over the mock: a copy taken before Ready, then the registration; a resolve on the copy is
     then answered.
-- **sup-14, sup-15, sup-16: tests.**
-  - `init`'s unmount answer is refused with a wrong magic, and with a reply id other than its
-    request's.
+- **sup-14: `init`'s unmount answer is held to its request.** A wrong magic is refused, a test
+  only. A reply id other than the request's is refused too, which is a code change in `init`'s
+  critical path: `answer` takes the request's id, and `unmount_one` passes it. The author makes it.
+- **sup-15, sup-16: tests.**
   - A mistyped `policy` falls back to `Never` and a mistyped `backoff` to the default.
   - `parse_duration_ns` saturates past `u64::MAX` nanoseconds and refuses a number past `u64`.
   - libinittoml refuses `key = "a"b"`.
@@ -349,8 +429,9 @@ services.
     - a kernel test that a registered partition's record carries its GUID;
     - storage-service tests of `source_device` over records for each of the eight cases,
       including the wrong match;
-    - a boot that shows the record carries it. No gate boots a `gpt-partuuid:` root today, so
-      which gate reads the GUID back is H.3's to settle.
+    - a boot that holds the match end to end. No gate boots a `gpt-partuuid:` root today, so one
+      gate's image names its root by GUID, and the boot checks storage-service knows `init`'s
+      mount. Which gate, H.3 settles.
 - **sup-5: a re-probe is rate-limited.**
   - A probe that waits on a device cannot be cut short, as a dropped I/O waits out its device
     before the buffer is free again.
@@ -388,7 +469,12 @@ services.
   - which id the servers share, the broker's or the supervisor's, and how an ended session
     reaches each server;
   - a session marker no path can begin with, for the filesystems' suffixes in H.5;
-  - the share's size per pool.
+  - the share's size per pool;
+  - **what counts as idle, and what an evicted client sees.** Today a full table answers the
+    newcomer `WouldBlock`, which clients retry. An evicted client's next operation would get
+    `PeerClosed`, which none retries, and a `libfsserver` directory session also carries mkdir,
+    unlink, rmdir, touch and rename. So only a session with nothing in flight is reclaimed, and
+    what its client is told lets librsproto's `Dir` resolve again and resume at its cursor.
 
 **The servers in H.4:**
 - **The view broker (sec-4).** It already has the identity.
@@ -418,9 +504,13 @@ H.4's mechanism, carried to the rest:
   a full table.
 - **tty-server.** A terminal is not idle while its session lives, so it is held to a share and
   never reclaimed.
-- **The clipboard and the profile server.** They are held to a share. The profile server's index
-  is rebuilt when a listing it cached empty can be served, so a full table no longer leaves
-  `/applications` empty until a restart.
+- **The clipboard and the profile server.** They are held to a share. The profile server caches
+  an index only when every package was read: a package whose directory was refused, or whose
+  listing failed, leaves the index uncached, so the next ask builds it again. Today a full table
+  leaves an index empty or partial until a restart, and programs of a skipped package go
+  unresolved, as programs are resolved from the same index. Test over the mock, after the
+  admission move: one package's resolve refused and another's served, then both served once the
+  refusal clears.
 
 tty-server, the clipboard and the profile server admit clients in their binaries, with no mock.
 Their admission moves into their libraries, with `libos`'s mock as a dev-dependency.
@@ -430,10 +520,15 @@ Their admission moves into their libraries, with `libos`'s mock as a dev-depende
 ### H.6 The shell's environment, and two commands that ignore an argument
 
 - **nxsh-1: `$env` writes through.**
-  - An assignment whose root is `$env`, whether a field or the whole record, updates the record
-    the shell reads. That is what `cd`, `~`, every stage's environment and `program_path` all use.
+  - An assignment whose root is `$env`, in any form, is applied to a copy, and the copy is judged
+    as a whole, not by the assignment's syntax. It must be a record of strings, and its `PWD`
+    must be there and unchanged; otherwise the assignment is refused, naming `cd` for `PWD`. Then
+    it becomes the record the shell reads, which is what `cd`, `~`, every stage's environment and
+    `program_path` all use.
+  - The forms judged alike: a field (`$env.HOME = …`), a name index (`$env["PWD"] = …`), the
+    whole record (`$env = {}`, `$env = ($env | update PWD "/x")`) and a value that is not a
+    record (`$env = 5`).
   - A new field adds a variable.
-  - `$env.PWD = …` is refused, naming `cd`.
   - The binding is republished from the record, so the two never disagree again, as
     `rebind_env` promises.
   - The code goes in a module of its own; `assign` calls it in one line, as `eval.rs` is at its
@@ -441,7 +536,9 @@ Their admission moves into their libraries, with `libos`'s mock as a dev-depende
   - `shell-language.md` says `$env` is assignable, with a version bump, and `$args` stays
     unassignable.
   - Test, a new `env_tests.rs` driven through the REPL:
-    - assign a field, run a program, and read its environment;
+    - assign a field, run a program, and read its environment, and the same by a name index;
+    - each form that would remove or change `PWD`, or make `$env` not a record, refused, with the
+      directory unchanged;
     - `cd` and read again;
     - a bare `cd` and `~`;
     - a new field;
@@ -472,8 +569,10 @@ Tests only, but one helper, in new test files, since `syscall/table.rs` and
     - the sender's pid stamped;
     - a map of two pages of a one-page object.
   - The guards are tested as functions today, and none where it is called.
-- **kmem-14:** a frame is dirtied and freed, then an object is made, and the object reads zero. It
-  is deterministic, where today only test order catches `alloc` in place of `alloc_zeroed`.
+- **kmem-14:** a frame is dirtied and freed, then an object is made, and the object reads zero.
+  The host's buddy is one allocator every concurrent test shares, so the object may not get the
+  dirtied frame, and the one it gets may be zero by chance. The test therefore checks the object
+  holds the dirtied frame by its address, and tries again when another test took it.
 - **kmem-17:** `find_free_range` refuses a request one page larger than its window, takes the
   whole window, and finds a hole that fits exactly.
 - **proto-16:**
@@ -482,6 +581,9 @@ Tests only, but one helper, in new test files, since `syscall/table.rs` and
   - a forget with a bad magic is refused;
   - each request builder refuses a suffix of 65,536 bytes and takes 65,535, the sized builder's
     and the rename's destination among them.
+- **sched-10:** a poll, `wait_on` with a deadline of 0, on objects none of which is ready answers
+  `TimedOut` at once and registers no waiter, so removing the poll path fails a test, not an
+  abort.
 - **The PID 4491 flake:** one of the two tests is renumbered, and a test that the kernel tests'
   PIDs are distinct holds the class.
 
@@ -499,7 +601,9 @@ today because the broken code and the correct code give the same answer on the e
 - **drv-10:** each of `partition_rebase`'s four overflows decided by itself, and a dispatch through
   a partition node at an offset that wraps.
 - **drv-11 and the seven arm guards:** one short descriptor per guard, each a panic without it. The
-  existing zero-length test, which hangs rather than fails when its guard goes, gets a bound.
+  existing zero-length test, which hangs rather than fails when its guard goes, gets a bound. Two
+  checks are not of a length: `configuration_total`'s `bLength` below 9, and `hid_interfaces`'
+  first interrupt-IN endpoint winning, held by an interface with two.
 - **drv-12:**
   - `dispatch_block_irp` refuses a request past its device's fragments.
   - **USB storage refuses what it clamped**, as AHCI's backstop does: it no longer issues 65
@@ -507,9 +611,10 @@ today because the broken code and the correct code give the same answer on the e
     test in `storage/tests/refusals.rs`.
 - **drv-13 and `id_slot`:** each rejection after a valid mouse, so a corrupt item cannot pass for
   "no mouse".
+  - A truncated item, and a truncated long item.
   - A second mouse collection.
   - A second key array.
-  - Four pushes and a pop past them.
+  - Five pushes, one past `STACK_MAX`, and a pop with nothing pushed.
   - Sixteen report ids and a seventeenth.
 - **drv-14:**
   - a multifunction header (`0x80`);

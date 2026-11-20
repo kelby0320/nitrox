@@ -13,7 +13,7 @@ servers share, then FAT's, with fs-3's two halves and the trials' doc claims. Gr
 flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, which frees no
 thread in place now, and the deadline heap's slots. On 2026-10-27 ten later findings moved to
 Part I with the safety survey's defects that repeat them. Part H detailed 2026-11-19: four of its
-fifty found fixed by later work, and ticked.** Part D of
+fifty found fixed by later work, and ticked, and sched-10's last mutation planned.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -574,8 +574,9 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   that failure. Demonstrated: removing the reserve and running `object::file_object` survived.
   Lens: tests. Low. **Later.**
   Fixed in `ac2ed261`: the push after the reservation is `push_within_capacity(..) else
-  unreachable!`, so removing the reservation fails six `file_object` tests, found so in Part H's
-  detail pass. A refused reservation stays untested: nothing on the host makes one fail.
+  unreachable!`, so removing the reservation fails five `file_object` tests and one of
+  `syscall::table`'s, found so in Part H's detail pass. A refused reservation stays untested:
+  nothing on the host makes one fail.
 
 What held up: user copies (`validate_user_range` with `checked_add` against `USER_VIRT_END`,
 zero-size and empty-slice cases, `lookup_recovery` matching only the two registered PCs, `clac` and
@@ -1804,6 +1805,9 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   `sched::tests`, and `has_deadline` forced false by `test-qemu`. Removing `wait_on`'s poll path
   still fails nothing: a poll then blocks until the next tick, which no host test can drive
   without a running thread. Open, for Part H.
+  On `main` at `3c6919a4` that mutation aborts the kernel's suite, by accident: J.15's `armed` test
+  polls, and the poll falls through to a deadline with no slot promised. Part H's H.7 tests the
+  poll itself.
 
 What held up: `sys_wait` registration and blocking share one SCHED hold, so no lost wakeup, and a
 partial registration is fully unwound. The `wait_try_wake` CAS plus `make_runnable`'s not-in-blocked
