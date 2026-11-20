@@ -263,8 +263,8 @@ fn parse_duration_ns(v: &str) -> Option<u64> {
 /// A declaration is emitted only if its `[service.<name>]` table carried an
 /// `executable`; one without is skipped rather than being a reason to drop the file.
 ///
-/// **A repeated name is skipped, not re-emitted**: the failure it would otherwise cause is
-/// starting the same service twice, which is worse than ignoring the duplicate. One file holds
+/// **A repeated name is skipped, not re-emitted**, its first block deciding, taken or skipped:
+/// starting a service twice, or one a later block replaced, is worse than ignoring the duplicate. One file holds
 /// every service because nothing can enumerate a directory of `.toml` files.
 pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
     parse_all_reporting(text).0
@@ -304,15 +304,16 @@ impl SkipReason {
     }
 }
 
-/// Whether a critical declaration among `skipped` was not read: the boot stops ([`crate::bringup::unfit`]).
+/// Whether `skipped` holds a critical declaration not read; a duplicate's first block was.
 pub fn critical_unread(skipped: &[Skipped]) -> bool {
-    skipped.iter().any(|s| s.critical)
+    skipped.iter().any(|s| s.critical && s.why != SkipReason::Duplicate)
 }
 
 /// [`parse_all`], and every declaration it skipped, in file order.
 pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
     let mut out: Vec<ServiceDecl> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     let mut name: Option<String> = None;
     let mut executable: Option<String> = None;
     let mut after: Vec<String> = Vec::new();
@@ -334,11 +335,12 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
             let (n, e) = (name.take(), executable.take());
             let why = match (&n, &e) {
                 (None, _) => None,
+                (Some(n), _) if named.contains(n) => Some(SkipReason::Duplicate),
                 (Some(_), None) => Some(SkipReason::NoExecutable),
-                (Some(n), Some(_)) if out.iter().any(|d: &ServiceDecl| &d.name == n) => Some(SkipReason::Duplicate),
                 (Some(_), Some(_)) if matches!(endpoint, Some(None)) => Some(SkipReason::BadEndpoint),
                 _ => None,
             };
+            named.extend(n.clone());
             if let (Some(n), Some(why)) = (n.clone(), why) {
                 skipped.push(Skipped { name: n, why, critical });
             } else if let (Some(n), Some(e)) = (n, e) {
@@ -867,5 +869,32 @@ backoff_max = \"2s\"\n";
         assert_eq!(parse_duration_ns("18446744073709551615ms"), Some(u64::MAX));
         assert_eq!(parse_duration_ns("18446744073709551616s"), None);
         assert_eq!(parse_duration_ns("18446744073ms"), Some(18_446_744_073_000_000));
+    }
+
+    /// The names `text` declares and what the boot makes of them, mapped as `main.rs` maps them.
+    fn boot(text: &str) -> (Vec<String>, Option<&'static str>) {
+        use crate::bringup::{Entry, unfit};
+        let (decls, skipped) = parse_all_reporting(text);
+        let entries: Vec<Entry> =
+            decls.iter().map(|d| Entry { server: d.endpoint.is_some(), critical: d.critical }).collect();
+        (decls.into_iter().map(|d| d.name).collect(), unfit(&entries, critical_unread(&skipped)))
+    }
+
+    /// **A name is decided by its first block**, taken or skipped, so a later block cannot replace it.
+    #[test]
+    fn a_name_is_decided_by_its_first_block() {
+        let core = "[service.core]\nexecutable = \"/core\"\nendpoint = \"/svc/core\"\ncritical = true\n";
+        let other = "[service.other]\nexecutable = \"/other\"\n";
+        for again in [core, "[service.core]\ncritical = true\n"] {
+            assert_eq!(boot(&[core, other, again].concat()), (vec!["core".into(), "other".into()], None), "{again}");
+        }
+        for critical in [false, true] {
+            let first =
+                format!("[service.evil]\nexecutable = \"/evil\"\nendpoint = \"svc/evil\"\ncritical = {critical}\n");
+            let good = "[service.evil]\nexecutable = \"/evil\"\nendpoint = \"/svc/evil\"\n";
+            let (names, unfit) = boot(&[core, &first, other, good].concat());
+            assert_eq!(names, ["core", "other"], "critical {critical}: neither block is taken");
+            assert_eq!(unfit.is_some(), critical, "critical {critical}: a critical first stops the boot");
+        }
     }
 }

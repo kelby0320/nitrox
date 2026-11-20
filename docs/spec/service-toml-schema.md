@@ -18,7 +18,7 @@ Building enumeration to serve the schema was rejected against changing the schem
 
 The file contains one `[service.<name>]` table per service, in any order. The service name comes from the table header.
 
-**Malformed input, since one bad table must not cost the file.** A `[service.<name>]` with no `executable` is skipped and does not consume the next declaration. A service name that appears again after another service's table closed it is dropped rather than started twice. A `[service.<other>.restart]` table belongs to `<other>` and never leaks into the declaration being parsed.
+**Malformed input, since one bad table must not cost the file.** A `[service.<name>]` with no `executable` is skipped and does not consume the next declaration. A service name that appears again after another service's table closed it is dropped rather than started twice, or in place of the first: **a name's first block decides**, taken or skipped, so a block appended after one skipped for its `endpoint` is not taken either (pre-Phase-7 Part H.2). A `[service.<other>.restart]` table belongs to `<other>` and never leaks into the declaration being parsed.
 
 **A repeated key keeps the first value** — `executable` and every `[restart]` key — so a declarations file cannot be steered by appending to it. That includes appending a whole second `[service.<name>.restart]` table, which re-enters the section rather than starting a new one. (Until 2026-08-21 this held for `executable` only, and the schema said otherwise; the restart keys were last-wins.)
 
@@ -116,8 +116,9 @@ Only `true` is true.
 
 **The file is held to its critical servers too** (PR #340 review). The service manager starts
 nothing, and asks for the emergency shell, when:
-- a declaration that says `critical = true` is skipped — an `endpoint` that does not read, no
-  `executable`, a repeated name — since that is a critical server that did not come up;
+- a declaration that says `critical = true` is skipped — an `endpoint` that does not read, or no
+  `executable` — since that is a critical server that did not come up. A repeated name is not: its
+  first block was read, and decided;
 - the file is missing, unreadable, or declares nothing that can be started;
 - no declaration is critical: the critical servers are what the boot cannot go on without, and a
   file with none has lost them.
