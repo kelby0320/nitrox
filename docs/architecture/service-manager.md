@@ -179,7 +179,10 @@ resolves the same path and reaches it. A route whose server is not up answers `N
 **The sessions bind the same routes** (Part E.1b). The login supervisors are handed a duplicate of
 the route to each server a session binds — the terminal server, the clipboard, the view broker,
 the compositor — never the server's own endpoint, so a session built before a restart reaches the
-new server too; `desktop-shell` passes the same handles into every application. `boot-probe`
+new server too; `desktop-shell` passes the same handles into every application. **A server not up
+when the chain starts is handed too**: its route is made then and answers `NotFound` until the
+server registers, as while one restarts. Until pre-Phase-7 Part H.2 only a live route was copied,
+and a server that came up late was out of every session's reach until a reboot. `boot-probe`
 proves it with a copy of the root made before a restart, which holds the same binding and is never
 rebound.
 

@@ -1060,10 +1060,10 @@ impl Mgr {
             .end();
     }
 
-    /// A duplicate of the route to server `name` for a login supervisor while something is bound
-    /// there.
-    fn route_copy(&self, name: &str, through: Option<&str>) -> Option<Endpoint> {
-        self.routes.live_copy(self.svcs.iter().position(|s| s.decl.name == name)?, through)
+    /// A copy of the route to server `name` for a login supervisor ([`Routes::copy`]).
+    fn route_copy(&mut self, name: &str, through: Option<&'static str>) -> Option<Endpoint> {
+        let i = self.svcs.iter().position(|s| s.decl.name == name)?;
+        self.routes.copy(i, &self.svcs[i].decl.name, through)
     }
 
     /// An admin or power session by its handle's value; `None` for `0`, one that has closed.

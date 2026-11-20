@@ -98,3 +98,22 @@ fn a_route_that_keeps_signalling_ends_the_grace_wait_at_its_deadline() {
     assert!(!wait_codes(&notif, &routes, None, time::now().unwrap() + 2_000_000));
     assert!(replies(&routes[r].client).len() < SERVE_DEPTH as usize, "ended by the clock, not by the ring");
 }
+
+/// **A route copied before its server is up reaches it once it is**, as a login supervisor's must.
+#[test]
+fn a_route_copied_before_its_server_is_up_reaches_it_once_it_is() {
+    mock::reset();
+    let registry = BindNs::create().unwrap();
+    let mut routes = Routes::default();
+    let copy = routes.copy(3, "storage-service", None).expect("a copy before the server is up");
+    // Its registration, as `register` makes it: the route found, and live.
+    let r = routes.route(3, "storage-service", None).unwrap();
+    assert!(mock::same_object(copy.raw().0, routes[r].client.raw().0), "the copy is that route");
+    resolve(&routes[r].client, 1);
+    routes.serve(Some(&registry), |_| true);
+    assert_eq!(replies(&routes[r].client), [(1, true)], "NotFound until it is up");
+    routes[r].live = true;
+    resolve(&routes[r].client, 2);
+    routes.serve(Some(&registry), |_| true);
+    assert_eq!(replies(&routes[r].client), [(2, false)], "answered once it is up");
+}

@@ -78,10 +78,10 @@ impl Routes {
         Some(self.0.len() - 1)
     }
 
-    /// A copy of the route to server `svc` for a login supervisor, while something is bound there.
-    pub fn live_copy(&self, svc: usize, through: Option<&str>) -> Option<Endpoint> {
-        let found = self.0.iter().find(|r| r.live && r.through == through && r.svc == svc);
-        found.and_then(|r| r.client.duplicate(Rights::TRANSFER | Rights::DUPLICATE).ok())
+    /// A copy of the route to server `svc`, `name`, made if need be: `NotFound` until it is up.
+    pub fn copy(&mut self, svc: usize, name: &str, through: Option<&'static str>) -> Option<Endpoint> {
+        let r = self.route(svc, name, through)?;
+        self.0[r].client.duplicate(Rights::TRANSFER | Rights::DUPLICATE).ok()
     }
 
     /// Add every route to `set`, telling `named` each one's index there and its own.
