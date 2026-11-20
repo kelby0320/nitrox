@@ -319,11 +319,32 @@ fn a_file_grown_after_a_growth_lost_its_size_write_counts_its_blocks() {
     let base = rw.0.into_inner();
     let grow = |vol: &Ext4<'_, Failing>| vol.grow_file(b"/system/a", 7 * 1024, NOW).map(drop);
     let total = writes(&base, |vol| grow(vol).unwrap());
-    let lost = Failing::after(base, total - 1);
-    assert_eq!(grow(&Ext4::new(&lost)), Err(FsError::Io), "the size write, last, is lost");
-    let then = crate::test_support::RwImage(std::cell::RefCell::new(lost.image.0.into_inner()));
-    Ext4::new(&then).grow_file(b"/system/a", 9 * 1024, NOW).unwrap();
-    crate::test_support::assert_e2fsck_clean(&then.0.borrow(), "grown-after-a-lost-size");
+    for xattr in [false, true] {
+        let lost = Failing::after(base.clone(), total - 1);
+        assert_eq!(grow(&Ext4::new(&lost)), Err(FsError::Io), "the size write, last, is lost");
+        let mut img = lost.image.0.into_inner();
+        if xattr {
+            // A value too long for the inode, so `debugfs` gives it a block, which `i_blocks` counts.
+            img = with_xattr_block(img, "/system/a");
+            let held = crate::ext4::read_inode(&crate::test_support::ImageReader(img.clone()), &sb, a).unwrap();
+            assert_ne!(crate::rd_u32(&held, 104), 0, "an extended-attribute block");
+        }
+        let then = crate::test_support::RwImage(std::cell::RefCell::new(img));
+        Ext4::new(&then).grow_file(b"/system/a", 9 * 1024, NOW).unwrap();
+        crate::test_support::assert_e2fsck_clean(&then.0.borrow(), "grown-after-a-lost-size");
+    }
+}
+
+/// `img` with a 500-byte extended attribute on `path`, written by `debugfs`.
+fn with_xattr_block(img: Vec<u8>, path: &str) -> Vec<u8> {
+    let f = std::env::temp_dir().join(format!("nitrox-xattr-{}.img", std::process::id()));
+    std::fs::write(&f, img).unwrap();
+    let set = format!("ea_set {path} user.long {}", "x".repeat(500));
+    let out = std::process::Command::new("debugfs").args(["-w", "-R", &set]).arg(&f).output().unwrap();
+    assert!(out.status.success(), "debugfs: {}", String::from_utf8_lossy(&out.stderr));
+    let img = std::fs::read(&f).unwrap();
+    let _ = std::fs::remove_file(&f);
+    img
 }
 
 /// A device that keeps the offset of every write, in order.
@@ -353,53 +374,4 @@ fn a_create_whose_inode_write_is_refused_gives_the_inode_back() {
     let rw = Failing::once(base, n);
     assert_eq!(Ext4::new(&rw).create_file(b"/system", b"new", NOW), Err(FsError::Io));
     crate::test_support::assert_e2fsck_clean(&rw.image.0.borrow(), "inode-write-refused");
-}
-
-fn state(img: &[u8]) -> u16 {
-    u16::from_le_bytes([img[1024 + 58], img[1024 + 59]])
-}
-
-/// **An unmount records clean only what its mount found clean and no change failed on**: found not
-/// clean, or with errors, it is left as found, and after a failed change as the mount left it.
-#[test]
-fn an_unmount_records_clean_only_what_was_found_clean_and_never_failed() {
-    for found in [0x0001u16, 0x0000, 0x0002, 0x0003] {
-        let mut img = fixture(4096, b"seed\n");
-        img[1024 + 58..1024 + 60].copy_from_slice(&found.to_le_bytes());
-        let rw = crate::test_support::RwImage(std::cell::RefCell::new(img));
-        let vol = Ext4::new(&rw);
-        vol.mark_mounted().unwrap();
-        assert_eq!(state(&rw.0.borrow()), found & !1, "{found:#06x}: mounted, never clean");
-        vol.create_file(b"/system", b"made", NOW).unwrap();
-        assert_eq!(vol.mkdir_at(2, b"system", NOW), Err(FsError::Exists));
-        vol.mark_clean().unwrap();
-        assert_eq!(state(&rw.0.borrow()), found, "{found:#06x}: unmounted as found");
-        assert_eq!(vol.was_left_clean(), Ok(found == 1), "{found:#06x}");
-    }
-    type Change = fn(&Ext4<'_, Failing>) -> Result<(), FsError>;
-    let changes: [(&str, Change, FsError); 2] = [
-        ("a create the device refused", |v| v.create_file(b"/system", b"made", NOW), FsError::Io),
-        (
-            "a truncate over metadata",
-            |v| v.truncate_file(b"/system/current-generation", 0, NOW).map(drop),
-            FsError::Corrupt,
-        ),
-    ];
-    for (what, change, why) in changes {
-        let mut img = fixture(4096, b"seed\n");
-        if why == FsError::Corrupt {
-            let rw = crate::test_support::RwImage(std::cell::RefCell::new(img.clone()));
-            let sb = crate::ext4::read_superblock(&rw).unwrap();
-            let file = Ext4::new(&rw).map_file(b"/system/current-generation", &mut [BlockRun::default(); 1]);
-            let at = crate::ext4::inode_offset(&rw, &sb, file.unwrap().id as u32).unwrap() as usize;
-            img[at + 60..at + 64].copy_from_slice(&1u32.to_le_bytes()); // the descriptor table's block
-        }
-        let rw = if why == FsError::Io { Failing::once(img, 1) } else { Failing::after(img, u64::MAX) };
-        let vol = Ext4::new(&rw);
-        vol.mark_mounted().unwrap();
-        assert_eq!(change(&vol), Err(why), "{what}");
-        vol.create_file(b"/system", b"after", NOW).unwrap();
-        vol.mark_clean().unwrap();
-        assert_eq!(state(&rw.image.0.borrow()), 0x0000, "{what}: left as the mount left it");
-    }
 }

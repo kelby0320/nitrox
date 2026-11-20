@@ -22,13 +22,13 @@
 //!
 //! **An unmount is a chain**: the label leaves `fs`, every dirty file is written back (the mount's
 //! flush, by `FLUSH_TIMEOUT_NS`), the unmount is refused if a file is still held (the mount's
-//! held), the server records the filesystem clean and exits (`Meta::Unmount`), the drive's cache
-//! is flushed, and the namespace is dropped.
+//! held), the server records the unmount and exits (`Meta::Unmount`: clean, unless it was found not
+//! clean or something failed), the drive's cache is flushed, and the namespace is dropped.
 //!
 //! **A shutdown unmounts everything.** On `CTRL_OP_SHUTDOWN` (sent only by a shutdown, since this
 //! service is `essential`) it runs the chain on every mount, last mounted first, **without the
 //! held check**, by the maintainer's call: a write made after the sync is lost, as at a power
-//! cut, and every filesystem is left clean. Then it exits.
+//! cut, and every filesystem is left clean that was found so. Then it exits.
 
 #![no_std]
 #![no_main]

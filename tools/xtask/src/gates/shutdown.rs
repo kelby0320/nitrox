@@ -224,7 +224,8 @@ fn check_shutdown_sequence(transcript: &str) -> R<()> {
         "logging-service: asked to stop, exiting",
         "auth-service: asked to stop, exiting",
         "service-mgr: every service has been asked to stop; telling init to finish",
-        "init: / unmounted, and its server left the filesystem clean",
+        "init: / unmounted, and its server recorded how it was left",
+        "fs-server: unmounted, and the filesystem recorded clean",
         "power: stopping every processor, to halt",
     ] {
         if !transcript.contains(line) {

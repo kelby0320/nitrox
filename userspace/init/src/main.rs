@@ -555,7 +555,8 @@ fn reap_loop(notify: Option<Handle<Notify, Only>>, root: Root, mut terminal: Opt
 
 /// **Finish a shutdown.** `service-mgr` has asked every session and service to stop. What is left
 /// is `init`'s own: its mounts, last first — each flushed, then told `Meta::Unmount`, on which its
-/// server records the filesystem clean and exits — and then the machine, by the power node.
+/// server records the unmount, clean if it found it so, and exits — and then the machine, by the
+/// power node.
 /// Whatever one mount answers, the next is still unmounted, since one stopped half way leaves every
 /// later filesystem not clean; whatever still runs writes after the flush at its own risk, as at a
 /// power cut. **Each wait is bounded**: a flush by `FLUSH_TIMEOUT_NS`, an unmount's answer by
@@ -612,7 +613,7 @@ fn unmount_one(root: &Root, m: Kept) {
     if received {
         use init::unmount::Answer;
         match init::unmount::answer(msg.payload()) {
-            Answer::Done => line.s(b" unmounted, and its server left the filesystem clean"),
+            Answer::Done => line.s(b" unmounted, and its server recorded how it was left"),
             Answer::Failed(why) => line.s(b" unmounted, but not left clean: ").untrusted(why),
             Answer::Unexpected => line.s(b" answered its unmount with something else"),
         };

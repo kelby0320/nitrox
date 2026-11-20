@@ -600,3 +600,25 @@ fn a_tree_over_metadata_is_never_read_as_a_node_or_freed() {
     assert_eq!(Ext4::new(&img).truncate_file(b"/d/x", 1024, NOW), Err(FsError::Corrupt), "a tail over the table");
     assert!(*img.0.borrow() == before, "refused before any write");
 }
+
+/// **An extent is checked whatever the extent before it**: one block at 8192, clear, then two
+/// from 8192, reaching group 1's backup superblock, which a cache of the first would map.
+#[test]
+fn an_extent_is_checked_though_the_last_began_at_its_block() {
+    let img = zoned();
+    let at = x_inode(&img);
+    {
+        let mut v = img.0.borrow_mut();
+        v[at + 4..at + 8].copy_from_slice(&3072u32.to_le_bytes());
+        v[at + 42..at + 44].copy_from_slice(&2u16.to_le_bytes());
+        for (i, (lblock, len)) in [(0u32, 1u16), (1, 2)].into_iter().enumerate() {
+            let x = at + 52 + 12 * i;
+            v[x..x + 12].fill(0);
+            v[x..x + 4].copy_from_slice(&lblock.to_le_bytes());
+            v[x + 4..x + 6].copy_from_slice(&len.to_le_bytes());
+            v[x + 8..x + 12].copy_from_slice(&8192u32.to_le_bytes());
+        }
+    }
+    let mapped = Ext4::new(&img).map_file(b"/d/x", &mut [BlockRun::default(); 4]).map(drop);
+    assert_eq!(mapped, Err(FsError::Corrupt));
+}

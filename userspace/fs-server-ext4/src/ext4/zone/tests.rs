@@ -90,3 +90,47 @@ fn the_zone_is_the_metadata_dumpe2fs_names() {
         }
     }
 }
+
+/// **The layout check reads the descriptor table a block at a time**: on a 931 GiB disk without
+/// `flex_bg`, 7,448 groups, it read 16 at a time, 466 commands to a disk probed with no cache.
+#[test]
+fn the_layout_check_reads_the_table_a_block_at_a_time() {
+    use crate::ext4::superblock::Backups;
+    struct Counting(Vec<u8>, std::cell::Cell<u64>);
+    impl BlockReader for Counting {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            self.1.set(self.1.get() + 1);
+            let at = offset as usize;
+            buf.copy_from_slice(self.0.get(at..at + buf.len()).ok_or(FsError::Io)?);
+            Ok(())
+        }
+    }
+    let blocks = 931u64 << 18; // 931 GiB of 4 KiB blocks
+    let sb = Superblock {
+        block_size: 4096,
+        inodes_per_group: 8192,
+        inode_size: 256,
+        desc_size: 32,
+        first_gdt_block: 1,
+        blocks_per_group: 32768,
+        first_data_block: 0,
+        blocks_count: blocks,
+        inodes_count: 0,
+        backups: Backups::Sparse,
+        reserved_gdt_blocks: 0,
+        groups_per_flex: 1,
+    };
+    let groups = sb.group_count() as u64;
+    let table = (groups * 32).div_ceil(4096);
+    let mut img = vec![0u8; ((1 + table) * 4096) as usize];
+    for g in 0..groups {
+        let start = sb.group_start(g as u32) + if sb.has_super(g as u32) { sb.super_blocks() } else { 0 };
+        let d = 4096 + 32 * g as usize;
+        for (at, block) in [(0, start), (4, start + 1), (8, start + 2)] {
+            img[d + at..d + at + 4].copy_from_slice(&(block as u32).to_le_bytes());
+        }
+    }
+    let r = Counting(img, 0.into());
+    assert_eq!(layout(&r, &sb), Ok(()));
+    assert_eq!((groups, r.1.get()), (7448, table), "a read a block of the table");
+}

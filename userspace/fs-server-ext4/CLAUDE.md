@@ -18,7 +18,10 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
 
 ## Structure
 
-- **`src/ext4.rs` + `src/lib.rs` — the parser + write path.** Pure logic behind the
+- **`src/ext4.rs` and `src/ext4/` + `src/lib.rs` — the parser + write path.** `ext4.rs` reads and
+  names; `ext4/` holds the superblock (`superblock.rs`), `s_state` (`state.rs`), allocating and
+  freeing (`alloc.rs`), a file's growth (`grow.rs`), a directory's insert (`insert.rs`) and the
+  system zone (`zone.rs`). Pure logic behind the
   `BlockReader` (`read_at`) and `BlockWriter` (`write_at`) traits, so it is 100%
   host-tested against an `mke2fs` fixture — including `e2fsck` on the mutated image
   after `grow_file`. `no_std`, **no `alloc`**: buffer-based (`read_file` into a

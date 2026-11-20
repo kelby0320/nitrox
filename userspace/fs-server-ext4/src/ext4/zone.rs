@@ -4,7 +4,7 @@
 
 use super::*;
 
-/// The bytes of descriptors read at a time.
+/// The bytes of descriptors [`clear`] reads at a time: a flex group's of 16, the usual size.
 const CHUNK: usize = 512;
 
 /// Groups whose descriptors [`clear`] reads for a block's: its flex group, up to a block of them.
@@ -17,19 +17,19 @@ fn tables(sb: &Superblock, d: &[u8]) -> [(u64, u64); 3] {
     [(rd_u32(d, 0) as u64, 1), (rd_u32(d, 4) as u64, 1), (rd_u32(d, 8) as u64, sb.table_blocks())]
 }
 
-/// Hand each descriptor of groups `from..to` to `each` until one answers `false`, and answer that.
+/// Hand each descriptor of groups `from..to`, read `buf` at a time, to `each` until one answers
+/// `false`, and answer that.
 fn descriptors<R: BlockReader>(
     r: &R,
     sb: &Superblock,
-    from: u64,
-    to: u64,
+    (from, to): (u64, u64),
+    buf: &mut [u8],
     mut each: impl FnMut(u64, &[u8]) -> bool,
 ) -> Result<bool, FsError> {
     let size = sb.desc_size as usize;
-    let mut buf = [0u8; CHUNK];
     let mut g = from;
     while g < to {
-        let n = (to - g).min((CHUNK / size) as u64);
+        let n = (to - g).min((buf.len() / size) as u64);
         let bytes = &mut buf[..n as usize * size];
         r.read_meta(sb.group_desc_offset(g as u32), bytes)?;
         for (i, d) in bytes.chunks_exact(size).enumerate() {
@@ -63,7 +63,7 @@ pub(crate) fn clear<R: BlockReader>(r: &R, sb: &Superblock, phys: u64, len: u64)
         }
         let flex = group / span * span;
         let apart = |_: u64, d: &[u8]| tables(sb, d).iter().all(|&(s, n)| stop <= s || s.saturating_add(n) <= at);
-        if !descriptors(r, sb, flex, (flex + span).min(groups), apart)? {
+        if !descriptors(r, sb, (flex, (flex + span).min(groups)), &mut [0u8; CHUNK], apart)? {
             return Ok(false);
         }
         at = stop;
@@ -91,7 +91,9 @@ pub(crate) fn layout<R: BlockReader>(r: &R, sb: &Superblock) -> Result<(), Unser
         }
         ok
     };
-    descriptors(r, sb, 0, groups, inside).map_err(|_| Unservable::Unreadable)?;
+    // A block at a time: the probe reads a disk with no cache, and a 931 GiB root has 7,448 groups.
+    let block = &mut [0u8; MAX_BLOCK][..sb.block_size as usize];
+    descriptors(r, sb, (0, groups), block, inside).map_err(|_| Unservable::Unreadable)?;
     match outside {
         Some(group) => Err(Unservable::Layout { group }),
         None => Ok(()),

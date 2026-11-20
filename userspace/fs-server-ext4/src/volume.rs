@@ -9,23 +9,63 @@ use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, D
 /// **An ext4 filesystem on `R`**: the read-write disk, or the `ReadOnly` over it a read-only
 /// mount is served through, and what its unmount is to record.
 pub struct Ext4<'a, R> {
-    r: &'a R,
+    /// The device, as every operation reaches it.
+    dev: Watched<'a, R>,
     /// `s_state` as a writable mount found it.
     found: Cell<Option<u16>>,
-    /// Whether a change failed on the device, or found the filesystem corrupt, during this mount.
+}
+
+/// **The device, noting each write it refuses**: a change may answer `Ok`, or `TooLarge`, with a
+/// write lost inside it, and its answer does not say so.
+struct Watched<'a, R> {
+    r: &'a R,
+    /// Whether a write failed, or an operation failed on the device or found corruption.
     failed: Cell<bool>,
+}
+
+impl<R> Watched<'_, R> {
+    fn note(&self, out: Result<(), FsError>) -> Result<(), FsError> {
+        if matches!(out, Err(e) if e != FsError::ReadOnly) {
+            self.failed.set(true);
+        }
+        out
+    }
+}
+
+impl<R: BlockReader> BlockReader for Watched<'_, R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.r.read_at(offset, buf)
+    }
+    fn read_meta(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.r.read_meta(offset, buf)
+    }
+    fn read_only(&self) -> bool {
+        self.r.read_only()
+    }
+}
+
+impl<R: BlockWriter> BlockWriter for Watched<'_, R> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        self.note(self.r.write_at(offset, buf))
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        self.note(self.r.write_zeroes(offset, len))
+    }
+    fn forget(&self, offset: u64, len: u64) {
+        self.r.forget(offset, len)
+    }
 }
 
 impl<'a, R> Ext4<'a, R> {
     /// The filesystem on `r`.
     pub fn new(r: &'a R) -> Self {
-        Ext4 { r, found: Cell::new(None), failed: Cell::new(false) }
+        Ext4 { dev: Watched { r, failed: Cell::new(false) }, found: Cell::new(None) }
     }
 
-    /// What a change answered, noting a failure on the device or a corrupt find for the unmount.
-    fn changed<T>(&self, out: Result<T, FsError>) -> Result<T, FsError> {
+    /// What an operation answered, noting a failure on the device or corruption, on any path.
+    fn noted<T>(&self, out: Result<T, FsError>) -> Result<T, FsError> {
         if matches!(out, Err(FsError::Io | FsError::Corrupt)) {
-            self.failed.set(true);
+            self.dev.failed.set(true);
         }
         out
     }
@@ -66,11 +106,11 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
     type Unservable = Unservable;
 
     fn read_only(&self) -> bool {
-        self.r.read_only()
+        self.dev.read_only()
     }
 
     fn check(&self) -> Result<(), Unservable> {
-        ext4::check_device(self.r)
+        ext4::check_device(&self.dev)
     }
 
     fn state_unwritable() -> Unservable {
@@ -78,87 +118,87 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
     }
 
     fn was_left_clean(&self) -> Result<bool, FsError> {
-        ext4::was_left_clean(self.r)
+        ext4::was_left_clean(&self.dev)
     }
 
     fn mark_mounted(&self) -> Result<(), FsError> {
-        self.found.set(Some(ext4::mark_mounted(self.r)?));
+        self.found.set(Some(ext4::mark_mounted(&self.dev)?));
         Ok(())
     }
 
     fn mark_clean(&self) -> Result<(), FsError> {
         match self.found.get() {
-            Some(found) => ext4::mark_unmounted(self.r, found, self.failed.get()),
+            Some(found) => ext4::mark_unmounted(&self.dev, found, self.dev.failed.get()),
             None => Ok(()),
         }
     }
 
     fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError> {
-        let m = ext4::map_file(self.r, path, runs)?;
+        let m = self.noted(ext4::map_file(&self.dev, path, runs))?;
         Ok(Mapped { size: m.size, block_size: m.block_size, runs: m.runs, id: m.ino as u64 })
     }
 
     fn read_file(&self, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
-        ext4::read_file(self.r, path, out)
+        self.noted(ext4::read_file(&self.dev, path, out))
     }
 
     fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError> {
-        ext4::read_file_range(self.r, path, offset, len, out)
+        self.noted(ext4::read_file_range(&self.dev, path, offset, len, out))
     }
 
     fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError> {
-        self.changed(ext4::create_file(self.r, parent, name, now).map(drop))
+        self.noted(ext4::create_file(&self.dev, parent, name, now).map(drop))
     }
 
     fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
-        self.changed(ext4::grow_file_from(self.r, path, size, now).map(|(was, _)| was as u64))
+        self.noted(ext4::grow_file_from(&self.dev, path, size, now).map(|(was, _)| was as u64))
     }
 
     /// An ext4 file keeps its inode at any size, so a truncate ends no id.
     fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<Option<u64>, FsError> {
-        self.changed(ext4::truncate_file(self.r, path, size, now).map(|_| None))
+        self.noted(ext4::truncate_file(&self.dev, path, size, now).map(|_| None))
     }
 
     fn resolve_dir(&self, path: &[u8]) -> Result<u64, FsError> {
-        ext4::resolve_dir(self.r, path).map(u64::from)
+        self.noted(ext4::resolve_dir(&self.dev, path).map(u64::from))
     }
 
     fn read_dir(&self, dir: u64, cursor: u64, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
-        ext4::read_dir_stat(self.r, ino(dir)?, cursor, |id, ft, name, st| {
+        self.noted(ext4::read_dir_stat(&self.dev, ino(dir)?, cursor, |id, ft, name, st| {
             emit(&DirEntry { id, kind: map_kind(ft, st.mode), mode: st.mode, size: st.size, mtime: st.mtime, name })
-        })
+        }))
     }
 
     fn mkdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        self.changed(ext4::mkdir_at(self.r, ino(dir)?, name, now))
+        self.noted(ext4::mkdir_at(&self.dev, ino(dir)?, name, now))
     }
 
     fn unlink_at(&self, dir: u64, name: &[u8], now: i64) -> Result<Option<u64>, FsError> {
-        self.changed(ext4::unlink_at(self.r, ino(dir)?, name, now).map(|orphan| orphan.map(u64::from)))
+        self.noted(ext4::unlink_at(&self.dev, ino(dir)?, name, now).map(|orphan| orphan.map(u64::from)))
     }
 
     fn rmdir_at(&self, dir: u64, name: &[u8], now: i64, freeing: impl FnOnce(u64)) -> Result<(), FsError> {
-        self.changed(ext4::rmdir_at(self.r, ino(dir)?, name, now, |i| freeing(u64::from(i))))
+        self.noted(ext4::rmdir_at(&self.dev, ino(dir)?, name, now, |i| freeing(u64::from(i))))
     }
 
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        self.changed(ext4::touch_at(self.r, ino(dir)?, name, now))
+        self.noted(ext4::touch_at(&self.dev, ino(dir)?, name, now))
     }
 
     fn rename_at(&self, dir: u64, old: &[u8], new: &[u8], now: i64) -> Result<(), FsError> {
-        self.changed(ext4::rename_at(self.r, ino(dir)?, old, new, now))
+        self.noted(ext4::rename_at(&self.dev, ino(dir)?, old, new, now))
     }
 
     fn rename_path(&self, old: &[u8], new: &[u8], replace: bool, now: i64) -> Result<Option<u64>, FsError> {
-        self.changed(ext4::rename_path(self.r, old, new, replace, now).map(|replaced| replaced.map(u64::from)))
+        self.noted(ext4::rename_path(&self.dev, old, new, replace, now).map(|replaced| replaced.map(u64::from)))
     }
 
     fn touch_file(&self, id: u64, now: i64) -> Result<(), FsError> {
-        self.changed(ext4::touch_file(self.r, ino(id)?, now))
+        self.noted(ext4::touch_file(&self.dev, ino(id)?, now))
     }
 
     fn release(&self, id: u64, now: i64) -> Result<(), FsError> {
-        self.changed(ext4::release_inode(self.r, ino(id)?, now))
+        self.noted(ext4::release_inode(&self.dev, ino(id)?, now))
     }
 }
 
@@ -717,3 +757,6 @@ mod hostile_tests;
 
 #[cfg(test)]
 mod crash_tests;
+
+#[cfg(test)]
+mod unmount_tests;

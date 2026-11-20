@@ -105,9 +105,12 @@ and each link runs only once the one before it held:
    again after a few milliseconds before it is believed, because an IRP that just finished holds
    its file until its completion ends (`syscall-abi.md` § `sys_ns_lookup`). **A refusal here leaves
    the mount exactly as it was.**
-4. **The server records the filesystem clean and exits**, on
-   [`Meta::Unmount`](rsproto-wire-format.md). From here the mount is gone, whatever the answer. A
-   read-only mount records nothing and leaves the filesystem as it was found, clean or not.
+4. **The server records the unmount and exits**, on [`Meta::Unmount`](rsproto-wire-format.md):
+   the filesystem clean, unless it was found not clean or a change failed or found it corrupt
+   during the mount, when it is left marked for a check. From here the mount is gone, whatever the
+   answer. A read-only mount records nothing and leaves the filesystem as it was found, clean or
+   not. **A success says the unmount was recorded, not that the filesystem is clean**: the
+   service's line says which, from the device read again.
 5. **The drive's cache is flushed** (`IoOpcode::Flush`), for a writable mount. A read-only mount
    wrote nothing.
 6. **The mount's namespace is dropped.**
@@ -116,7 +119,7 @@ and each link runs only once the one before it held:
 |---|---|
 | `NotFound` | nothing is mounted with that label. `init`'s mounts have no label and are never unmounted here |
 | `WouldBlock` | a file on it is still open or mapped |
-| `IoError` | a write-back failed (the mount is left as it was); or the server did not record the filesystem clean, or the flush failed (the mount is gone either way) |
+| `IoError` | a write-back failed (the mount is left as it was); or the server could not record the unmount, or the flush failed (the mount is gone either way) |
 
 ### `InUse` (`0x1002`)
 

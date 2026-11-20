@@ -42,7 +42,8 @@ pub fn request(out: &mut [u8], request_id: u64) -> Option<usize> {
 /// What a server answered an unmount with.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Answer<'a> {
-    /// The filesystem is recorded clean, or, for a read-only mount, left as it was found.
+    /// The unmount is recorded: clean, or marked for a check, as the server's own line says; for a
+    /// read-only mount, as it was found.
     Done,
     /// It could not be: here is why, empty if the server gave no reason that parses.
     Failed(&'a [u8]),
