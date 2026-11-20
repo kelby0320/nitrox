@@ -13,7 +13,8 @@ servers share, then FAT's, with fs-3's two halves and the trials' doc claims. Gr
 flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, which frees no
 thread in place now, and the deadline heap's slots. On 2026-10-27 ten later findings moved to
 Part I with the safety survey's defects that repeat them. Part H detailed 2026-11-19: four of its
-fifty found fixed by later work, and ticked, and sched-10's last mutation planned.** Part D of
+fifty found fixed by later work, and ticked, and sched-10's last mutation planned. H.1 fixed
+fs-9 and fs-11 2026-11-20.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -735,7 +736,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   `a_name_taken_away_returns_what_it_freed_whatever_write_is_refused_after` and
   `what_a_change_answers_is_what_it_did`.
 
-- [ ] **fs-9** `userspace/fs-server-ext4/src/ext4.rs:1115` — If `dir_insert`'s directory growth
+- [x] **fs-9** `userspace/fs-server-ext4/src/ext4.rs:1115` — If `dir_insert`'s directory growth
   loses its last write (the inode's new size), nothing undoes it. Once the directory's extent tree
   has a leaf block (depth 1 or more), the leaf already maps block N past the unchanged i_size.
   Every later insert that needs a block appends at N again, and `extent::add` refuses it as
@@ -747,6 +748,13 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   create's 11 writes in turn. Only write 9 (the directory inode) gave "later creates failing: 30
   Some(Some(Corrupt))", and `e2fsck` said "end of extent exceeds allowed value (logical block 6,
   physical block 388, len 1)". Lens: error-paths. medium. **Later.**
+  Fixed in `02a12f1b`: a directory's growth cuts its tree at its size first, counting `i_blocks`
+  from the tree when that frees anything (as a file's growth now does too), a refused size write is
+  undone, and a create whose inode write is refused frees the inode; fails without it:
+  `a_directory_growth_stopped_at_any_write_leaves_it_able_to_grow` (a growing create, mkdir and
+  rename, each write refused once and from then on),
+  `a_file_grown_after_a_growth_lost_its_size_write_counts_its_blocks` and
+  `a_create_whose_inode_write_is_refused_gives_the_inode_back`.
 
 - [x] **fs-10** `userspace/fs-server-ext4/src/ext4.rs:1692` — The guard against moving a directory
   into its own subtree is a byte-prefix test, `new_parent_path.starts_with(old_path)`, with no
@@ -762,7 +770,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   `a_directory_moves_beside_a_name_that_begins_with_its_own_but_never_into_itself` and
   `a_loop_of_parent_records_is_corrupt_to_move_a_directory_into`.
 
-- [ ] **fs-11** `userspace/fs-server-ext4/src/extent.rs:163` — `on_device()` bounds an extent only to
+- [x] **fs-11** `userspace/fs-server-ext4/src/extent.rs:163` — `on_device()` bounds an extent only to
   `[first_data_block, blocks_count)`, so an extent over a group's bitmaps, inode table or GDT, or
   over another file's blocks, is accepted and then freed by truncate, unlink or release through
   `free_run`. The metadata blocks are cleared in the bitmap and the allocator hands them out. A
@@ -771,6 +779,16 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   absent. Demonstrated: patching a created file's extent start to the inode-table block (34). Its
   bitmap bit was 1 before and 0 after `unlink_at` plus `release_inode`. Lens: tests. medium.
   **Later.**
+  Fixed in `3adb57d3`: `ext4/zone.rs` holds a run off each group's superblock and descriptor
+  copies, bitmaps and inode table wherever an extent is used, freed or allocated, and a writable
+  mount of a layout it does not cover is served read-only; fails without it, each of its ten check
+  sites alone: `an_extent_over_metadata_is_never_mapped_or_freed`,
+  `a_tree_over_metadata_is_never_read_as_a_node_or_freed`,
+  `a_free_bit_over_an_inode_table_is_refused_and_the_root_inode_kept`,
+  `a_layout_the_check_does_not_cover_is_served_read_only` and
+  `an_extent_starts_past_the_first_data_block`. `the_zone_is_the_metadata_dumpe2fs_names` holds it
+  to `dumpe2fs` at every block of seven layouts. An extent over another file's blocks is not caught,
+  as Linux does not catch it.
 
 - [x] **fs-12** `userspace/fs-server-fat/src/table.rs:282` — `allocate()` aborts with `?` on a used
   cluster whose FAT entry is reserved or out of range (Corrupt) after it has marked free clusters.

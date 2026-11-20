@@ -1,6 +1,6 @@
 # What the bash left
 
-**Status: detailed 2026-11-19.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
+**Status: detailed 2026-11-19; H.1 built 2026-11-20.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
 bug bash triaged **later**, which [`bug-bash.md`](bug-bash.md) records, checked against `main` and
 fixed, each with a test that fails without it.
 
@@ -362,6 +362,33 @@ found, the error bit included. Tests:
 - one found clean, with nothing failed, is recorded clean.
 
 **Gates:** `check-storage`, `check-media` and `check-install`, which write ext4. No new gate.
+
+**Built 2026-11-20**, in five commits. Where it departs from the above:
+- **More left `ext4.rs` than `dir_insert`**: the allocator, the growth, the insert, `s_state` and
+  the superblock moved to `ext4/` together, since each fix touched one and the file was at its size
+  entry.
+- **The fs-9 test sweeps a growing `mkdir` and rename too**, the create's class, and checks each
+  write refused once straight after it as well, since an undo is what makes that clean. The create
+  whose inode write is refused has a test of its own: its leak reads in `e2fsck` exactly as a lost
+  count write's does.
+- **The layout rule is "inside its flex group"**, not "in its own group or its flex group's first":
+  `mke2fs` on 1 KiB blocks spills a flex group's inode tables past its first group, and the check
+  reads the same descriptors either way. `the_zone_is_the_metadata_dumpe2fs_names` holds it to
+  `dumpe2fs` at every block of seven layouts, `sparse_super2` and a reserve among them.
+- **A volume is marked by a change answering `Io` or `Corrupt`**; a refusal for what was asked, a
+  name taken, marks nothing. `was_left_clean` counts the error bit as not clean, as `e2fsck -p`
+  does.
+- **Two gates assumed the old record**: `check-storage` and `check-recovery` mark the copy's root
+  not clean before boot, mount it writable and unmount it. They now expect it left not clean, the
+  table saying so, and on the host `e2fsck` clean with `s_state` still not clean. So an installed
+  root a crash left not clean is now reported so at every boot until something checks it, which
+  `TODO(fs-repair)`'s entry says.
+- **A test fixture held a copy of its own image**: `fixture_blocks` made the image inside the tree
+  `mke2fs -d` copied, filling most of a small fixture's group 0. Fixed first, in its own commit.
+- **Four older tests used blocks no file can hold**: two 32,768-block extents through a backup
+  superblock, now on a layout with none past group 0; a free-run comparison over the inode tables,
+  now across group 1's end into group 2; and geometry edges whose inflated inode count is now also
+  a layout no writer may keep, checked read-only.
 
 ### H.2 service-mgr and init
 

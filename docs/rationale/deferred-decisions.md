@@ -1497,7 +1497,9 @@ resident page of a dirty object.
 administration Part C.3 a writable mount clears ext4's clean bit and an unmount sets it again, so
 a filesystem knows it was left mounted: a crash, a power cut, or, until Part E's shutdown, any
 boot of an installed machine. `fs-server-ext4` **reports** that and serves the filesystem
-anyway. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
+anyway. **Since pre-Phase-7 Part H.1 it stays marked**: an unmount records clean only what its mount
+found clean and no change failed on, as FAT's always has, so an installed root a crash left not
+clean is reported so at every boot until something checks it, here or on another machine. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
 fine: this server writes metadata through at once, and a crash leaves at worst what
 `rename_path` and the two-phase free already document, an unattached inode that `e2fsck` puts in
 `lost+found`. **A FAT has no link count**, so a crash mid-rename leaves one file under two names,
