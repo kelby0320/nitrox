@@ -57,7 +57,11 @@ impl RestartConfig {
         match self.backoff {
             Backoff::None => 0,
             Backoff::Linear => self.initial_ns,
-            Backoff::Exponential => self.initial_ns.checked_shl(attempts).unwrap_or(u64::MAX).min(self.max_ns),
+            Backoff::Exponential => {
+                // A shift alone drops what it pushes out, so the doubling saturates by a multiply.
+                let doubled = 1u64.checked_shl(attempts).and_then(|f| f.checked_mul(self.initial_ns));
+                doubled.unwrap_or(u64::MAX).min(self.max_ns)
+            }
         }
     }
 }
@@ -828,5 +832,40 @@ backoff_max = \"2s\"\n";
         for bad in ["", "/", "log", "/svc/", "/svc//auth", "/./x", "/x/..", "/a b"] {
             assert!(!valid_endpoint(bad), "{bad}");
         }
+    }
+
+    /// **An exponential backoff saturates at its cap**, whatever the attempt: `initial << attempts`
+    /// wrapped silently from attempt 55, and a failing service was restarted nine times at once.
+    #[test]
+    fn an_exponential_backoff_saturates_at_its_cap() {
+        let at = |initial_ns, attempts| RestartConfig { initial_ns, ..RestartConfig::default() }.backoff_ns(attempts);
+        let (s, cap) = (1_000_000_000, 300_000_000_000);
+        assert_eq!((at(s, 8), at(s, 9)), (256 * s, cap), "the cap's neighbours");
+        for attempts in [54, 55, 63, 64, u32::MAX] {
+            assert_eq!(at(s, attempts), cap, "1 s, attempt {attempts}");
+        }
+        assert_eq!(at(100_000_000, 56), cap, "100 ms, attempt 56");
+    }
+
+    /// **A restart setting that does not read keeps its default**: never restart, back off doubling.
+    #[test]
+    fn a_restart_setting_that_does_not_read_keeps_its_default() {
+        let restart =
+            |body: &str| one(&format!("[service.s]\nexecutable = \"/s\"\n[service.s.restart]\n{body}")).restart;
+        for policy in ["\"on-failur\"", "always", "\"\""] {
+            assert_eq!(restart(&format!("policy = {policy}")).policy, RestartPolicy::Never, "{policy}");
+        }
+        assert_eq!(restart("policy = \"always\"").policy, RestartPolicy::Always);
+        assert_eq!(restart("backoff = \"expo\"").backoff, Backoff::Exponential);
+        assert_eq!(restart("backoff = \"linear\"").backoff, Backoff::Linear);
+    }
+
+    /// **A duration saturates past what nanoseconds hold**, and a number past `u64` does not read.
+    #[test]
+    fn a_duration_saturates_and_a_number_past_u64_does_not_read() {
+        assert_eq!(parse_duration_ns("18446744073709551615s"), Some(u64::MAX));
+        assert_eq!(parse_duration_ns("18446744073709551615ms"), Some(u64::MAX));
+        assert_eq!(parse_duration_ns("18446744073709551616s"), None);
+        assert_eq!(parse_duration_ns("18446744073ms"), Some(18_446_744_073_000_000));
     }
 }
