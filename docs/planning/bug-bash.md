@@ -1568,7 +1568,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   account with such a password. Demonstrated by mutation, restored. The reviewers' hand check
   of the 55/56/63-byte tails found the code correct as it stands. tests. Medium. **Later.**
 
-- [ ] **sec-10** `userspace/view-broker/src/main.rs:1322` — Each endpoint grant's bind treats any
+- [x] **sec-10** `userspace/view-broker/src/main.rs:1322` — Each endpoint grant's bind treats any
   non-zero `SYS_NS_BIND` result as "not there to grant". The view is a copy of the caller's
   namespace, and a caller already in a view has those paths bound, so the kernel answers
   AlreadyBound. Only the kernel-log grant tolerates AlreadyExists (1394). Scenario: in a shell
@@ -1583,6 +1583,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   == 0` is at Storage 1322-1335, Services 1341-1349, Power 1355-1363 and Logs 1369-1377, and
   `bind_endpoint` for views and accounts (1411, 1418) works the same way. `with.rs:277` sends
   `sys_ns_derive` of its own namespace unpruned. logic, trust-boundary. Low. **Later.**
+  Fixed in `e33cb740`: `spawning::grant` binds each endpoint grant in place of what the view's copy had at its path, on `AlreadyExists`, and any other refusal stands; fails without it: `a_grant_in_a_view_made_from_a_view_is_the_brokers`, and `test-interactive`'s step 20b, a `with admin whoami` inside `with admin nxsh` ("could not start: the storage service is not there to grant").
 
 - [ ] **sec-11** `userspace/view-broker/src/main.rs:1086` — A wrong current password on
   ChangePassword delays the session's next check but does not forget the session's
@@ -1867,7 +1868,7 @@ Found 21, refuted by a boot 0, reported 16.
   from a real stick rests on the code-read USB deadline and was not booted. Lenses: logic,
   error-paths, trust-boundary (three reviewers found it independently). High. **Fix.**
 
-- [ ] **sup-2** `userspace/storage-service/src/lib.rs:95` — the `gpt-partuuid` matching in
+- [x] **sup-2** `userspace/storage-service/src/lib.rs:95` — the `gpt-partuuid` matching in
   `source_device` reads the disk's table through libgpt and compares libgpt's entry name with the
   kernel's record name. The two read a GPT differently, so a partuuid root that init mounts is
   left unmatched. `init_known` then goes false, nothing is auto-mounted, and every admin Mount,
@@ -1881,6 +1882,7 @@ Found 21, refuted by a boot 0, reported 16.
   unlabelled root printed `source_device = None` and `init_known = false`. A nine-partition disk
   printed `read_table = None`. Run with `cargo test -p storage-service --lib probe_ --
   --nocapture`; the probe was removed. Lens: trust-boundary. Medium. **Later.**
+  Fixed in `d6ca5d21`: the kernel's record carries a GPT partition's unique GUID (registry version 3), and `source_device` matches `gpt-partuuid:` on it, reading no table; the test image's root is named by its GUID, so every test-image boot holds it; fails without it: `a_uuid_source_is_the_partition_whose_record_carries_it`, `a_partitions_record_carries_its_unique_guid_and_no_other_does`, and `test-qemu` ("the root is not one row, nitrox-root's").
 
 - [x] **sup-3** `userspace/service-mgr/src/main.rs:160` — `compute_backoff`'s exponential arm uses
   `initial_ns.checked_shl(attempts)`, which fails only for shifts of 64 or more. Bits shifted out
@@ -1907,7 +1909,7 @@ Found 21, refuted by a boot 0, reported 16.
   show whether the stop is answered before the flood ends. Lens: logic. Medium. **Later.**
   Fixed in `d1749b5b`: every route and every `/svc/services` handle is read at most `routes::PER_PASS` (16) a pass through `routes::take`, a ring left non-empty signalling the next wait; fails without it: `a_pass_answers_a_bounded_number_of_resolves_a_route` and `a_pass_takes_a_bounded_number_of_requests_from_a_channel`. Since `afd8f700` the bound counts every message, decoded or not, and holds a look at a control channel too; fails without it: `a_pass_counts_the_messages_that_do_not_decode` and `a_look_at_a_control_channel_is_bounded_and_sees_past_a_full_ring`.
 
-- [ ] **sup-5** `userspace/storage-service/src/main.rs:642` — every resolve of `info/<name>.tsm`,
+- [x] **sup-5** `userspace/storage-service/src/main.rs:642` — every resolve of `info/<name>.tsm`,
   including any session's `/dev/storage/all.tsm`, calls `refresh_unmounted`. That re-probes every
   unmounted device synchronously on the service's only thread, and each read is a `po_wait` with
   no deadline. One slow device with no filesystem (so it is never mounted) costs about 3-4
@@ -1919,6 +1921,7 @@ Found 21, refuted by a boot 0, reported 16.
   are skipped (main.rs:586). Unverified: time `cat /dev/storage/all.tsm` on a throttled QEMU
   usb-storage stick with no filesystem, and run `ls /storage` meanwhile. Lens: trust-boundary.
   Medium. **Later.**
+  Fixed in `fc18dc44`: `rescan::Rescan` has a table's resolve probe at most once in two seconds from the last probe's end, or when the mounts have changed, and a name that names no device probe nothing; fails without it: `a_probe_waits_out_the_interval_from_the_last_ones_end` and `a_change_of_mounts_probes_and_an_unknown_name_never_does`.
 
 - [ ] **sup-6** `userspace/storage-service/src/main.rs:704` — media sessions
   (`MAX_MEDIA_SESSIONS` = 2) and directory sessions (`MAX_DIRS` = 9) are one pool shared by every
@@ -2000,20 +2003,22 @@ Found 21, refuted by a boot 0, reported 16.
   resolve `/storage`. Lens: trust-boundary. Low. **Later.**
   Fixed in `1e904345`: a login supervisor's copy finds or makes the route, which answers `NotFound` until its server registers; fails without it: `a_route_copied_before_its_server_is_up_reaches_it_once_it_is`. Since `afd8f700` the login supervisors resolve the view broker's supervisor channel again at a login that has none, or whose broker has gone; fails without it: `a_broker_up_late_or_restarted_is_reached_at_the_next_login`.
 
-- [ ] **sup-12** `userspace/storage-service/src/probe.rs:125` — `partition_entries`, which decides
+- [x] **sup-12** `userspace/storage-service/src/probe.rs:125` — `partition_entries`, which decides
   whether a whole disk's own filesystem is ignored, has conditions no test pins: the 0xAA half of
   the signature, `e[4] != 0`, `first != 0`, `count != 0` and the bound `end <= blocks`. The
   `RamDisk` arm of `whole` is also unpinned. A regression would treat a disk with a stale sector 0
   as partitioned (a FAT or ext4 that should mount is reported as Nothing), or mount a partitioned
   disk whole over its partitions. Demonstrated: each mutation alone passed `cargo test -p
   storage-service --lib` (5 survivors, plus the `RamDisk` removal). Lens: tests. Low. **Later.**
+  Fixed in `2b5c929e`: held by tests; fails without it: `a_partition_table_needs_its_signature_and_a_used_entry_on_the_disk`, `a_partition_entry_must_end_on_the_disk` and `a_ram_disk_with_partition_entries_is_not_a_filesystem`, each mutation named.
 
-- [ ] **sup-13** `userspace/storage-service/src/probe.rs:150` — `fat_label`'s FAT12/16 branch
+- [x] **sup-13** `userspace/storage-service/src/probe.rs:150` — `fat_label`'s FAT12/16 branch
   (the `0x29` extended signature at 0x26 and the FAT string at 0x36) and the sector-size
   allow-list lack negative tests. Removing the `sector[0x26] == 0x29` check, or accepting 0 as a
   sector size, passed all storage-service tests. A non-FAT sector carrying those bytes would be
   probed as FAT and offered for mounting. Demonstrated: the two mutations passed the suite; the
   FAT32 branch equivalents were killed. Lens: tests. Low. **Later.**
+  Fixed in `2b5c929e`: held by tests; fails without it: `a_fat16_boot_sector_missing_a_mark_or_with_a_wrong_sector_size_is_not_one`, both mutations and sector sizes 0, 256 and 8192.
 
 - [x] **sup-14** `userspace/init/src/unmount.rs:42` — `unmount::answer` has no test for a wrong
   `RS_MAGIC`. Reducing the check to the length test passes all of init's tests, so a non-rsproto
@@ -2484,6 +2489,7 @@ before it is fixed.
   eviction, the long-name ordinal bound and checksum, the numeric-tail window, the rewrite's slot
   bound, the FSInfo hint, FAT32's reserved nibble, DEL in a name). Tests. Low.
   **Later**: each run against `main` as a mutation in Part H first.
+  T1-24 held in `2b5c929e`: fails without it: `a_fat_with_its_type_string_cleared_is_found_with_fats_own_label` and `a_fat_with_4k_sectors_gives_its_label`.
 - [x] **pr365-12** — the trials' other doc claims, not yet read against `main`: `Meta::Unmount`'s
   "recorded clean" where FAT keeps a volume found dirty (T1-16); `error-codes.md` pointing at the
   deleted `fs_kerror` (T1-18); `File::Forget`'s list missing a truncate to zero (T1-19);

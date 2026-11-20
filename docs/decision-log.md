@@ -38916,3 +38916,23 @@ H.1 merged, #460. H.2 on `pre-phase-7/h2-supervisors`, as
 - **storage-service's unmount answer is held to its request in H.3**, which moves that code out of
   a `main.rs` at its size entry, with a `lib.rs` at 1,000 lines.
 
+
+## 2026-11-20 — Before Phase 7: H.3, storage-service and the broker
+
+H.2 merged, #461. H.3 on `pre-phase-7/h3-storage-broker`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.3 plans it.
+
+- **A partition's registry record carries its unique GUID** (sup-2, the maintainer's call of
+  2026-11-19): `guid`, the record's last field, 160 bytes, registry version 3, zero for every node
+  but a GPT partition. The storage service matches `gpt-partuuid:` on it and reads no table of its
+  own, so a root the kernel published, however its table reads to `libgpt`, is `init`'s. The record
+  is not an input to the ABI version hash. **The test image's root is named by its GUID**, so every
+  test-image boot holds the match.
+- **A resolve of the storage table probes the unmounted devices at most once in two seconds**
+  (sup-5), or when the mounts have changed: a probe waits on its device and cannot be cut short.
+- **A grant in a view made from a view binds the broker's endpoint** (sec-10) in place of the
+  caller's binding; the kernel's log and the clock keep the caller's, as before.
+- **The storage service's unmount answer is held to its request**, the #461 review's finding 6,
+  as `init`'s is. **No code moved out of its `main.rs`**, which the H.2 entry above expected: each
+  fix fitted, and the file fell from 1,160 lines to 1,149.
+- **The probe's test gaps are held** (sup-12, sup-13, T1-24).
