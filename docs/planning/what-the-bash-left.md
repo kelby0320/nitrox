@@ -375,9 +375,11 @@ found, the error bit included. Tests:
   `mke2fs` on 1 KiB blocks spills a flex group's inode tables past its first group, and the check
   reads the same descriptors either way. `the_zone_is_the_metadata_dumpe2fs_names` holds it to
   `dumpe2fs` at every block of seven layouts, `sparse_super2` and a reserve among them.
-- **A volume is marked by a change answering `Io` or `Corrupt`**; a refusal for what was asked, a
-  name taken, marks nothing. `was_left_clean` counts the error bit as not clean, as `e2fsck -p`
-  does.
+- **A volume is marked by any write lost, and any operation answering `Io` or `Corrupt`**, reads
+  included (the maintainer's call, on the review): a change can answer `Ok` or `TooLarge` with a
+  write lost inside it, so `Ext4` reaches its device through a watcher that notes each refused
+  write. A refusal for what was asked, a name taken, marks nothing. `was_left_clean` counts the
+  error bit as not clean, as `e2fsck -p` does.
 - **Two gates assumed the old record**: `check-storage` and `check-recovery` mark the copy's root
   not clean before boot, mount it writable and unmount it. They now expect it left not clean, the
   table saying so, and on the host `e2fsck` clean with `s_state` still not clean. So an installed

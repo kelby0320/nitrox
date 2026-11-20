@@ -248,10 +248,14 @@ one, since its blocks read linearly as they are. An insert wrote over the tree's
 (`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
 change, and a mount that cannot write that is refused (`Unservable::StateUnwritable`). An
 unmount, on `Meta::Unmount` from its supervisor on the control channel, sets the bit again as its
-last write (`mark_unmounted`) **only if the mount found the filesystem clean and no change failed
-on the device or found it corrupt**; otherwise it leaves `s_state` as it was found, its error bit
-with it, or as the mount left it, not clean, as FAT does (pre-Phase-7 Part H.1). Until then a crash's
-damage, or a failed change's, was recorded clean at the next unmount and hidden from `e2fsck -p`.
+last write (`mark_unmounted`) **only if the mount found the filesystem clean, no write was lost
+and no operation failed on the device or found it corrupt**; otherwise it leaves `s_state` as it
+was found, its error bit with it, or as the mount left it, not clean (pre-Phase-7 Part H.1). A lost
+write is seen where it is lost, since `Ext4` reaches its device only through a watcher that notes
+each refused write: a change can answer `Ok` or `TooLarge` with one lost inside it. **A read that
+finds corruption marks it too**, as Linux marks an error found on any path; FAT's mark comes from a
+change alone. Until then a crash's damage, or a failed change's, was recorded clean at the next
+unmount and hidden from `e2fsck -p`.
 A state with its error bit set counts as not clean (`was_left_clean`), as `e2fsck -p` counts it.
 The server then replies and exits
 ([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found

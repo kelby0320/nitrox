@@ -106,8 +106,8 @@ and each link runs only once the one before it held:
    its file until its completion ends (`syscall-abi.md` § `sys_ns_lookup`). **A refusal here leaves
    the mount exactly as it was.**
 4. **The server records the unmount and exits**, on [`Meta::Unmount`](rsproto-wire-format.md):
-   the filesystem clean, unless it was found not clean or a change failed or found it corrupt
-   during the mount, when it is left marked for a check. From here the mount is gone, whatever the
+   the filesystem clean, unless it was found not clean or something failed on the device or found
+   it corrupt during the mount, when it is left marked for a check. From here the mount is gone, whatever the
    answer. A read-only mount records nothing and leaves the filesystem as it was found, clean or
    not. **A success says the unmount was recorded, not that the filesystem is clean**: the
    service's line says which, from the device read again.

@@ -38880,7 +38880,10 @@ Part H's detail pass merged, #459. H.1 on `pre-phase-7/h1-ext4`, as
   has no `alloc` and `nxinstall` mounts nothing. A writable mount of a layout it does not cover is
   served read-only, as a feature this writer does not keep is.
 - **An unmount records clean only what its mount found clean and nothing failed on**, as FAT's
-  does and as Linux puts back the state it found. **The consequence, worth stating**: with no check
+  does and as Linux puts back the state it found. **Nothing** is any write the device refused,
+  seen where it is refused, since a change can answer `Ok` with one lost inside it, and any
+  operation answering `Io` or `Corrupt`, **reads included**, as Linux marks an error found on any
+  path: the maintainer's call on the review, FAT keeping its rule of a change alone. **The consequence, worth stating**: with no check
   here (`TODO(fs-repair)`), an installed root a crash left not clean is reported so at every boot
   until something checks it. `check-storage` and `check-recovery`, which mark their copy's root not
   clean and unmount it writable, now expect it left so.

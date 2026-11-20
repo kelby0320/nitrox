@@ -73,7 +73,7 @@ pub const OP_PING: u16 = 0x0003;
 /// `Meta::Ready` — startup signal on the control channel.
 pub const OP_READY: u16 = 0x0004;
 /// `Meta::Unmount` — a supervisor telling a filesystem server, on its control channel, to record
-/// the unmount and exit: cleanly unmounted, unless it was found not clean or a change failed. Empty
+/// the unmount and exit: cleanly unmounted, unless it was found not clean or something failed. Empty
 /// body; the server answers with a reply — empty on success, an error body if the state could not
 /// be written — then exits.
 pub const OP_UNMOUNT: u16 = 0x0005;

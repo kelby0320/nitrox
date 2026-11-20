@@ -193,9 +193,10 @@ The supervisor binds `handles[0]` into the appropriate namespace location after 
 *(Administration Part C.3, 2026-09-24.)* Sent by a supervisor to a **filesystem server** on its
 control channel, after `Ready`, to end the mount. Request body: empty. The server records the
 filesystem **cleanly unmounted** as its last write — ext4's `s_state` clean bit set, FAT's state
-bit cleared — unless the mount found it not clean, or a change during the mount failed on the
-device or found the filesystem corrupt, when it is left marked for a check: ext4's `s_state` as it
-was found, error bit and all, or as the mount left it
+bit cleared — unless the mount found it not clean, or during the mount something failed on the
+device or found the filesystem corrupt (for ext4 any write or operation, a read's too; for FAT a
+change), when it is left marked for a check: ext4's `s_state` as it was found, error bit and all,
+or as the mount left it
 ([`ext4-fs-server-rw.md`](../architecture/ext4-fs-server-rw.md)), FAT's bit set
 ([`fat-fs-server.md`](../architecture/fat-fs-server.md) § 6). Then it replies and exits. The reply
 is empty on success, or an [`ErrorBody`](#error-replies) if the state could not be written. A read-only mount writes nothing, since it never marked the filesystem
