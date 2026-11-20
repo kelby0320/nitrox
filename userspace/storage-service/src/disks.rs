@@ -75,6 +75,23 @@ pub(super) fn take_block(root: &Root) -> Result<(Chan, Vec<(DeviceRecord, Node)>
     }
 }
 
+impl Service {
+    /// **Table file `name`**, the unmounted devices probed again first if due; `None` if no device.
+    pub(super) fn table_file(&mut self, name: &str) -> Option<Vec<u8>> {
+        let now = || libos::time::now().unwrap_or(u64::MAX);
+        let mounted: Vec<u32> = self.all_mounts().iter().map(|m| m.device).collect();
+        if self.rescan.due(&self.devices, name, now(), &mounted) {
+            self.refresh_unmounted();
+            self.rescan.probed(now(), mounted);
+        }
+        let mounts = self.all_mounts();
+        match name {
+            "all" => Some(table::all(&self.devices, &mounts)),
+            _ => table::one(&self.devices, &mounts, name),
+        }
+    }
+}
+
 /// `init`'s manifest, or why it could not be read: each way it can fail says so.
 pub(super) fn read_manifest(root: &Root) -> Result<manifest::Manifest, &'static [u8]> {
     // `INSPECT` as well as `MAP_READ`: the object's size comes from `stat`.

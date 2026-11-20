@@ -423,6 +423,13 @@ The watch is pinged for a change in the devices as well as the mounts for this.
 block device in registry order, then one `<name>.tsm` per device. **A name is `/dev/devices`' own**,
 `blk-<n>` for `/dev/blk/<n>`, so a row in either table names the same device.
 
+**A resolve of a table reads the devices nothing has mounted again first, at most once in two
+seconds** (`storage_service::rescan`): a read waits on its device and cannot be cut short, so a
+client asking again and again held the service's one thread, and every `/storage` resolve with it,
+in probe after probe of a slow device. Between probes a table says what the last one found, unless
+what is mounted has changed since, as a device just unmounted was last read before its mount. A
+name that names no device reads none, and `Reread` reads its device whatever the time.
+
 | Column | Type | Holds |
 |---|---|---|
 | `name` | string | `blk-<n>` |

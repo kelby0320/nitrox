@@ -8,6 +8,7 @@ extern crate alloc;
 
 pub mod fit;
 pub mod probe;
+pub mod rescan;
 
 pub mod sources {
     //! **Which devices `init` mounted, and whether this is a live boot.**

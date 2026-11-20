@@ -64,6 +64,7 @@ use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_READY, OP_UNMOUNT, RS_FLAG_
 use storage_service::fit::{SCRATCH, ScratchRead, scratch_read};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
+use storage_service::rescan::Rescan;
 use storage_service::sources::{InitMount, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
@@ -208,6 +209,8 @@ struct Service {
     watches: Watches,
     watch_ends: BTreeMap<u64, Chan>,
     dirs: Vec<(Chan, Listing)>,
+    /// When a resolve of the table probes the unmounted devices again.
+    rescan: Rescan,
 }
 
 /// A request refused: the error, and the reason its reply carries.
@@ -280,21 +283,12 @@ impl Service {
         match asked {
             Asked::Directory => self.open_dir(from, m.request_id, Listing::Tables),
             Asked::Mounts => self.open_dir(from, m.request_id, Listing::Mounts),
-            Asked::File(name) => {
-                self.refresh_unmounted();
-                let mounts = self.all_mounts();
-                let bytes = if name == "all" {
-                    Some(table::all(&self.devices, &mounts))
-                } else {
-                    table::one(&self.devices, &mounts, name)
-                };
-                match bytes {
-                    Some(b) => {
-                        server::reply_object(from, m.request_id, &b);
-                    }
-                    None => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+            Asked::File(name) => match self.table_file(name) {
+                Some(b) => {
+                    server::reply_object(from, m.request_id, &b);
                 }
-            }
+                None => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+            },
             Asked::Mount { label, consumed } => match self.mounted.iter().find(|x| x.label == label) {
                 Some(x) => {
                     server::reply_subnamespace(from, m.request_id, x.ns.as_ref(), consumed, b"/");
@@ -1045,6 +1039,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         admin_ends: Vec::new(),
         admin_sessions: Vec::new(),
         dirs: Vec::new(),
+        rescan: Rescan::default(),
     };
     let mounts = s.all_mounts();
     Line::new().s(b"storage-service: ").u(s.devices.len() as u64).s(b" block device(s)").end();
