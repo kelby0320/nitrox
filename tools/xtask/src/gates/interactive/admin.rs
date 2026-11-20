@@ -114,6 +114,15 @@ pub(crate) fn interactive_administration(s: &mut Session) -> R<usize> {
     if asked.elapsed() > std::time::Duration::from_secs(20) {
         return Err("`with admin sleep 60` took more than 20 s to stop after Ctrl-C".into());
     }
+    //      (f2) **A view made inside a view gets its grants**: the inner shell's namespace binds
+    //           them already, and each was refused as not there to grant.
+    with_admin_asked(s, "nxsh")?;
+    s.expect_all(&["view: alice admin nxsh — started", "/home>"])?;
+    with_admin_asked(s, "whoami")?;
+    s.expect_all(&["view: alice admin whoami — started", "view: alice admin whoami — exited, code 0"])?;
+    s.send("exit")?;
+    s.expect_all(&["view: alice admin nxsh — exited", "/home>"])?;
+    println!("  ok: a view made inside a view gets its grants");
     //      (g) **An audit record for each, and no password in any**: the prompts turned echo off.
     let t = s.transcript();
     for line in [

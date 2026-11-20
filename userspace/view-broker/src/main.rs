@@ -51,7 +51,7 @@ use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
 use view_broker::sessions::Sessions;
 use view_broker::slots::Load;
-use view_broker::spawning::{StartError, Started, spawn_program};
+use view_broker::spawning::{StartError, Started, grant, spawn_program};
 use view_broker::suffix::{self, Suffix};
 use wire::{Ch, Root, lookup, now_ns, recv, recv_full, reply_error, reply_outcome, send, wait_until};
 
@@ -258,7 +258,7 @@ fn bind_endpoint_at(
     view_ns: &Handle<Namespace, NsMutable>,
     at: &str,
 ) -> bool {
-    endpoint(root, slot, from).is_some_and(|e| view_ns.bind(at, e).is_ok())
+    endpoint(root, slot, from).is_some_and(|e| grant(view_ns, at, || view_ns.bind(at, e)))
 }
 
 impl Broker {
@@ -822,7 +822,7 @@ impl Broker {
     /// Bind this broker's forwarding endpoint at `at` in `view_ns`, with `base` naming the session
     /// it serves. `false` if it would not bind, or there is none.
     fn bind_forwarding(&self, view_ns: &Handle<Namespace, NsMutable>, at: &str, base: &str) -> bool {
-        self.forwarding.as_ref().is_some_and(|f| view_ns.bind_server(at, f.as_ref(), base).is_ok())
+        self.forwarding.as_ref().is_some_and(|f| grant(view_ns, at, || view_ns.bind_server(at, f.as_ref(), base)))
     }
 
     fn start(&mut self, i: usize, op: u16, request_id: u64, mut p: Pending, principal: &str) {
