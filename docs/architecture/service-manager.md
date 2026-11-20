@@ -111,7 +111,8 @@ arrives beside a pid that cannot be matched. One exit per wake — every case th
 produces — pairs correctly; the residual is in the deferral entry. **The close can come
 first**: `sys_process_exit` closes the child's handles before it queues `ChildExited`, so a
 wake that finds more deaths than codes waits on the notification channel for the rest, up to
-`CODE_GRACE_NS` (1 s). Only past that is an exit reported `code=unknown`.
+`CODE_GRACE_NS` (1 s), answering resolves meanwhile, which do not cut it short. Only past that is
+an exit reported `code=unknown`.
 
 **Litmus test:** *could this be written as a `service.toml` and supervised?* → it is
 service-mgr's. *Does it require being the kernel's first process / the thing that exists

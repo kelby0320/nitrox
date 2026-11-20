@@ -221,6 +221,8 @@ struct Mock {
     settled: Vec<(u64, u64)>,
     /// Each test verdict reported, as its code.
     verdicts: Vec<u64>,
+    /// Notifications for queues, delivered once the next wait has returned.
+    later: Vec<(usize, Notification)>,
 }
 
 thread_local! {
@@ -456,6 +458,11 @@ pub(super) fn wait_exact(handles: &[u64], results: &mut [IoResult], deadline: u6
             }
             results[n] = res;
             n += 1;
+        }
+        for (obj, note) in core::mem::take(&mut m.later) {
+            if let Object::Notify(q) = &mut m.objects[obj] {
+                q.push_back(note);
+            }
         }
         match (n, deadline) {
             (0, 0) => e(KError::WouldBlock),

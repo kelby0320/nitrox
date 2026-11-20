@@ -109,19 +109,28 @@ impl Routes {
     }
 }
 
-/// Wait for `notif` or a route until `deadline`, answering the routes: whether `notif` signalled.
+/// Wait for `notif` until `deadline`, answering the routes meanwhile: whether `notif` signalled. A
+/// route's wake does not end it, as the code it waits for may come next.
 pub fn wait_codes(notif: &Handle<Notify, Only>, routes: &Routes, registry: Option<&BindNs>, deadline: u64) -> bool {
     const N: usize = libkern::abi::MAX_WAIT_HANDLES;
     let mut route_at = [usize::MAX; N];
     let mut set = WaitSet::<N>::new();
     let Ok(notif_at) = set.add(notif) else { return false };
     routes.watch(&mut set, |i, r| route_at[i] = r);
-    let Ok(waited) = set.wait(Deadline::at(deadline)) else {
-        return false;
-    };
-    let fired: Vec<usize> = waited.iter().map(|(i, _)| i).collect();
-    routes.serve(registry, |r| fired.iter().any(|&i| route_at[i] == r));
-    fired.contains(&notif_at)
+    loop {
+        let Ok(waited) = set.wait(Deadline::at(deadline)) else {
+            return false;
+        };
+        let fired: Vec<usize> = waited.iter().map(|(i, _)| i).collect();
+        routes.serve(registry, |r| fired.iter().any(|&i| route_at[i] == r));
+        if fired.contains(&notif_at) {
+            return true;
+        }
+        // Nothing signalled: the deadline passed. A route that keeps signalling ends it by the clock.
+        if fired.is_empty() || libos::time::now().is_ok_and(|now| now >= deadline) {
+            return false;
+        }
+    }
 }
 
 /// One message on `ch`, its handles closed: `Err(())` once **a peer that has gone** is all that is
@@ -141,3 +150,6 @@ pub fn recv_request(ch: &Endpoint) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests;
