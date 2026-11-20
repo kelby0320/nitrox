@@ -578,14 +578,14 @@ fn new_node<RW: BlockReader + BlockWriter>(
 /// written there with the new root before what it dropped is freed, as each tree block is, so no
 /// write lost after leaves it mapping a freed block. Its caller writes it again afterwards, with
 /// `i_blocks` and whatever else changed. `None` for an inode already freed, whose blocks an error
-/// here only leaks.
+/// here only leaks. Answers how many blocks it freed.
 pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     inode: &mut [u8; 256],
     keep: u64,
     at: Option<u64>,
-) -> Result<(), FsError> {
+) -> Result<u64, FsError> {
     let mut root = [0u8; 60];
     root.copy_from_slice(&inode[ROOT]);
     let h = header(&root, ROOT_ENTRIES)?;
@@ -605,7 +605,45 @@ pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
     // Whatever was freed before an error is gone from the tree too, so the inode takes both.
     inode[ROOT].copy_from_slice(&root);
     count(inode, sb, -(freed as i64));
-    done
+    done.map(|()| freed)
+}
+
+/// **Cut what lies past `keep` before a growth**, then count `i_blocks` from the tree if that freed
+/// anything: an `fallocate` that kept the size counted those blocks, a growth whose inode write was
+/// lost did not, and nothing on the disk says which.
+pub(crate) fn cut_past<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    inode: &mut [u8; 256],
+    keep: u64,
+    at: Option<u64>,
+) -> Result<(), FsError> {
+    if truncate(rw, sb, inode, keep, at)? == 0 {
+        return Ok(());
+    }
+    let xattr = rd_u32(inode, 104) != 0 || rd_u16(inode, 118) != 0;
+    let blocks = held(rw, sb, &inode[ROOT], ROOT_ENTRIES, END)? + xattr as u64;
+    let units = (blocks * (sb.block_size / 512) as u64).min(u32::MAX as u64) as u32;
+    inode[28..32].copy_from_slice(&units.to_le_bytes());
+    Ok(())
+}
+
+/// The blocks under `node`, its keys below `hi`, as `i_blocks` counts them: extents' and nodes'.
+fn held<R: BlockReader>(r: &R, sb: &Superblock, node: &[u8], cap: usize, hi: u64) -> Result<u64, FsError> {
+    let h = header(node, cap)?;
+    let mut buf = [0u8; MAX_BLOCK];
+    let mut blocks = 0;
+    for i in 0..h.entries {
+        if h.depth == 0 {
+            blocks += read_extent(node, i)?.len;
+        } else {
+            let keys = child_keys(node, h, i, hi);
+            read_node(r, sb, read_index(node, i).1, h.depth - 1, keys, &mut buf)?;
+            let bs = sb.block_size as usize;
+            blocks += 1 + held(r, sb, &buf[..bs], block_cap(sb), keys.1)?;
+        }
+    }
+    Ok(blocks)
 }
 
 /// Cut `node`, whose keys run below `hi`, at `keep`, returning whether it changed. A child left

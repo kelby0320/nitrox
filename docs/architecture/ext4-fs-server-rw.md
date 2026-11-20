@@ -118,7 +118,10 @@ the name and left an unattached inode holding its blocks.
   rather than the block a file's next data would continue into.
 - **Growing** appends **a run at a time** — the blocks the allocator hands out contiguously, up
   to the 32,768 an extent can hold — so a tree changes once a run rather than once a block.
-  Blocks past `i_size` (an `fallocate` that kept the size leaves them) are cut first.
+  Blocks past `i_size` are cut first, a file's and a directory's alike: an `fallocate` that kept
+  the size leaves them, and so does a growth whose size write was lost after its leaf's. **A cut
+  that frees any counts `i_blocks` again from the tree** (`extent::cut_past`), since nothing on the
+  disk says whether they were counted: the `fallocate` counted them, the lost write did not.
 - **Cutting** (`extent::truncate`) frees every block from a logical block on, drops the extents
   that held them, shortens the one across it, frees each tree block left empty, and **folds**
   what is left back into the inode while it fits: an index over one child of four entries or fewer
@@ -145,7 +148,11 @@ block it had taken stayed in use, on a filesystem the grow did not fit all of it
 create whose directory cannot grow gives its inode back; a `mkdir` gives back its inode, its block
 and its group's count of directories, which is now **its own group's** — it was always group 0's;
 and a rename within a directory that cannot take the new name puts the old one back, where the
-file had been left with none.
+file had been left with none. **A directory's growth whose block or size write is refused is
+undone**, its size put back and the block cut off, and a create whose inode write is refused gives
+the inode back (pre-Phase-7 Part H.1). Until then a lost size write left the directory's leaf
+mapping a block past its size, and every later growth appended there again and was refused
+`Corrupt`: no create, `mkdir` or rename into it worked until an offline `e2fsck`.
 
 **What is freed is out of the tree on the disk first** (PR #371 review, 2026-10-13). A cut takes an
 extent out of its node — the node's header counting what is left — and writes the node, a tree block

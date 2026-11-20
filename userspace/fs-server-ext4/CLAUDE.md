@@ -99,7 +99,9 @@ another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entrie
 files with data, a file at four extents, or a removal of a file Linux wrote at its name. A
 grow, create, `mkdir` or rename that fails for want of space or depth now gives back what it took.
 A rename that loses a write midway is undone, and a stop there leaves no name reaching what a
-removal frees (2026-10-23); a grow that loses one is not yet (`TODO(ext4-failed-write-undo)`).
+removal frees (2026-10-23); a grow that loses one is not yet (`TODO(ext4-failed-write-undo)`),
+though every growth, a directory's too, cuts what a lost one left past the size, and counts
+`i_blocks` again from the tree when that frees anything (pre-Phase-7 Part H.1).
 
 ## This crate's library has a second consumer
 

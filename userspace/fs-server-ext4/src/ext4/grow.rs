@@ -56,9 +56,9 @@ pub fn grow_file_from<RW: BlockReader + BlockWriter>(
     let isize = (sb.inode_size as usize).min(256);
 
     let grown = (|| {
-        // Blocks past the end (an `fallocate` that kept the size leaves them) would sit under the
-        // extents this appends, so they go first.
-        extent::truncate(rw, &sb, &mut inode, cur_blocks, Some(off))?;
+        // Blocks past the end (an `fallocate` that kept the size leaves them, and so does a growth
+        // whose size write was lost) would sit under the extents this appends, so they go first.
+        extent::cut_past(rw, &sb, &mut inode, cur_blocks, Some(off))?;
         // The old last block past the old end: a truncate leaves the bytes it cut there.
         let within = cur_size % bs;
         if within != 0 {

@@ -490,13 +490,12 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     inode[26..28].copy_from_slice(&1u16.to_le_bytes()); // i_links_count
     inode[32..36].copy_from_slice(&EXTENTS_FL.to_le_bytes()); // i_flags
     extent::empty_root(&mut inode); // i_block: a leaf of no extents
-    let off = inode_offset(rw, &sb, ino)?;
-    rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
 
-    // Link it into the parent directory, growing it by a block if it is full. **A failed link
-    // gives the inode back**, rather than leaving it allocated and unattached.
-    let linked = resolve_path_ino(rw, &sb, parent_path).and_then(|(parent_ino, mut parent_inode)| {
-        dir_insert(rw, &sb, parent_ino, &mut parent_inode, name, ino, EXT4_FT_REG_FILE, now).map(|()| parent_ino)
+    // Written, then linked into the parent directory, growing it by a block if it is full. **A
+    // failed write or link gives the inode back**, rather than leaving it allocated and unattached.
+    let written = inode_offset(rw, &sb, ino).and_then(|off| rw.write_at(off, &inode[..sb.inode_len()]));
+    let linked = written.and_then(|()| resolve_path_ino(rw, &sb, parent_path)).and_then(|(parent_ino, mut dir)| {
+        dir_insert(rw, &sb, parent_ino, &mut dir, name, ino, EXT4_FT_REG_FILE, now).map(|()| parent_ino)
     });
     let parent_ino = match linked {
         Ok(parent_ino) => parent_ino,
@@ -537,7 +536,7 @@ fn free_inode_blocks<RW: BlockReader + BlockWriter>(
     inode: &[u8; 256],
 ) -> Result<(), FsError> {
     let mut copy = *inode;
-    extent::truncate(rw, sb, &mut copy, 0, None)
+    extent::truncate(rw, sb, &mut copy, 0, None).map(drop)
 }
 
 /// Remove the directory entry `name` from directory-inode bytes `dir_inode`, returning the removed

@@ -68,6 +68,9 @@ pub(super) fn dir_insert<RW: BlockReader + BlockWriter>(
     }
 
     let off = inode_offset(rw, sb, dir_ino)?;
+    // What a growth whose size write was lost left mapped past the end goes first, or this block
+    // would be appended where that one is, and refused.
+    extent::cut_past(rw, sb, dir_inode, nblocks, Some(off))?;
     let phys = append_block(rw, sb, dir_inode, nblocks)?;
     // A fresh directory block is a single **unused** record spanning it: inode 0, `rec_len` =
     // block size. Zero the rest so no stale bytes are read as entries.
@@ -77,19 +80,19 @@ pub(super) fn dir_insert<RW: BlockReader + BlockWriter>(
     buf[6] = name.len() as u8;
     buf[7] = file_type;
     buf[8..8 + name.len()].copy_from_slice(name);
-    if let Err(e) = rw.write_at(phys * sb.block_size as u64, &buf[..bs]) {
-        // The block goes back, and the inode is written since a cut can fold its root.
+    // A directory's `i_size` is a whole number of blocks; the tree counted the block in `i_blocks`.
+    let grown = rw.write_at(phys * sb.block_size as u64, &buf[..bs]).and_then(|()| {
+        dir_inode[4..8].copy_from_slice(&((size + bs as u64) as u32).to_le_bytes());
+        stamp(dir_inode, now, sb.inode_size, Stamp::Modified);
+        rw.write_at(off, &dir_inode[..sb.inode_len()])
+    });
+    if let Err(e) = grown {
+        // The size and the block go back, and the inode is written since a cut can fold its root.
+        dir_inode[4..8].copy_from_slice(&(size as u32).to_le_bytes());
         let _ = extent::truncate(rw, sb, dir_inode, nblocks, Some(off));
-        let _ = rw.write_at(off, &dir_inode[..(sb.inode_size as usize).min(256)]);
+        let _ = rw.write_at(off, &dir_inode[..sb.inode_len()]);
         return Err(e);
     }
-
-    // `i_size` of a directory is always a whole number of blocks. The tree counted the block in
-    // `i_blocks`.
-    let new_size = size + bs as u64;
-    dir_inode[4..8].copy_from_slice(&(new_size as u32).to_le_bytes());
-    stamp(dir_inode, now, sb.inode_size, Stamp::Modified);
-    rw.write_at(off, &dir_inode[..(sb.inode_size as usize).min(256)])?;
     Ok(())
 }
 

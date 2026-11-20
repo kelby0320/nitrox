@@ -212,3 +212,145 @@ fn a_mkdir_stopped_at_any_write_leaves_no_count_short() {
         }
     }
 }
+
+/// A 250-byte name: three fill a 1 KiB block, and its slack holds no fourth.
+fn long_name(i: u32) -> Vec<u8> {
+    format!("{i:0>250}").into_bytes()
+}
+
+fn dir_inode(rw: &crate::test_support::RwImage, path: &[u8]) -> [u8; 256] {
+    let sb = crate::ext4::read_superblock(rw).unwrap();
+    let ino = Ext4(rw).resolve_dir(path).unwrap() as u32;
+    crate::ext4::read_inode(rw, &sb, ino).unwrap()
+}
+
+/// `/g` on 1 KiB blocks: fifteen files with data, five full blocks, a tree of depth 1.
+fn full_directory() -> Vec<u8> {
+    let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(1024, b"seed\n")));
+    let vol = Ext4(&rw);
+    vol.mkdir_at(2, b"g", NOW).unwrap();
+    for i in 0..15 {
+        vol.create_file(b"/g", &long_name(i), NOW).unwrap();
+        vol.grow_file(&[b"/g/" as &[u8], &long_name(i)].concat(), 1, NOW).unwrap();
+    }
+    let g = dir_inode(&rw, b"/g");
+    assert_eq!((crate::rd_u32(&g, 4), crate::rd_u16(&g, 46)), (5 * 1024, 1), "five blocks, a tree of depth 1");
+    rw.0.into_inner()
+}
+
+/// Whether `e2fsck` finds a block or inode in use and unmarked: a bitmap difference with `+`.
+fn marks_too_few(text: &str) -> bool {
+    text.lines().filter_map(|l| l.split_once("bitmap differences:")).any(|(_, rest)| rest.contains('+'))
+}
+
+/// What `e2fsck` must never say after a stopped growth: [`NEVER`], a size or count wrong, a block
+/// in use unmarked, and, for a write refused once, an inode never linked.
+fn growth_left_wrong(text: &str, once: bool) -> bool {
+    let wrong = ["end of extent exceeds", "i_blocks is", "i_size is"];
+    wrong.iter().chain(NEVER.iter()).any(|bad| text.contains(bad))
+        || marks_too_few(text)
+        || (once && (text.contains("Unattached") || text.contains("Unconnected")))
+}
+
+/// **A directory growth stopped at any write leaves it able to grow**: each write of a growing
+/// create, mkdir and rename refused once and from then on, then a create and a mkdir. A lost write
+/// may still cost what `TODO(ext4-failed-write-undo)` records: a block or inode marked and unused,
+/// and, from then on, an inode never linked.
+#[test]
+fn a_directory_growth_stopped_at_any_write_leaves_it_able_to_grow() {
+    type Op = fn(&Ext4<'_, Failing>) -> Result<(), FsError>;
+    let growths: [(&str, Op); 3] = [
+        ("create", |v| v.create_file(b"/g", &long_name(15), NOW)),
+        ("mkdir", |v| v.mkdir_at(v.resolve_dir(b"/g")?, &long_name(15), NOW)),
+        ("rename", |v| {
+            let to = [b"/g/" as &[u8], &long_name(15)].concat();
+            v.rename_path(b"/system/current-generation", &to, false, NOW).map(drop)
+        }),
+    ];
+    let base = full_directory();
+    for (what, op) in growths {
+        let total = writes(&base, |vol| op(vol).unwrap());
+        assert!(what != "create" || total == 11, "the growing create's writes: {total}");
+        for n in 0..total {
+            for once in [true, false] {
+                let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
+                let _ = op(&Ext4(&rw));
+                let how = if once { "once" } else { "and every one after" };
+                let text = e2fsck(&rw.image.0.borrow());
+                assert!(
+                    !(once && growth_left_wrong(&text, once)),
+                    "the growing {what}, write {n} refused once:\n{text}"
+                );
+                let then = crate::test_support::RwImage(std::cell::RefCell::new(rw.image.0.into_inner()));
+                let vol = Ext4(&then);
+                assert_eq!(
+                    vol.create_file(b"/g", &long_name(16), NOW),
+                    Ok(()),
+                    "{what}, write {n} refused {how}: a create"
+                );
+                let g = vol.resolve_dir(b"/g").unwrap();
+                assert_eq!(vol.mkdir_at(g, &long_name(17), NOW), Ok(()), "{what}, write {n} refused {how}: a mkdir");
+                let text = e2fsck(&then.0.borrow());
+                let ok = !growth_left_wrong(&text, once);
+                assert!(
+                    ok,
+                    "the growing {what}, write {n} of {total} refused {how}, then a create and a mkdir:\n{text}"
+                );
+            }
+        }
+    }
+}
+
+/// **A file grown after a growth lost its size write counts its blocks** as `e2fsck` counts them.
+#[test]
+fn a_file_grown_after_a_growth_lost_its_size_write_counts_its_blocks() {
+    let rw = crate::test_support::RwImage(std::cell::RefCell::new(fixture(1024, b"seed\n")));
+    let vol = Ext4(&rw);
+    vol.create_file(b"/system", b"a", NOW).unwrap();
+    vol.create_file(b"/system", b"b", NOW).unwrap();
+    // Grown in turn a block at a time, so each of `a`'s blocks is an extent of its own.
+    for i in 1..=6 {
+        vol.grow_file(b"/system/a", i * 1024, NOW).unwrap();
+        vol.grow_file(b"/system/b", i * 1024, NOW).unwrap();
+    }
+    let sb = crate::ext4::read_superblock(&rw).unwrap();
+    let a = vol.map_file(b"/system/a", &mut [BlockRun::default(); 8]).unwrap().id as u32;
+    assert_eq!(crate::rd_u16(&crate::ext4::read_inode(&rw, &sb, a).unwrap(), 46), 1, "a tree of depth 1");
+    let base = rw.0.into_inner();
+    let grow = |vol: &Ext4<'_, Failing>| vol.grow_file(b"/system/a", 7 * 1024, NOW).map(drop);
+    let total = writes(&base, |vol| grow(vol).unwrap());
+    let lost = Failing::after(base, total - 1);
+    assert_eq!(grow(&Ext4(&lost)), Err(FsError::Io), "the size write, last, is lost");
+    let then = crate::test_support::RwImage(std::cell::RefCell::new(lost.image.0.into_inner()));
+    Ext4(&then).grow_file(b"/system/a", 9 * 1024, NOW).unwrap();
+    crate::test_support::assert_e2fsck_clean(&then.0.borrow(), "grown-after-a-lost-size");
+}
+
+/// A device that keeps the offset of every write, in order.
+struct Recording(crate::test_support::RwImage, std::cell::RefCell<Vec<u64>>);
+impl BlockReader for Recording {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.0.read_at(offset, buf)
+    }
+}
+impl BlockWriter for Recording {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        self.1.borrow_mut().push(offset);
+        self.0.write_at(offset, buf)
+    }
+}
+
+/// **A create whose inode write is refused gives the inode back**, rather than leaving it taken.
+#[test]
+fn a_create_whose_inode_write_is_refused_gives_the_inode_back() {
+    let base = fixture(4096, b"seed\n");
+    let made = Recording(crate::test_support::RwImage(std::cell::RefCell::new(base.clone())), Default::default());
+    Ext4(&made).create_file(b"/system", b"new", NOW).unwrap();
+    let ino = Ext4(&made).map_file(b"/system/new", &mut [BlockRun::default(); 1]).unwrap().id as u32;
+    let sb = crate::ext4::read_superblock(&made).unwrap();
+    let at = crate::ext4::inode_offset(&made, &sb, ino).unwrap();
+    let n = made.1.borrow().iter().position(|&off| off == at).expect("the create writes its inode") as u64;
+    let rw = Failing::once(base, n);
+    assert_eq!(Ext4(&rw).create_file(b"/system", b"new", NOW), Err(FsError::Io));
+    crate::test_support::assert_e2fsck_clean(&rw.image.0.borrow(), "inode-write-refused");
+}
