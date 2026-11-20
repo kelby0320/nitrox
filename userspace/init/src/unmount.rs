@@ -17,12 +17,14 @@ pub fn flush_then_ask<'a, M: CanLookup + 'a>(
 ) -> Result<bool, KError> {
     ns.into().flush_by(mount_point, deadline).map_err(|e| e.code())?;
     let mut msg = Msg::new();
-    let request = request(msg.payload_mut(), 1).and_then(|n| msg.set_len(n).ok());
+    let request = request(msg.payload_mut(), REQUEST_ID).and_then(|n| msg.set_len(n).ok());
     Ok(request.is_some() && control.send(&msg, &mut Carried::new()).is_ok())
 }
 
 /// The `Meta::Unmount` op.
 pub const OP_UNMOUNT: u16 = 0x0005;
+/// The id each unmount request carries, and its answer must.
+pub const REQUEST_ID: u64 = 1;
 /// The envelope's version.
 pub const RS_VERSION: u16 = 1;
 /// `RS_FLAG_REPLY`: set on an answer.
@@ -51,10 +53,11 @@ pub enum Answer<'a> {
     Unexpected,
 }
 
-/// Parse the rsproto message in an `IpcMsg`'s payload, already cut to the header's `payload_len`.
-pub fn answer(payload: &[u8]) -> Answer<'_> {
+/// The answer to request `request_id` in an `IpcMsg`'s payload, cut to the header's `payload_len`.
+pub fn answer(payload: &[u8], request_id: u64) -> Answer<'_> {
     let envelope = payload.len() >= HEADER_LEN && u32_at(payload, 0) == RS_MAGIC;
-    if !envelope || u16_at(payload, 6) != OP_UNMOUNT {
+    let ours = payload.get(8..16) == Some(&request_id.to_le_bytes()[..]);
+    if !envelope || !ours || u16_at(payload, 6) != OP_UNMOUNT {
         return Answer::Unexpected;
     }
     let flags = u32_at(payload, 16);
@@ -128,26 +131,30 @@ mod tests {
     fn a_servers_answers_parse() {
         let mut buf = [0u8; 256];
         let n = encode(&mut buf, librsproto::OP_UNMOUNT, 7, RS_FLAG_REPLY, &[], 0).unwrap();
-        assert_eq!(answer(&buf[..n]), Answer::Done);
+        assert_eq!(answer(&buf[..n], 7), Answer::Done);
 
         let mut body = [0u8; 128];
         let why = b"the state could not be written";
         let len = error_body(&mut body, libkern::error::KError::IoError.as_i32(), 0, why).unwrap();
         let failed = RS_FLAG_REPLY | RS_FLAG_ERROR;
         let n = encode(&mut buf, librsproto::OP_UNMOUNT, 7, failed, &body[..len], 0).unwrap();
-        assert_eq!(answer(&buf[..n]), Answer::Failed(why));
+        assert_eq!(answer(&buf[..n], 7), Answer::Failed(why));
     }
 
     #[test]
     fn anything_else_is_unexpected() {
         let mut buf = [0u8; 256];
         let n = request(&mut buf, 7).unwrap();
-        assert_eq!(answer(&buf[..n]), Answer::Unexpected, "not a reply");
+        assert_eq!(answer(&buf[..n], 7), Answer::Unexpected, "not a reply");
         let n = encode(&mut buf, librsproto::OP_READY, 7, RS_FLAG_REPLY, &[], 0).unwrap();
-        assert_eq!(answer(&buf[..n]), Answer::Unexpected, "another op");
-        assert_eq!(answer(&buf[..HEADER_LEN - 1]), Answer::Unexpected, "truncated");
+        assert_eq!(answer(&buf[..n], 7), Answer::Unexpected, "another op");
+        assert_eq!(answer(&buf[..HEADER_LEN - 1], 7), Answer::Unexpected, "truncated");
         let failed = RS_FLAG_REPLY | RS_FLAG_ERROR;
         let n = encode(&mut buf, librsproto::OP_UNMOUNT, 7, failed, &[0; 4], 0).unwrap();
-        assert_eq!(answer(&buf[..n]), Answer::Failed(b""), "a body too short for its reason");
+        assert_eq!(answer(&buf[..n], 7), Answer::Failed(b""), "a body too short for its reason");
+        let n = encode(&mut buf, librsproto::OP_UNMOUNT, 7, RS_FLAG_REPLY, &[], 0).unwrap();
+        assert_eq!(answer(&buf[..n], 8), Answer::Unexpected, "another request's answer");
+        buf[0] ^= 0xFF;
+        assert_eq!(answer(&buf[..n], 7), Answer::Unexpected, "the wrong magic");
     }
 }
