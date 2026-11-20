@@ -51,6 +51,32 @@ pub struct RestartConfig {
     pub max_ns: u64,
 }
 
+impl RestartConfig {
+    /// How long before restart `attempts` of a service with this configuration.
+    pub fn backoff_ns(&self, attempts: u32) -> u64 {
+        match self.backoff {
+            Backoff::None => 0,
+            Backoff::Linear => self.initial_ns,
+            Backoff::Exponential => {
+                // A shift alone drops what it pushes out, so the doubling saturates by a multiply.
+                let doubled = 1u64.checked_shl(attempts).and_then(|f| f.checked_mul(self.initial_ns));
+                doubled.unwrap_or(u64::MAX).min(self.max_ns)
+            }
+        }
+    }
+}
+
+impl RestartPolicy {
+    /// Whether a service under this policy that exited with `code` is restarted.
+    pub fn restarts(self, code: i32) -> bool {
+        match self {
+            RestartPolicy::Never => false,
+            RestartPolicy::OnFailure => code != 0,
+            RestartPolicy::Always => true,
+        }
+    }
+}
+
 impl Default for RestartConfig {
     fn default() -> Self {
         RestartConfig {
@@ -237,8 +263,8 @@ fn parse_duration_ns(v: &str) -> Option<u64> {
 /// A declaration is emitted only if its `[service.<name>]` table carried an
 /// `executable`; one without is skipped rather than being a reason to drop the file.
 ///
-/// **A repeated name is skipped, not re-emitted**: the failure it would otherwise cause is
-/// starting the same service twice, which is worse than ignoring the duplicate. One file holds
+/// **A repeated name is skipped, not re-emitted**, its first block deciding, taken or skipped:
+/// starting a service twice, or one a later block replaced, is worse than ignoring the duplicate. One file holds
 /// every service because nothing can enumerate a directory of `.toml` files.
 pub fn parse_all(text: &str) -> Vec<ServiceDecl> {
     parse_all_reporting(text).0
@@ -278,10 +304,16 @@ impl SkipReason {
     }
 }
 
+/// Whether `skipped` holds a critical declaration not read; a duplicate's first block was.
+pub fn critical_unread(skipped: &[Skipped]) -> bool {
+    skipped.iter().any(|s| s.critical && s.why != SkipReason::Duplicate)
+}
+
 /// [`parse_all`], and every declaration it skipped, in file order.
 pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
     let mut out: Vec<ServiceDecl> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
+    let mut named: Vec<String> = Vec::new();
     let mut name: Option<String> = None;
     let mut executable: Option<String> = None;
     let mut after: Vec<String> = Vec::new();
@@ -303,11 +335,12 @@ pub fn parse_all_reporting(text: &str) -> (Vec<ServiceDecl>, Vec<Skipped>) {
             let (n, e) = (name.take(), executable.take());
             let why = match (&n, &e) {
                 (None, _) => None,
+                (Some(n), _) if named.contains(n) => Some(SkipReason::Duplicate),
                 (Some(_), None) => Some(SkipReason::NoExecutable),
-                (Some(n), Some(_)) if out.iter().any(|d: &ServiceDecl| &d.name == n) => Some(SkipReason::Duplicate),
                 (Some(_), Some(_)) if matches!(endpoint, Some(None)) => Some(SkipReason::BadEndpoint),
                 _ => None,
             };
+            named.extend(n.clone());
             if let (Some(n), Some(why)) = (n.clone(), why) {
                 skipped.push(Skipped { name: n, why, critical });
             } else if let (Some(n), Some(e)) = (n, e) {
@@ -800,6 +833,78 @@ backoff_max = \"2s\"\n";
         }
         for bad in ["", "/", "log", "/svc/", "/svc//auth", "/./x", "/x/..", "/a b"] {
             assert!(!valid_endpoint(bad), "{bad}");
+        }
+    }
+
+    /// **An exponential backoff saturates at its cap**, whatever the attempt: `initial << attempts`
+    /// wrapped silently from attempt 55, and a failing service was restarted nine times at once.
+    #[test]
+    fn an_exponential_backoff_saturates_at_its_cap() {
+        let at = |initial_ns, attempts| RestartConfig { initial_ns, ..RestartConfig::default() }.backoff_ns(attempts);
+        let (s, cap) = (1_000_000_000, 300_000_000_000);
+        assert_eq!((at(s, 8), at(s, 9)), (256 * s, cap), "the cap's neighbours");
+        for attempts in [54, 55, 63, 64, u32::MAX] {
+            assert_eq!(at(s, attempts), cap, "1 s, attempt {attempts}");
+        }
+        assert_eq!(at(100_000_000, 56), cap, "100 ms, attempt 56");
+    }
+
+    /// **Which exits each policy restarts**: on-failure restarting a clean exit would loop.
+    #[test]
+    fn each_policy_restarts_the_exits_it_names() {
+        let codes = [0, 1, -1, i32::MIN];
+        let restarts = |p: RestartPolicy| codes.map(|c| p.restarts(c));
+        assert_eq!(restarts(RestartPolicy::Never), [false; 4]);
+        assert_eq!(restarts(RestartPolicy::OnFailure), [false, true, true, true]);
+        assert_eq!(restarts(RestartPolicy::Always), [true; 4]);
+    }
+
+    /// **A restart setting that does not read keeps its default**: never restart, back off doubling.
+    #[test]
+    fn a_restart_setting_that_does_not_read_keeps_its_default() {
+        let restart =
+            |body: &str| one(&format!("[service.s]\nexecutable = \"/s\"\n[service.s.restart]\n{body}")).restart;
+        for policy in ["\"on-failur\"", "always", "\"\""] {
+            assert_eq!(restart(&format!("policy = {policy}")).policy, RestartPolicy::Never, "{policy}");
+        }
+        assert_eq!(restart("policy = \"always\"").policy, RestartPolicy::Always);
+        assert_eq!(restart("backoff = \"expo\"").backoff, Backoff::Exponential);
+        assert_eq!(restart("backoff = \"linear\"").backoff, Backoff::Linear);
+    }
+
+    /// **A duration saturates past what nanoseconds hold**, and a number past `u64` does not read.
+    #[test]
+    fn a_duration_saturates_and_a_number_past_u64_does_not_read() {
+        assert_eq!(parse_duration_ns("18446744073709551615s"), Some(u64::MAX));
+        assert_eq!(parse_duration_ns("18446744073709551615ms"), Some(u64::MAX));
+        assert_eq!(parse_duration_ns("18446744073709551616s"), None);
+        assert_eq!(parse_duration_ns("18446744073ms"), Some(18_446_744_073_000_000));
+    }
+
+    /// The names `text` declares and what the boot makes of them, mapped as `main.rs` maps them.
+    fn boot(text: &str) -> (Vec<String>, Option<&'static str>) {
+        use crate::bringup::{Entry, unfit};
+        let (decls, skipped) = parse_all_reporting(text);
+        let entries: Vec<Entry> =
+            decls.iter().map(|d| Entry { server: d.endpoint.is_some(), critical: d.critical }).collect();
+        (decls.into_iter().map(|d| d.name).collect(), unfit(&entries, critical_unread(&skipped)))
+    }
+
+    /// **A name is decided by its first block**, taken or skipped, so a later block cannot replace it.
+    #[test]
+    fn a_name_is_decided_by_its_first_block() {
+        let core = "[service.core]\nexecutable = \"/core\"\nendpoint = \"/svc/core\"\ncritical = true\n";
+        let other = "[service.other]\nexecutable = \"/other\"\n";
+        for again in [core, "[service.core]\ncritical = true\n"] {
+            assert_eq!(boot(&[core, other, again].concat()), (vec!["core".into(), "other".into()], None), "{again}");
+        }
+        for critical in [false, true] {
+            let first =
+                format!("[service.evil]\nexecutable = \"/evil\"\nendpoint = \"svc/evil\"\ncritical = {critical}\n");
+            let good = "[service.evil]\nexecutable = \"/evil\"\nendpoint = \"/svc/evil\"\n";
+            let (names, unfit) = boot(&[core, &first, other, good].concat());
+            assert_eq!(names, ["core", "other"], "critical {critical}: neither block is taken");
+            assert_eq!(unfit.is_some(), critical, "critical {critical}: a critical first stops the boot");
         }
     }
 }

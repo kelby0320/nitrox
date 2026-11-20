@@ -951,3 +951,13 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-20	460	2684ead5	9	rules-and-docs	optional	demonstrated	fixed	2e922ced	Volume::mark_clean and serve_control say they record the unmount, clean only when found so and nothing failed
 2026-11-20	460	2684ead5	10	rules-and-docs	optional	demonstrated	fixed	2e922ced	the crate CLAUDE.md Structure names ext4/superblock, state, alloc, grow, insert and zone
 2026-11-20	460	2684ead5	11	architecture	optional	unverified	fixed	2e922ced	reproduced: 466 reads for 7,448 groups without flex_bg; layout now reads a block at a time, 59; the_layout_check_reads_the_table_a_block_at_a_time failed at 466 before
+2026-11-20	461	d406f5e2	1	logic+error-paths+architecture	worth-fixing	demonstrated	fixed	afd8f700	take counts every message, decoded or not; channel_peer_closed bounded the same, CONTROL_DEPTH 10 under PER_PASS 16; the old take and the unbounded look each fail a new test
+2026-11-20	461	d406f5e2	2	tests	worth-fixing	demonstrated	fixed	afd8f700	the Ok(true) case decodes the sent request and checks REQUEST_ID; the review's id-2 mutation fails it
+2026-11-20	461	d406f5e2	3	tests	worth-fixing	demonstrated	fixed	afd8f700	an_open_channel_is_not_taken_for_closed; the empty arm answering closed fails it
+2026-11-20	461	d406f5e2	4	tests	worth-fixing	demonstrated	fixed	afd8f700	a_derived_endpoint_has_a_route_of_its_own; the lookup on svc alone fails it
+2026-11-20	461	d406f5e2	5	architecture	worth-fixing	demonstrated	fixed	f171400e	session-mgr/CLAUDE.md and its main.rs comment (afd8f700): a server not up yet is handed its route; 0 only for one not declared or with no route
+2026-11-20	461	d406f5e2	6	error-paths+architecture	optional	unverified	deferred		planned into H.3 (what-the-bash-left.md): storage-service main.rs at its entry and lib.rs at 1,000 lines leave the check no host-tested home here; H.3 moves that code out
+2026-11-20	461	d406f5e2	7	tests	optional	demonstrated	fixed	afd8f700	each_policy_restarts_the_exits_it_names; the review's mutation and two siblings each fail it
+2026-11-20	461	d406f5e2	8	tests	optional	unverified	fixed	afd8f700	the session lists' walk moved into routes::serve_each with a host test; stepping past a removal, or ignoring pick, fails it
+2026-11-20	461	d406f5e2	9	rules-and-docs	optional	demonstrated	fixed	afd8f700	swept with -W missing_docs (Found.essential, running too); the lib denies missing_docs, and a removed field doc fails to compile
+2026-11-20	461	d406f5e2	10	architecture	optional	demonstrated	fixed	afd8f700	maintainer's call: fix here; libsession::open_views_session_from resolves the broker channel again when none or gone; four controls fail its test

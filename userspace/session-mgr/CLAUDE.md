@@ -100,8 +100,9 @@ service-mgr spawns session-mgr with a control channel (`rdx`) + re-delegated
 
 **3–7 are `service-mgr`'s routes, not the servers' own endpoints** (administration Part E.1b): each
 is an endpoint of `service-mgr`'s that continues every resolve into whichever instance of that one
-server is running, so a session bound before a restart reaches the new server. `0` for a server
-that did not come up; the session then binds nothing there.
+server is running, so a session bound before a restart reaches the new server. **A server not up
+yet is handed its route too**, which answers `NotFound` until it is. `0` is handed only for a server
+not declared, or one with no route, and the session then binds nothing there.
 
 session-mgr `recv`s all eight before doing anything. `desktop-session-mgr` gets the same with the
 compositor's route fourth, nine in all, and the control channels are 10 deep; `service-mgr`'s

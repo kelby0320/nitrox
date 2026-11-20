@@ -1,6 +1,7 @@
 use super::*;
 use libkern::IPC_PAYLOAD_SIZE;
-use libos::{Carried, Handle, mock};
+use libkern::RawHandle;
+use libos::{Carried, Handle, Namespace, NsMutable, NsReadOnly, mock};
 use librsproto::auth::{
     AUTH_RESULT_AUTHENTICATED, build_authenticate_reply, build_denied_reply, parse_authenticate_request,
 };
@@ -142,4 +143,43 @@ fn a_broker_that_refuses_opens_no_session() {
     drop(server);
     assert_eq!(open_views_session(&client, b"alice", &mut base), None);
     close_views_session(&client, 1);
+}
+
+fn broker_at(client: End) -> Handle<Namespace, NsReadOnly> {
+    let root = mock::answering_with("/svc/views/session", client.into_raw().0);
+    // SAFETY: a namespace the mock has just made, which nothing else holds.
+    unsafe { Handle::from_raw(RawHandle(root), Rights::LOOKUP) }
+}
+
+/// **A broker up after its supervisor, or restarted, is reached at the next login**, and one still
+/// up, or refusing, is not resolved again.
+#[test]
+fn a_broker_up_late_or_restarted_is_reached_at_the_next_login() {
+    mock::reset();
+    let (mut sup, mut base) = (None, [0u8; 24]);
+    let none = Handle::<Namespace, NsMutable>::create().unwrap();
+    assert_eq!(open_views_session_from(&none, &mut sup, b"alice", &mut base), None, "no broker yet");
+    let broker = |id: u64| {
+        let (client, server) = End::pair(512).unwrap();
+        let mut body = [0u8; 8];
+        let n = build_session_id(&mut body, id).unwrap();
+        answer_every_id(&server, OP_VIEWS_OPEN_SESSION, RS_FLAG_REPLY, &body[..n]);
+        (broker_at(client), server)
+    };
+    let (root, first) = broker(7);
+    assert_eq!(open_views_session_from(&root, &mut sup, b"alice", &mut base), Some((7, 4)), "up late");
+    // What a call that timed out could leave queued, before the broker goes.
+    while sup.as_ref().unwrap().recv(&mut Msg::new()).is_ok() {}
+    for _ in 0..3 {
+        first.send(&Msg::new(), &mut Carried::new()).unwrap();
+    }
+    drop(first);
+    let (root, _second) = broker(8);
+    assert_eq!(open_views_session_from(&root, &mut sup, b"alice", &mut base), Some((8, 4)), "restarted");
+    assert_eq!(open_views_session_from(&none, &mut sup, b"alice", &mut base), Some((8, 4)), "still up");
+    let (client, refusing) = End::pair(512).unwrap();
+    answer_every_id(&refusing, OP_VIEWS_OPEN_SESSION, RS_FLAG_REPLY | RS_FLAG_ERROR, b"");
+    let (held, mut sup) = (client.raw(), Some(client));
+    assert_eq!(open_views_session_from(&none, &mut sup, b"alice", &mut base), None, "refused");
+    assert_eq!(sup.map(|s| s.raw()), Some(held), "and kept");
 }

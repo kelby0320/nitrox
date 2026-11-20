@@ -188,6 +188,15 @@ pub fn notify(queued: &[Notification]) -> u64 {
     with(|m| m.mint(Object::Notify(queued.iter().copied().collect()), Rights::WAIT) as u64)
 }
 
+/// Queue `note` on the notification queue `queue` once the next wait has returned: one that came
+/// while that wake was being answered.
+pub fn notify_after_wait(queue: u64, note: Notification) {
+    with(|m| {
+        let (obj, _) = m.typed(queue, Rights::empty(), KObjectType::NotificationChannel).expect("a queue");
+        m.later.push((obj, note));
+    })
+}
+
 /// A handle to `h`'s object with exactly `rights`, as one a process was given would be.
 pub fn with_rights(h: u64, rights: Rights) -> u64 {
     with(|m| {

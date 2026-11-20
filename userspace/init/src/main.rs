@@ -612,7 +612,7 @@ fn unmount_one(root: &Root, m: Kept) {
     line.s(b"init: ").s(at);
     if received {
         use init::unmount::Answer;
-        match init::unmount::answer(msg.payload()) {
+        match init::unmount::answer(msg.payload(), init::unmount::REQUEST_ID) {
             Answer::Done => line.s(b" unmounted, and its server recorded how it was left"),
             Answer::Failed(why) => line.s(b" unmounted, but not left clean: ").untrusted(why),
             Answer::Unexpected => line.s(b" answered its unmount with something else"),

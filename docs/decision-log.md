@@ -38890,3 +38890,29 @@ Part H's detail pass merged, #459. H.1 on `pre-phase-7/h1-ext4`, as
 - **A test fixture held a copy of its own image**, fixed on the way; four older tests that used
   blocks no file can hold were moved onto layouts that have them.
 
+## 2026-11-20 — Before Phase 7: H.2, service-mgr and init
+
+H.1 merged, #460. H.2 on `pre-phase-7/h2-supervisors`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.2 plans it.
+
+- **The routes moved into service-mgr's library** (`service_mgr::routes`), with the grace wait, the
+  backoff and the count of skipped critical declarations, so each fix has a host test over libos's
+  mock.
+- **Five defects fixed**: an exponential backoff that wrapped to 0 from attempt 55 (sup-3); a
+  critical server declared twice sending the boot to `eshell`, and a block taken for a name skipped
+  earlier (sup-8); the exit-code grace ended by any route's wake (sup-10); a client keeping a ring
+  full holding service-mgr in one loop (sup-4); a server that came up late out of every session's
+  reach (sup-11).
+- **`init`'s unmount answer is held to its request** (sup-14), a change on its critical path.
+- **The test gaps beside them are held** (sup-15, sup-16).
+- **The review (#461) found sup-4's bound counted only the requests that decoded**, so junk queued
+  as fast as it was read still held a pass. A pass now takes at most `PER_PASS` messages, decoded or
+  not, and a look at a control channel as many, more than its 10 deep ring holds. The session lists'
+  walk moved into the library (`routes::serve_each`) so a host test holds it.
+- **The login supervisors resolve the view broker's supervisor channel again at a login** that has
+  none, or whose broker has gone (the maintainer's call, 2026-11-20). Resolved once at their start,
+  a broker that came up late or restarted left every session without `with` until a reboot, though
+  sup-11 hands its route. One that refuses is not resolved again.
+- **storage-service's unmount answer is held to its request in H.3**, which moves that code out of
+  a `main.rs` at its size entry, with a `lib.rs` at 1,000 lines.
+

@@ -353,6 +353,11 @@ device = \"gpt-partlabel:root\"  # trailing comment
     fn errors_carry_line_numbers() {
         assert_eq!(parse("[[mount]]\nbroken\n"), Err(ParseError { line: 2, kind: ErrorKind::MissingEquals }));
         assert_eq!(parse("[[mount]]\nx = \"oops\n"), Err(ParseError { line: 2, kind: ErrorKind::UnterminatedString }));
+        // A quote inside is no string, though one closes the line.
+        assert_eq!(
+            parse("[[mount]]\nx = \"a\"b\"\n"),
+            Err(ParseError { line: 2, kind: ErrorKind::UnterminatedString })
+        );
         assert_eq!(
             parse("[mount.options]\nx = 1\n"),
             Err(ParseError { line: 1, kind: ErrorKind::UnknownSubtableParent })

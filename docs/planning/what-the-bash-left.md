@@ -1,6 +1,6 @@
 # What the bash left
 
-**Status: detailed 2026-11-19; H.1 built 2026-11-20.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
+**Status: detailed 2026-11-19; H.1 and H.2 built 2026-11-20.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
 bug bash triaged **later**, which [`bug-bash.md`](bug-bash.md) records, checked against `main` and
 fixed, each with a test that fails without it.
 
@@ -445,6 +445,29 @@ already takes for its tests.
 **Gates:** `test-interactive`, `check-login` and `check-shutdown`, which start, stop and supervise
 services.
 
+**Built 2026-11-20**, in eight commits. Where it departs from the above:
+- **The first commit is a refactor, not a move**: the routes were `Mgr`'s methods, so they went to
+  `service_mgr::routes` behind a `Routes`, `wait_codes` as a function of the queue and the routes,
+  and `main.rs` delegates. Behaviour unchanged; its size entry fell from 1,855 to 1,689 over the
+  part, the review's fixes included.
+- **sup-4 needed no code to wake the next wait**: a wait on a channel is satisfied while its ring
+  is non-empty (`syscall-abi.md`), so a pass that stops at `PER_PASS` (16) is served again at once.
+  Every loop takes through `routes::take`, the admin and power sessions' and endpoints' too.
+- **sup-10's grace also ends by the clock**, for a route that keeps signalling, which the bound made
+  testable. The notification that comes after a route's wake is libos's `mock::notify_after_wait`.
+  On the way: a timed-out wait moves the mock's clock 1 ms, where the kernel returns only at the
+  deadline, so the loop ends on an empty wake rather than reading the clock alone.
+- **sup-11's test shows the copy is the route its registration finds**: the copy carries
+  `TRANSFER | DUPLICATE` and no `SEND`, so the resolves are put on the route itself.
+- **sup-14's request id is a constant**, `unmount::REQUEST_ID`, which `flush_then_ask` sends and
+  `unmount_one` checks.
+- **The test gaps' tests were written here**, not briefed to the implementer: each was a few lines
+  beside a fix in the same file.
+- **Its review** (#461) made the bound count every message, decoded or not, and bound a look at a
+  control channel too; moved the session lists' walk into `routes::serve_each`; had the login
+  supervisors resolve the broker's supervisor channel again at a login (`libsession`); and planned
+  storage-service's unmount answer into H.3.
+
 ### H.3 storage-service and the broker: one GPT reading, a probe that waits, grants in a view
 
 - **sup-2: the kernel records each partition's GUID.**
@@ -473,6 +496,11 @@ services.
   binding and binds its own: the view gets the broker's endpoint, not whatever the caller had.
   `bind_forwarding`, for policy and accounts, goes the same way. Test over the mock: each grant in
   a view made from a view.
+- **The unmount's answer is held to its request**, as `init`'s is since sup-14: PR #461's review,
+  finding 6. `unmount` takes any `OP_UNMOUNT` without the error flag as recorded, whatever its
+  request id and whether `RS_FLAG_REPLY` is set, and `tear_down` sends the same request. The check
+  moves into a library module with the code H.3 moves out of `main.rs`, where a host test holds it:
+  another request's answer, a request rather than a reply, and an error.
 - **sup-12, sup-13 and T1-24: storage-service's probe tests, in `tests/probe.rs`.**
   - `partition_entries` with each mark broken, and its neighbours.
   - The RamDisk arm.

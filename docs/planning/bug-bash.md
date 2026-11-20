@@ -14,7 +14,7 @@ flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, 
 thread in place now, and the deadline heap's slots. On 2026-10-27 ten later findings moved to
 Part I with the safety survey's defects that repeat them. Part H detailed 2026-11-19: four of its
 fifty found fixed by later work, and ticked, and sched-10's last mutation planned. H.1 fixed
-fs-9 and fs-11 2026-11-20.** Part D of
+fs-9 and fs-11 2026-11-20, and H.2 sup-3, 4, 8, 10, 11, 14, 15 and 16 the same day.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -1882,7 +1882,7 @@ Found 21, refuted by a boot 0, reported 16.
   printed `read_table = None`. Run with `cargo test -p storage-service --lib probe_ --
   --nocapture`; the probe was removed. Lens: trust-boundary. Medium. **Later.**
 
-- [ ] **sup-3** `userspace/service-mgr/src/main.rs:160` — `compute_backoff`'s exponential arm uses
+- [x] **sup-3** `userspace/service-mgr/src/main.rs:160` — `compute_backoff`'s exponential arm uses
   `initial_ns.checked_shl(attempts)`, which fails only for shifts of 64 or more. Bits shifted out
   wrap silently, so the backoff becomes 0 for attempts 55-63 (56-63 for a 100 ms initial). A
   service with `backoff = "exponential"` and the default unlimited `max_attempts` that keeps
@@ -1893,8 +1893,9 @@ Found 21, refuted by a boot 0, reported 16.
   and attempt 64 gives 300000000000. 200 ms/2 s also gives 0 at 55 and 63. Fix: saturating
   multiply, or clamp the shift. Lenses: logic, trust-boundary, tests (three reviewers; severity
   rated low, low and medium). Medium. **Later.**
+  Fixed in `b9ea35e3`: the doubling is `1 << attempts` times the initial, each step checked and saturating, then capped; fails without it: `an_exponential_backoff_saturates_at_its_cap` (attempts 54, 55, 63, 64, `u32::MAX` at 1 s, 56 at 100 ms, and the cap's neighbours).
 
-- [ ] **sup-4** `userspace/service-mgr/src/main.rs:1192` — `serve_resolves` loops `recv_serve`
+- [x] **sup-4** `userspace/service-mgr/src/main.rs:1192` — `serve_resolves` loops `recv_serve`
   per route until the ring is empty, with no per-pass bound. `serve_services` does the same for
   the root (1846-1856) and the session endpoint (1861-1863). A client that issues forwarded
   resolves faster than service-mgr answers keeps it inside the loop. A session app (or two) on
@@ -1904,6 +1905,7 @@ Found 21, refuted by a boot 0, reported 16.
   Ready deadline is acted on. storage-service and device-mgr take one message per handle per
   pass. Unverified: a two-thread flood client on `/dev/tty` while `service --stop` is issued would
   show whether the stop is answered before the flood ends. Lens: logic. Medium. **Later.**
+  Fixed in `d1749b5b`: every route and every `/svc/services` handle is read at most `routes::PER_PASS` (16) a pass through `routes::take`, a ring left non-empty signalling the next wait; fails without it: `a_pass_answers_a_bounded_number_of_resolves_a_route` and `a_pass_takes_a_bounded_number_of_requests_from_a_channel`. Since `afd8f700` the bound counts every message, decoded or not, and holds a look at a control channel too; fails without it: `a_pass_counts_the_messages_that_do_not_decode` and `a_look_at_a_control_channel_is_bounded_and_sees_past_a_full_ring`.
 
 - [ ] **sup-5** `userspace/storage-service/src/main.rs:642` — every resolve of `info/<name>.tsm`,
   including any session's `/dev/storage/all.tsm`, calls `refresh_unmounted`. That re-probes every
@@ -1945,7 +1947,7 @@ Found 21, refuted by a boot 0, reported 16.
   `libinittoml::manifest::text`, over the whole object, found so in Part H's detail pass; the
   bash's manifest now gives both `["/"]`.
 
-- [ ] **sup-8** `userspace/service-mgr/src/main.rs:280` — `skipped_critical` counts every skipped
+- [x] **sup-8** `userspace/service-mgr/src/main.rs:280` — `skipped_critical` counts every skipped
   declaration that says `critical = true`, including a Duplicate (or a NoExecutable re-entered
   block) of a critical server that was already read in full. `bringup::unfit` then reports "a
   critical declaration could not be read". service-mgr starts nothing and asks init for the
@@ -1957,6 +1959,7 @@ Found 21, refuted by a boot 0, reported 16.
   printed `Skipped { name: "auth-service", why: Duplicate, critical: true }` and
   `unfit = Some("a critical declaration could not be read")`. The appended block gave
   `NoExecutable` and the same result. The probe was removed. Lens: error-paths. Low. **Later.**
+  Fixed in `fd7ce15f`: a name's first block decides, taken or skipped, a duplicate is checked before a missing executable, and one does not count as a critical declaration unread; the sibling, a block taken after one of its name skipped for its endpoint, with it; fails without it: `a_name_is_decided_by_its_first_block`.
 
 - [x] **sup-9** `userspace/service-mgr/src/main.rs:1231` — bring-up's `Step::Start` calls
   `start(i, true)` without checking `running`. An admin Start of a declaration bring-up has not
@@ -1973,7 +1976,7 @@ Found 21, refuted by a boot 0, reported 16.
   Fixed in `106601be`, as sup-d3: an admin Start bring-up has not reached is refused.
   `a_start_bring_up_has_not_reached_is_refused` fails without it.
 
-- [ ] **sup-10** `userspace/service-mgr/src/main.rs:1374` — `wait_codes` is meant to wait up to
+- [x] **sup-10** `userspace/service-mgr/src/main.rs:1374` — `wait_codes` is meant to wait up to
   `CODE_GRACE_NS` for a dead service's exit code, but it returns false when any route wakes the
   wait, because `wait_serving` returns Some only if notif itself is ready. `poll()`'s `while
   dead.len() > codes.len() && self.wait_codes(until)` then stops, and the death is reaped with
@@ -1984,8 +1987,9 @@ Found 21, refuted by a boot 0, reported 16.
   Unverified: on SMP, a server that exits 0 before its Ready while another process resolves
   through a route in a tight loop; look for `code=unknown` followed by "unsupervised child
   exited code=0". Fix: loop until `until`. Lens: error-paths. Low. **Later.**
+  Fixed in `48608eac`: the grace wait answers the routes and waits on until the queue signals or its deadline passes, by the clock too for a route that keeps signalling; fails without it: `the_grace_wait_lasts_its_length_though_a_route_wakes_it` (over libos's `mock::notify_after_wait`) and `a_route_that_keeps_signalling_ends_the_grace_wait_at_its_deadline`.
 
-- [ ] **sup-11** `userspace/service-mgr/src/main.rs:2202` — login supervisors get their route
+- [x] **sup-11** `userspace/service-mgr/src/main.rs:2202` — login supervisors get their route
   copies once, at login-chain start (574-576, 600-602), and only for servers live then
   (`route_copy` requires `r.live`, 1549). If storage-service or device-mgr misses its Ready at
   boot (sup-1, say), session-mgr and desktop-session-mgr get an empty slot. A later
@@ -1994,6 +1998,7 @@ Found 21, refuted by a boot 0, reported 16.
   `/dev/devices` until reboot. Routes exist so that a restart reaches every session. Unverified:
   boot with storage-service failing its Ready, start it from an admin session, log in, and
   resolve `/storage`. Lens: trust-boundary. Low. **Later.**
+  Fixed in `1e904345`: a login supervisor's copy finds or makes the route, which answers `NotFound` until its server registers; fails without it: `a_route_copied_before_its_server_is_up_reaches_it_once_it_is`. Since `afd8f700` the login supervisors resolve the view broker's supervisor channel again at a login that has none, or whose broker has gone; fails without it: `a_broker_up_late_or_restarted_is_reached_at_the_next_login`.
 
 - [ ] **sup-12** `userspace/storage-service/src/probe.rs:125` — `partition_entries`, which decides
   whether a whole disk's own filesystem is ignored, has conditions no test pins: the 0xAA half of
@@ -2010,24 +2015,27 @@ Found 21, refuted by a boot 0, reported 16.
   probed as FAT and offered for mounting. Demonstrated: the two mutations passed the suite; the
   FAT32 branch equivalents were killed. Lens: tests. Low. **Later.**
 
-- [ ] **sup-14** `userspace/init/src/unmount.rs:42` — `unmount::answer` has no test for a wrong
+- [x] **sup-14** `userspace/init/src/unmount.rs:42` — `unmount::answer` has no test for a wrong
   `RS_MAGIC`. Reducing the check to the length test passes all of init's tests, so a non-rsproto
   payload with the right bytes at offsets 6 and 16 would be accepted as a clean unmount
   (`Answer::Done`). The `reply_id` is also not matched to the request. Demonstrated: the
   mutation passed `cargo test -p init --lib`; `anything_else_is_unexpected` covers wrong op,
   not-a-reply and truncation only. Lens: tests. Low. **Later.**
+  Fixed in `4af3f459`: `answer` takes the request's id and refuses another's; the magic is held; fails without it: `anything_else_is_unexpected` (another request's answer, the wrong magic).
 
-- [ ] **sup-15** `userspace/service-mgr/src/service_toml.rs:418` — an unrecognised or malformed
+- [x] **sup-15** `userspace/service-mgr/src/service_toml.rs:418` — an unrecognised or malformed
   restart `policy` falls back to `Never`, but no test pins it. Changing the fallback to `Always`
   passed `cargo test -p service-mgr --lib`, so a regression would make every mistyped
   declaration (`policy = "on-failur"`) restart forever. `parse_duration_ns`'s overflow behaviour
   is untested too. Demonstrated by the surviving mutation. Lens: tests. Low. **Later.**
+  Fixed in `b9ea35e3`: held by tests: a mistyped policy never restarts, a mistyped backoff stays exponential (its sibling), a duration saturates and a number past `u64` does not read; fails without it: `a_restart_setting_that_does_not_read_keeps_its_default` and `a_duration_saturates_and_a_number_past_u64_does_not_read`.
 
-- [ ] **sup-16** `userspace/libinittoml/src/toml_lite.rs:257` — `parse_value` accepts a string
+- [x] **sup-16** `userspace/libinittoml/src/toml_lite.rs:257` — `parse_value` accepts a string
   with an interior quote: `key = "a"b"` parses as the value `a"b` instead of
   `UnterminatedString`. The `body.contains('"')` rejection is untested. Replacing it with
   `false` passed all 19 libinittoml tests. The manifest is trusted initramfs data, so the impact
   is limited. Demonstrated by that mutation. Lens: tests. Low. **Later.**
+  Fixed in `bc6d5e9c`: held by a test; fails without it: `errors_carry_line_numbers`, which now asks `key = "a"b"`.
 
 What held up: about 105 single-line mutations across storage-service, the service-mgr lib,
 libinittoml, device-mgr and init were killed by the tests, apart from the survivors above and
