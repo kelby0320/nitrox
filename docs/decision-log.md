@@ -38797,3 +38797,71 @@ G.6 merged, #456. G.7, `manual.md` § G.7, built on `pre-phase-7/part-g7-system-
   its time, and the four run under Miri.
 - **Part F's record**: its Miri run, clean, was logged with G.1 on 2026-11-17, but no status line
   said Part F was done. `pre-phase-7.md`, `context-menus.md` and the implementation plan now do.
+
+## 2026-11-19 — Before Phase 7: Part H detailed
+
+Part G merged, #458. Part H's detail pass,
+[`what-the-bash-left.md`](planning/what-the-bash-left.md), on `pre-phase-7/part-h-detail`, measured
+on `main` at `3c6919a4`.
+
+- **Each later finding was checked against today's `main` before it was planned**, as Parts D, E,
+  I and J moved much of the code they name.
+  - Seven agents in worktrees took a group each, without a boot.
+  - Each test gap's mutations were run against the crate's whole suite.
+  - Each defect was reproduced by a temporary host test where its code is reachable, and read
+    otherwise.
+- **Of fifty-one open, four were fixed by later work**, and are ticked in `bug-bash.md`. The
+  fifty-first is sched-10, marked fix and left open for Part H by Part D:
+  - sup-7, by `e6a4ecf2`;
+  - kmem-10, by `7938344d`;
+  - proto-5, by `662163e6`;
+  - kmem-19, by `ac2ed261`.
+
+  Six more are partly closed. **Fifteen defects and thirty-two test gaps remain**, every gap
+  holdable by host tests.
+- **Four reach further than the bash recorded.**
+  - **sup-2 can match the wrong partition**: an entry off the disk shifts libgpt's index from the
+    kernel's.
+  - **sup-8's sibling lets an appended block of a skipped name boot.**
+  - **nxsh-1's stale environment reaches `cd`, `~` and every stage.**
+  - **The slot class reaches every server the sessions share.** That is the root filesystem,
+    tty-server, the clipboard, the profile server, each FAT stick and device-mgr, besides the
+    broker and storage-service.
+- **The maintainer's calls**:
+  - **Every shared server is held to a share a session, by one mechanism.** The session is named
+    in its binding's base, as `/dev/views` is, and each server's pool reclaims an idle slot when
+    full. It takes two sub-parts.
+  - **The kernel's per-process quotas stay deferred.** That is the "quota question" of
+    2026-10-22, which is not a bash finding; `TODO(deadline-slot-quota)` says Part H left it.
+  - **The kernel records each partition's unique GUID in the device record.** storage-service
+    matches `gpt-partuuid:` on it, no longer reading the table a second time with a different
+    parser. This is an ABI change.
+  - **`$env` writes through**: an assignment changes what programs, `cd` and `~` see, and a new
+    field adds a variable. `shell-language.md`, which said it cannot be assigned, changes with it.
+- **Ten sub-parts, a PR each.** The six with defects come first, ext4's first: a crafted stick's
+  extent over the inode table is served to the kernel and freed by an unlink, and a lost or
+  crashed directory growth wedges the directory. The test gaps follow, by subsystem.
+- **Most fixes start with a move.** Nine files a fix needs are at their size entries:
+  - service-mgr's and storage-service's `main.rs`;
+  - both of the view broker's files;
+  - `nxsh`'s `eval.rs`;
+  - ext4's `ext4.rs`;
+  - three kernel files.
+
+  The same moves put code that only a boot could reach under a host test over `libos`'s mock.
+- **After review** (#459), the plan's specs were corrected where a test or fix written to their
+  words would have gone wrong.
+  - **sched-10 is in**, which the inventory had left out. Its last mutation now aborts the kernel's
+    suite by accident, and H.7 tests the poll itself.
+  - **ext4's metadata check is made per group, with no table**, as the library has no `alloc` and
+    `nxinstall` writes with no mount.
+    - It is made at allocation as well as at reading and freeing.
+    - **A writable mount whose layout the per-group check does not cover is served read-only**,
+      with its reason.
+  - **A cut before a growth recounts `i_blocks` from the tree.** On disk nothing says whether
+    blocks past the size were counted. `grow_file_from` has the same flaw today.
+  - **The fs-9 test names the e2fsck lines it forbids and those it accepts** as the failed-write
+    TODO's cost.
+  - **ext4 keeps a volume found unclean, or one whose change failed, unclean**, as FAT does.
+  - **`$env` is judged by the record an assignment would leave**, not by its syntax.
+  - **A reclaimed session's client is told to resolve again**, not handed `PeerClosed`.

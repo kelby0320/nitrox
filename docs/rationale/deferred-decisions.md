@@ -2584,7 +2584,9 @@ slot and an IPC endpoint four (2026-10-25), and the heap grows to cover them, to
 about 131,000 slots. A process creating some 32,000 endpoints or 131,000 timers takes them all,
 and every other process's `sys_timer_create` and `sys_channel_create` then fail `OutOfMemory`. It
 is the quota question the 512-thread cap left (2026-10-22): one process can take every thread
-too. Trigger: per-process accounting (the rlimits item above), or a report of the refusal.
+too. Part H of the work before Phase 7 left it here (the maintainer's call, 2026-11-19): it holds
+the servers' slots to a share a session, not the kernel's to a share a process. Trigger: per-process
+accounting (the rlimits item above), or a report of the refusal.
 
 **Removing a deadline is a scan of the heap — `TODO(deadline-heap-scan)`.** `deadline::remove` finds an
 entry by its target, linearly, under `SCHED` with interrupts masked, and a debug build's
