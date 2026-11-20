@@ -51,6 +51,28 @@ pub struct RestartConfig {
     pub max_ns: u64,
 }
 
+impl RestartConfig {
+    /// How long before restart `attempts` of a service with this configuration.
+    pub fn backoff_ns(&self, attempts: u32) -> u64 {
+        match self.backoff {
+            Backoff::None => 0,
+            Backoff::Linear => self.initial_ns,
+            Backoff::Exponential => self.initial_ns.checked_shl(attempts).unwrap_or(u64::MAX).min(self.max_ns),
+        }
+    }
+}
+
+impl RestartPolicy {
+    /// Whether a service under this policy that exited with `code` is restarted.
+    pub fn restarts(self, code: i32) -> bool {
+        match self {
+            RestartPolicy::Never => false,
+            RestartPolicy::OnFailure => code != 0,
+            RestartPolicy::Always => true,
+        }
+    }
+}
+
 impl Default for RestartConfig {
     fn default() -> Self {
         RestartConfig {
@@ -276,6 +298,11 @@ impl SkipReason {
             SkipReason::BadEndpoint => "its endpoint is not an absolute path of plain components",
         }
     }
+}
+
+/// Whether a critical declaration among `skipped` was not read: the boot stops ([`crate::bringup::unfit`]).
+pub fn critical_unread(skipped: &[Skipped]) -> bool {
+    skipped.iter().any(|s| s.critical)
 }
 
 /// [`parse_all`], and every declaration it skipped, in file order.

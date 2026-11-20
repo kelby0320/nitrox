@@ -7,7 +7,7 @@ use alloc::vec::Vec;
 use libkern::{KError, KIND_CHILD_EXITED};
 use libos::log::Line;
 use libos::{Handle, Msg, Notify, Only};
-use service_mgr::wake;
+use service_mgr::{routes, wake};
 
 use crate::{Endpoint, Mgr, now_ns};
 
@@ -65,7 +65,8 @@ impl wake::Pass for Reaping<'_> {
 
     fn more_codes(&mut self, codes: &mut Vec<i32>) -> bool {
         let until = *self.until.get_or_insert_with(|| now_ns().saturating_add(CODE_GRACE_NS));
-        let more = self.mgr.wait_codes(until);
+        let (mgr, notif) = (&*self.mgr, self.mgr.notif.as_ref());
+        let more = notif.is_some_and(|q| routes::wait_codes(q, &mgr.routes, mgr.registry.as_ref(), until));
         if more {
             drain_codes(self.mgr.notif.as_ref(), codes);
         }

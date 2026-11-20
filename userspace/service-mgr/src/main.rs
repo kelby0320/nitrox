@@ -32,7 +32,8 @@ use librsproto::server;
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::handoff::{Clock, hand_on, recv_handoff, send_handle};
 use service_mgr::registry;
-use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
+use service_mgr::routes::{Routes, SERVE_DEPTH, recv_request};
+use service_mgr::service_toml::{self, RestartPolicy, ServiceDecl};
 use service_mgr::{services, wake};
 
 mod reaping;
@@ -46,9 +47,6 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// `ChildExited` on the notification channel.
 const MAX_SERVICES: usize = 24;
 const WAIT_MAX: usize = libkern::abi::MAX_WAIT_HANDLES;
-
-/// How deep each route is: a full ring answers the resolver `WouldBlock` at once.
-const SERVE_DEPTH: u32 = 64;
 
 const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
 
@@ -89,22 +87,6 @@ fn lookup<'a, T, M, N: CanLookup + 'a>(
 fn resolve_log_endpoint(registry: &BindNs, name: &str) -> Option<Endpoint> {
     // `TRANSFER` to move it into the child at spawn, which receives it attenuated to `SEND`.
     lookup(registry, &format!("/logging-service/system/{name}"), Rights::SEND | Rights::TRANSFER)
-}
-
-fn compute_backoff(cfg: &RestartConfig, attempts: u32) -> u64 {
-    match cfg.backoff {
-        Backoff::None => 0,
-        Backoff::Linear => cfg.initial_ns,
-        Backoff::Exponential => cfg.initial_ns.checked_shl(attempts).unwrap_or(u64::MAX).min(cfg.max_ns),
-    }
-}
-
-fn should_restart(policy: RestartPolicy, code: i32) -> bool {
-    match policy {
-        RestartPolicy::Never => false,
-        RestartPolicy::OnFailure => code != 0,
-        RestartPolicy::Always => true,
-    }
 }
 
 fn now_ns() -> u64 {
@@ -165,7 +147,7 @@ fn load_declarations(root: &Handle<Namespace, NsReadOnly>) -> (Vec<ServiceDecl>,
         }
         l.end();
     }
-    let skipped_critical = skipped.iter().any(|s| s.critical);
+    let skipped_critical = service_toml::critical_unread(&skipped);
     if decls.is_empty() {
         log::write(b"service-mgr: declaration parse error\n");
         return (decls, skipped_critical);
@@ -448,7 +430,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, arg0: u64) -> 
         root,
         root_bind,
         registry,
-        routes: Vec::new(),
+        routes: Routes::default(),
         services: Services::default(),
         held: Vec::new(),
         terminal,
@@ -474,23 +456,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, terminal: u64, arg0: u64) -> 
     }
     m.open_services();
     m.run()
-}
-
-/// One message on `ch`, its handles closed: `Err(())` once **a peer that has gone** is all that is
-/// left, as a closed channel stays signalled and a caller must drop it or the wait loop would
-/// spin; `None` when none is queued. A route's cannot close.
-fn recv_request(ch: &Endpoint) -> Result<Option<(u16, u64, Vec<u8>)>, ()> {
-    let mut msg = Msg::new();
-    loop {
-        let _sent = match ch.recv(&mut msg) {
-            Ok(sent) => sent,
-            Err(e) if e.code() == KError::PeerClosed => return Err(()),
-            Err(_) => return Ok(None),
-        };
-        if let Ok(m) = librsproto::decode(msg.payload()) {
-            return Ok(Some((m.op, m.request_id, m.body.to_vec())));
-        }
-    }
 }
 
 /// Refuse request `op` on `ch`, saying `why`. **`None` answers no one**: a held request whose
@@ -540,25 +505,6 @@ enum Phase {
     Starting { deadline: u64 },
     /// Running.
     Up,
-}
-
-/// **A route**: one of this manager's own endpoints, reaching one place in the registry.
-/// Every binding of a server's path — the root's, each session's, each application's — is a
-/// route, never the server's own endpoint, so a restart is reached from all of them. And one
-/// route reaches **one** server: one that reached any server by the suffix could not be handed
-/// to a session, since `desktop-shell` could bind it at a base of its choosing.
-struct Route {
-    svc: usize,
-    /// `None` for the server's own path; `Some(suffix)` for an endpoint it mints for sessions.
-    through: Option<&'static str>,
-    /// Where in the registry each resolve continues: `/<name>` or `/<name>.<suffix>`.
-    base: String,
-    client: Endpoint,
-    serve: Endpoint,
-    /// A derived route's endpoint as the server minted it, bound at `base`.
-    target: Option<Endpoint>,
-    /// Whether something is bound at `base`; else a resolve is `NotFound`.
-    live: bool,
 }
 
 /// **An admin request waiting for what it asked**, answered then, never by a wait here.
@@ -677,7 +623,7 @@ struct Mgr {
     root_bind: Option<BindNs>,
     registry: Option<BindNs>,
     /// One per server path and derived endpoint, kept for the boot.
-    routes: Vec<Route>,
+    routes: Routes,
     services: Services,
     held: Vec<Held>,
     terminal: Option<Endpoint>,
@@ -770,7 +716,7 @@ impl Mgr {
                 Err(_) => (Vec::new(), true),
             };
             let notified = all || fired.contains(&Waited::Notif);
-            self.serve_resolves(|r| all || fired.contains(&Waited::Route(r)));
+            self.routes.serve(self.registry.as_ref(), |r| all || fired.contains(&Waited::Route(r)));
             self.serve_services(|h| all || fired.contains(&Waited::Services(h)));
             let mut codes = Vec::new();
             if notified {
@@ -789,9 +735,7 @@ impl Mgr {
 
     /// Add every route to `set`.
     fn watch_routes<'a>(&'a self, set: &mut WaitSet<'a, WAIT_MAX>, names: &mut [Waited]) {
-        for (r, route) in self.routes.iter().enumerate() {
-            watch(set, names, &route.serve, Waited::Route(r));
-        }
+        self.routes.watch(set, |i, r| names[i] = Waited::Route(r));
     }
 
     fn next_deadline(&self) -> u64 {
@@ -816,25 +760,6 @@ impl Mgr {
             }
         }
         d
-    }
-
-    /// Answer every resolve queued on each route `pick` names: `SUBNAMESPACE` into the registry at
-    /// the route's base while something is bound there, `NotFound` while not.
-    fn serve_resolves(&self, pick: impl Fn(usize) -> bool) {
-        for (_, r) in self.routes.iter().enumerate().filter(|&(k, _)| pick(k)) {
-            while let Ok(Some((op, request_id, body))) = recv_request(&r.serve) {
-                let resolve = librsproto::OP_NS_RESOLVE;
-                if op != resolve {
-                    server::reply_error(&r.serve, op, request_id, KError::Unsupported, b"");
-                } else if librsproto::namespace::parse_resolve_request(&body).is_none() {
-                    server::reply_error(&r.serve, resolve, request_id, KError::InvalidArgument, b"");
-                } else if let (true, Some(registry)) = (r.live, &self.registry) {
-                    server::reply_subnamespace(&r.serve, request_id, registry.as_ref(), 0, r.base.as_bytes());
-                } else {
-                    server::reply_error(&r.serve, resolve, request_id, KError::NotFound, b"");
-                }
-            }
-        }
     }
 
     fn advance(&mut self) {
@@ -1002,27 +927,6 @@ impl Mgr {
         false
     }
 
-    /// Wait for the notification queue or any route until `deadline`, answering the routes that
-    /// signalled: whether the queue did.
-    fn wait_codes(&self, deadline: u64) -> bool {
-        let Some(notif) = &self.notif else {
-            return false;
-        };
-        let mut names = [Waited::Notif; WAIT_MAX];
-        let waited = {
-            let mut set = WaitSet::new();
-            watch(&mut set, &mut names, notif, Waited::Notif);
-            self.watch_routes(&mut set, &mut names);
-            set.wait(Deadline::at(deadline))
-        };
-        let Ok(waited) = waited else {
-            return false;
-        };
-        let fired = fired(&waited, &names);
-        self.serve_resolves(|r| fired.contains(&Waited::Route(r)));
-        fired.contains(&Waited::Notif)
-    }
-
     /// Resolve `path` in `ns`, **answering resolves until it completes** or `deadline` passes:
     /// the server asked may be resolving through a route itself.
     fn lookup_serving(&self, ns: &BindNs, path: &str, rights: Rights, deadline: u64) -> Option<Endpoint> {
@@ -1037,7 +941,7 @@ impl Mgr {
             };
             if let Ok(waited) = &waited {
                 let fired = fired(waited, &names);
-                self.serve_resolves(|r| fired.contains(&Waited::Route(r)));
+                self.routes.serve(self.registry.as_ref(), |r| fired.contains(&Waited::Route(r)));
                 if let Some(done) = lookup.completion_in(waited) {
                     return done.ok();
                 }
@@ -1071,7 +975,7 @@ impl Mgr {
             self.failed_to_start(i);
             return;
         }
-        let Some(r) = self.route(i, None) else {
+        let Some(r) = self.routes.route(i, &name, None) else {
             if let Some(registry) = &self.registry {
                 let _ = registry.unbind(&at);
             }
@@ -1127,7 +1031,7 @@ impl Mgr {
         if let Some(registry) = &self.registry {
             let _ = registry.unbind(&at);
         }
-        let route = if h.is_none() { None } else { self.route(i, Some(through)) };
+        let route = if h.is_none() { None } else { self.routes.route(i, &name, Some(through)) };
         let bound = route.is_some()
             && self
                 .registry
@@ -1156,33 +1060,10 @@ impl Mgr {
             .end();
     }
 
-    /// The route for server `i`'s own path or a derived endpoint, made when first needed. `None`
-    /// when there is no room, which is said.
-    fn route(&mut self, i: usize, through: Option<&'static str>) -> Option<usize> {
-        if let Some(r) = self.routes.iter().position(|r| r.svc == i && r.through == through) {
-            return Some(r);
-        }
-        let name = &self.svcs[i].decl.name;
-        let room = self.routes.len() < registry::MAX_ROUTES;
-        let made = if room { Handle::pair(SERVE_DEPTH).ok() } else { None };
-        let Some((client, serve)) = made else {
-            let why: &[u8] = if room { b"channel create FAIL" } else { b"all in use" };
-            Line::new().s(b"service-mgr: no route for '").s(name.as_bytes()).s(b"' -- ").s(why).end();
-            return None;
-        };
-        let base = match through {
-            None => registry::base(name),
-            Some(t) => registry::derived(name, t),
-        };
-        self.routes.push(Route { svc: i, through, base, client, serve, target: None, live: false });
-        Some(self.routes.len() - 1)
-    }
-
     /// A duplicate of the route to server `name` for a login supervisor while something is bound
     /// there.
     fn route_copy(&self, name: &str, through: Option<&str>) -> Option<Endpoint> {
-        let found = self.routes.iter().find(|r| r.live && r.through == through && self.svcs[r.svc].decl.name == name);
-        dup_endpoint(found.map(|r| &r.client))
+        self.routes.live_copy(self.svcs.iter().position(|s| s.decl.name == name)?, through)
     }
 
     /// An admin or power session by its handle's value; `None` for `0`, one that has closed.
@@ -1250,7 +1131,7 @@ impl Mgr {
                 drop(endpoint);
             }
         }
-        for r in self.routes.iter_mut().filter(|r| r.svc == i) {
+        for r in self.routes.0.iter_mut().filter(|r| r.svc == i) {
             r.live = false;
             if let Some(target) = r.target.take() {
                 if let Some(registry) = &self.registry {
@@ -1269,7 +1150,7 @@ impl Mgr {
     fn apply_policy(&mut self, i: usize, code: Option<i32>, was: Phase) {
         let s = &self.svcs[i];
         let restarting = !s.requested_shutdown
-            && should_restart(s.decl.restart.policy, code.unwrap_or(-1))
+            && s.decl.restart.policy.restarts(code.unwrap_or(-1))
             && (s.decl.restart.max_attempts == 0 || s.attempts < s.decl.restart.max_attempts);
         if matches!(was, Phase::Starting { .. }) && !restarting {
             self.failed_to_start(i);
@@ -1285,7 +1166,7 @@ impl Mgr {
                 .end();
             return;
         }
-        if !should_restart(s.decl.restart.policy, code.unwrap_or(-1)) {
+        if !s.decl.restart.policy.restarts(code.unwrap_or(-1)) {
             Line::new()
                 .s(b"service-mgr: '")
                 .s(s.decl.name.as_bytes())
@@ -1305,7 +1186,7 @@ impl Mgr {
                 .end();
             return;
         }
-        let backoff = compute_backoff(&s.decl.restart, s.attempts);
+        let backoff = s.decl.restart.backoff_ns(s.attempts);
         let mut l = Line::new();
         l.s(b"service-mgr: restarting '").s(s.decl.name.as_bytes()).s(b"' (attempt ").u((s.attempts + 1) as u64);
         if s.decl.restart.max_attempts != 0 {

@@ -9,6 +9,7 @@
 extern crate alloc;
 
 pub mod handoff;
+pub mod routes;
 pub mod service_toml;
 
 pub mod bringup {
