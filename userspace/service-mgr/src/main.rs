@@ -32,7 +32,7 @@ use librsproto::server;
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::handoff::{Clock, hand_on, recv_handoff, send_handle};
 use service_mgr::registry;
-use service_mgr::routes::{Routes, SERVE_DEPTH, recv_request};
+use service_mgr::routes::{Routes, SERVE_DEPTH, take};
 use service_mgr::service_toml::{self, RestartPolicy, ServiceDecl};
 use service_mgr::{services, wake};
 
@@ -1301,100 +1301,80 @@ impl Mgr {
     /// `power-endpoint` resolve arriving with its last holder's close was refused `WouldBlock` with
     /// the one slot about to be freed. Only the handles `pick` names, by value, are read.
     fn serve_services(&mut self, pick: impl Fn(u64) -> bool) {
+        let picked = |h: &Endpoint| if pick(h.raw().0) { take(h) } else { (Vec::new(), false) };
         let mut k = 0;
         while k < self.services.admin_sessions.len() {
             let session = self.services.admin_sessions[k].raw().0;
-            if !pick(session) {
+            let (asked, closed) = picked(&self.services.admin_sessions[k]);
+            for (op, request_id, body) in asked {
+                self.admin_request(session, op, request_id, &body);
+            }
+            if !closed {
                 k += 1;
                 continue;
             }
-            match recv_request(&self.services.admin_sessions[k]) {
-                Ok(Some((op, request_id, body))) => self.admin_request(session, op, request_id, &body),
-                Ok(None) => k += 1,
-                Err(()) => {
-                    self.services.admin_sessions.remove(k);
-                    // **What it asked goes on, unanswered.** Dropping the request instead would
-                    // drop a restart's start with its answer, and leave the service stopped.
-                    for h in self.held.iter_mut().filter(|h| h.session == session) {
-                        h.session = 0;
-                    }
-                }
+            self.services.admin_sessions.remove(k);
+            // **What it asked goes on, unanswered.** Dropping the request instead would drop a
+            // restart's start with its answer, and leave the service stopped.
+            for h in self.held.iter_mut().filter(|h| h.session == session) {
+                h.session = 0;
             }
         }
         let mut k = 0;
         while k < self.services.power_sessions.len() {
             let session = self.services.power_sessions[k].raw().0;
-            if !pick(session) {
-                k += 1;
-                continue;
+            let (asked, closed) = picked(&self.services.power_sessions[k]);
+            for (op, request_id, body) in asked {
+                self.power_request(session, op, request_id, &body);
             }
-            match recv_request(&self.services.power_sessions[k]) {
-                Ok(Some((op, request_id, body))) => self.power_request(session, op, request_id, &body),
-                Ok(None) => k += 1,
-                // A shutdown already asked goes on: it was answered when it began.
-                Err(()) => {
-                    self.services.power_sessions.remove(k);
-                }
+            // A shutdown already asked goes on: it was answered when it began.
+            k += !closed as usize;
+            if closed {
+                self.services.power_sessions.remove(k);
             }
         }
         let mut k = 0;
         while k < self.services.admin_ends.len() {
-            if !pick(self.services.admin_ends[k].raw().0) {
-                k += 1;
-                continue;
+            let (asked, closed) = picked(&self.services.admin_ends[k]);
+            for (op, request_id, _) in asked {
+                let (held, max) = (self.services.admin_sessions.len(), services::MAX_ADMIN_SESSIONS);
+                if let Some(s) = open_session(&self.services.admin_ends[k], op, request_id, held, max) {
+                    self.services.admin_sessions.push(s);
+                }
             }
-            match recv_request(&self.services.admin_ends[k]) {
-                Ok(Some((op, request_id, _))) => {
-                    let (held, max) = (self.services.admin_sessions.len(), services::MAX_ADMIN_SESSIONS);
-                    if let Some(s) = open_session(&self.services.admin_ends[k], op, request_id, held, max) {
-                        self.services.admin_sessions.push(s);
-                    }
-                }
-                Ok(None) => k += 1,
-                Err(()) => {
-                    self.services.admin_ends.remove(k);
-                }
+            k += !closed as usize;
+            if closed {
+                self.services.admin_ends.remove(k);
             }
         }
         let mut k = 0;
         while k < self.services.power_ends.len() {
-            if !pick(self.services.power_ends[k].raw().0) {
-                k += 1;
-                continue;
+            let (asked, closed) = picked(&self.services.power_ends[k]);
+            for (op, request_id, _) in asked {
+                let (held, max) = (self.services.power_sessions.len(), services::MAX_POWER_SESSIONS);
+                if let Some(s) = open_session(&self.services.power_ends[k], op, request_id, held, max) {
+                    self.services.power_sessions.push(s);
+                }
             }
-            match recv_request(&self.services.power_ends[k]) {
-                Ok(Some((op, request_id, _))) => {
-                    let (held, max) = (self.services.power_sessions.len(), services::MAX_POWER_SESSIONS);
-                    if let Some(s) = open_session(&self.services.power_ends[k], op, request_id, held, max) {
-                        self.services.power_sessions.push(s);
-                    }
-                }
-                Ok(None) => k += 1,
-                Err(()) => {
-                    self.services.power_ends.remove(k);
-                }
+            k += !closed as usize;
+            if closed {
+                self.services.power_ends.remove(k);
             }
         }
-        if self.services.serve.as_ref().is_some_and(|root| pick(root.raw().0)) {
-            while let Some(root) = &self.services.serve {
-                match recv_request(root) {
-                    Ok(Some((op, request_id, body))) => {
-                        let minted = self.answer_resolve(root, op, request_id, &body, false);
-                        self.keep(minted);
-                    }
-                    Ok(None) => break,
-                    Err(()) => self.services.serve = None,
-                }
-            }
+        let (asked, closed) = self.services.serve.as_ref().map_or((Vec::new(), false), picked);
+        for (op, request_id, body) in asked {
+            let minted =
+                self.services.serve.as_ref().and_then(|r| self.answer_resolve(r, op, request_id, &body, false));
+            self.keep(minted);
+        }
+        if closed {
+            self.services.serve = None;
         }
         // This manager holds its other end, so it cannot close.
-        if self.services.session_serve.as_ref().is_some_and(|s| pick(s.raw().0)) {
-            while let Some(session) = &self.services.session_serve
-                && let Ok(Some((op, request_id, body))) = recv_request(session)
-            {
-                let minted = self.answer_resolve(session, op, request_id, &body, true);
-                self.keep(minted);
-            }
+        for (op, request_id, body) in self.services.session_serve.as_ref().map_or(Vec::new(), |s| picked(s).0) {
+            let minted =
+                self.services.session_serve.as_ref().and_then(|s| self.answer_resolve(s, op, request_id, &body, true));
+            self.keep(minted);
         }
     }
 

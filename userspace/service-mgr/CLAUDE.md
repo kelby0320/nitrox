@@ -50,7 +50,8 @@ and the slice plan all live there.
   deadlocks the boot. Its main wait is `Mgr::run`'s: its notifications, every route, and each
   control channel that can still bring a message, with the nearest deadline as the timeout. A
   `Ready` awaited, a backoff, an `after` — each is a deadline there, and resolves are answered on
-  every pass that their route signals. The grace wait for an exit code and the lookup of a derived
+  every pass that their route signals, **at most `routes::PER_PASS` from a channel a pass**: a
+  client that keeps its ring full held the loop, and a ring left non-empty signals the next wait. The grace wait for an exit code and the lookup of a derived
   endpoint (`wait_codes`, `lookup_serving`) answer them too. The lookups it waits on outright
   (`lookup`: `/bin`, a server's log endpoint) reach the root filesystem, the profile server and
   servers already serving, none of which waits on it.

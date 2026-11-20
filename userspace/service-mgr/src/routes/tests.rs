@@ -52,3 +52,49 @@ fn the_grace_wait_lasts_its_length_though_a_route_wakes_it() {
         assert_eq!(mock::sleeps(), !late as u32, "late {late}: the grace waited out");
     }
 }
+
+/// **A pass answers at most [`PER_PASS`] resolves a route**, the rest left for the next: a client
+/// that kept a ring full held this manager in that route's loop, reaping and restarts with it.
+#[test]
+fn a_pass_answers_a_bounded_number_of_resolves_a_route() {
+    mock::reset();
+    let mut routes = Routes::default();
+    let r = routes.route(0, "tty-server", None).unwrap();
+    for id in 0..PER_PASS as u64 + 3 {
+        resolve(&routes[r].client, id);
+    }
+    routes.serve(None, |_| true);
+    assert_eq!(replies(&routes[r].client).len(), PER_PASS, "one pass");
+    routes.serve(None, |_| true);
+    assert_eq!(replies(&routes[r].client).len(), 3, "the next");
+}
+
+/// **A pass takes at most [`PER_PASS`] requests from a channel**, and says it closed only once
+/// none is left.
+#[test]
+fn a_pass_takes_a_bounded_number_of_requests_from_a_channel() {
+    mock::reset();
+    let (ours, theirs) = Endpoint::pair(64).unwrap();
+    for id in 0..PER_PASS as u64 + 3 {
+        resolve(&theirs, id);
+    }
+    drop(theirs);
+    assert_eq!(take(&ours).0.len(), PER_PASS);
+    let (rest, closed) = take(&ours);
+    assert_eq!((rest.len(), closed), (3, true));
+}
+
+/// **A route that keeps signalling does not hold the grace wait past its deadline.**
+#[test]
+fn a_route_that_keeps_signalling_ends_the_grace_wait_at_its_deadline() {
+    mock::reset();
+    let mut routes = Routes::default();
+    let r = routes.route(0, "tty-server", None).unwrap();
+    // SAFETY: a queue the mock has just made, which nothing else holds.
+    let notif = unsafe { Handle::<Notify, Only>::from_raw(RawHandle(mock::notify(&[])), Rights::empty()) };
+    for id in 0..SERVE_DEPTH as u64 {
+        resolve(&routes[r].client, id);
+    }
+    assert!(!wait_codes(&notif, &routes, None, time::now().unwrap() + 2_000_000));
+    assert!(replies(&routes[r].client).len() < SERVE_DEPTH as usize, "ended by the clock, not by the ring");
+}

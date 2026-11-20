@@ -19,6 +19,10 @@ pub type BindNs = Handle<Namespace, NsMutable>;
 /// How deep each route is: a full ring answers the resolver `WouldBlock` at once.
 pub const SERVE_DEPTH: u32 = 64;
 
+/// The most requests a pass takes from one channel, so a client that keeps its ring full cannot
+/// hold this manager from its other work: a ring left non-empty signals the next wait at once.
+pub const PER_PASS: usize = 16;
+
 /// **A route**, reaching **one** server: one that reached any server by the suffix could not be
 /// handed to a session, since `desktop-shell` could bind it at a base of its choosing.
 pub struct Route {
@@ -93,7 +97,7 @@ impl Routes {
     /// the route's base while something is bound there, `NotFound` while not.
     pub fn serve(&self, registry: Option<&BindNs>, pick: impl Fn(usize) -> bool) {
         for (_, r) in self.0.iter().enumerate().filter(|&(k, _)| pick(k)) {
-            while let Ok(Some((op, request_id, body))) = recv_request(&r.serve) {
+            for (op, request_id, body) in take(&r.serve).0 {
                 let resolve = librsproto::OP_NS_RESOLVE;
                 if op != resolve {
                     server::reply_error(&r.serve, op, request_id, KError::Unsupported, b"");
@@ -131,6 +135,19 @@ pub fn wait_codes(notif: &Handle<Notify, Only>, routes: &Routes, registry: Optio
             return false;
         }
     }
+}
+
+/// Up to [`PER_PASS`] requests from `ch`, and whether its peer has gone with none left.
+pub fn take(ch: &Endpoint) -> (Vec<(u16, u64, Vec<u8>)>, bool) {
+    let mut taken = Vec::new();
+    while taken.len() < PER_PASS {
+        match recv_request(ch) {
+            Ok(Some(request)) => taken.push(request),
+            Ok(None) => return (taken, false),
+            Err(()) => return (taken, true),
+        }
+    }
+    (taken, false)
 }
 
 /// One message on `ch`, its handles closed: `Err(())` once **a peer that has gone** is all that is
