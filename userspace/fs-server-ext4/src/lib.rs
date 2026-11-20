@@ -1318,7 +1318,7 @@ mod tests {
             base.read_at(2 * 1024, &mut gd).unwrap();
             rd_u16(&gd, 12) as u64
         };
-        let want = free_0 + 600; // past group 0's free blocks, into group 1's
+        let want = free_0 + 8190 + 600; // past groups 0 and 1's free blocks, into group 2's
 
         let (a, b) = (RwImage(RefCell::new(image.clone())), RwImage(RefCell::new(image)));
         let (mut by_run, mut goal) = (Vec::new(), first + 100);
@@ -1338,8 +1338,8 @@ mod tests {
         assert!(by_run.iter().any(|&p| p >= first + 8192), "the runs reached group 1");
         assert!(*a.0.borrow() == *b.0.borrow(), "the same bitmaps and counts");
 
-        let end_0 = first + 8192;
-        let runs = [(end_0 - 300, 900), (first + 120, 40)];
+        let end_1 = first + 2 * 8192; // group 2 has no backup at its start, so a run can cross into it
+        let runs = [(end_1 - 300, 900), (taken[0] + 120, 40)];
         for (phys, len) in runs {
             ext4::free_run(&a, &sb, phys, len).unwrap();
             for blk in phys..phys + len {

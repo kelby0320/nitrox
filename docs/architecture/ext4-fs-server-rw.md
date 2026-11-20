@@ -193,6 +193,21 @@ worst. An unlink or a replacing rename that answered an error once its name was 
 orphan with it, since the server releases one only on `Ok`. `volume/crash_tests.rs` stops each at
 every write, refused once or from there on, and asks `e2fsck` what it left.
 
+**No file has a block of the filesystem's own** (pre-Phase-7 Part H.1, bug-bash fs-11). Each
+group's superblock and descriptor-table copies, its reserve for the table, its two bitmaps and its
+inode table are the *system zone*, as Linux names it (`ext4_sb_block_valid`), and `ext4/zone.rs`
+answers whether a run touches it: the copies from the superblock's own fields (`sparse_super`,
+`sparse_super2`, `s_reserved_gdt_blocks`), the tables from the descriptors of the run's flex
+group. There is no table of it, since the library has no `alloc` and `nxinstall` writes with no
+mount. It is asked where an extent is used — the extent a lookup lands in, every tree node read,
+and what a cut drops, before it writes — where a run is freed (`free_run`, which every free goes
+through), and where one is allocated (`alloc_run`, so a bitmap bit cleared over a table is refused,
+not handed out). Each answers `Corrupt`. Until then a crafted stick's extent over an inode table was
+handed to the kernel to write back into, and freed by an unlink or a cut for the next file to zero;
+a test zeroed the root inode. **The first data block itself**, the primary superblock on 1 KiB
+blocks, is no extent's to start at, as Linux refuses it. An extent over another file's blocks is
+not caught, as Linux does not catch it: only a check's whole scan can.
+
 The tree is held to **e2fsprogs** in the host tests: `debugfs`' reading of every map, and `e2fsck
 -fn` clean — 4,096 files of 16 KiB in one directory; two files grown in turn to two levels at both
 block sizes and cut back through each; a two-level tree `mke2fs -d` wrote, read, cut and removed;
@@ -220,9 +235,12 @@ replayed (`needs_recovery`), since a replay after a write here would undo it. A 
 `dir_nlink` and `extra_isize`, refuses a writable mount only: `metadata_csum` and `uninit_bg`
 checksums a write would leave stale, so `e2fsck` and Linux called the filesystem corrupt after the
 first, and `bigalloc` and quotas count what this writer does not. So does a filesystem lacking
-`filetype` or `extent`, which every write here makes. Until then each was mounted writable. The
-storage service mounts such a filesystem read-only, saying why (`check_writable`). The table is
-`ext4/features.rs`. **`dir_index`**, a compatible feature, asks one thing of a writer that keeps no
+`filetype` or `extent`, which every write here makes. Until then each was mounted writable. **So
+does a layout the system zone's check does not cover** (pre-Phase-7 Part H.1): a group whose
+bitmaps or inode table lie outside its flex group, or flex groups with more descriptors than a
+block, which a fallback of `mke2fs` or a `resize2fs` can leave; `mke2fs`'s own layouts and this
+crate's `mkfs` are inside it. The storage service mounts such a filesystem read-only, saying why
+(`check_writable`). The table is `ext4/features.rs`. **`dir_index`**, a compatible feature, asks one thing of a writer that keeps no
 hash tree: a directory Linux indexed is made linear before a name goes in, as an older writer makes
 one, since its blocks read linearly as they are. An insert wrote over the tree's root instead.
 

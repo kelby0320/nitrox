@@ -215,24 +215,7 @@ impl Geometry {
     /// **`sparse_super`'s rule**: group 0, group 1, and every power of 3, 5 and 7. Anything
     /// else holds only its own bitmaps and inode table.
     pub fn has_super(&self, group: u32) -> bool {
-        if group <= 1 {
-            return true;
-        }
-        if group.is_multiple_of(2) {
-            return false; // no even group above 0 is a power of 3, 5 or 7
-        }
-        [3u32, 5, 7].iter().any(|&base| {
-            let mut n = base;
-            loop {
-                if n == group {
-                    return true;
-                }
-                match n.checked_mul(base) {
-                    Some(next) if next <= group => n = next,
-                    _ => return false,
-                }
-            }
-        })
+        sparse_group(group)
     }
 
     /// Blocks of `group` taken by metadata: its superblock and descriptor copy if it has one, its
@@ -252,6 +235,28 @@ impl Geometry {
         let total: u64 = (0..self.groups).map(|g| self.blocks_in_group(g) as u64).sum();
         total - used - 1 // the root directory's one data block
     }
+}
+
+/// Whether `group` holds a superblock copy under `sparse_super`: 0, 1, and powers of 3, 5 and 7.
+pub(crate) fn sparse_group(group: u32) -> bool {
+    if group <= 1 {
+        return true;
+    }
+    if group.is_multiple_of(2) {
+        return false; // no even group above 0 is a power of 3, 5 or 7
+    }
+    [3u32, 5, 7].iter().any(|&base| {
+        let mut n = base;
+        loop {
+            if n == group {
+                return true;
+            }
+            match n.checked_mul(base) {
+                Some(next) if next <= group => n = next,
+                _ => return false,
+            }
+        }
+    })
 }
 
 const MAX_INODES: u64 = 1 << 20;

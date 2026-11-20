@@ -205,10 +205,32 @@ fn a_tree_e2fsprogs_wrote_is_read_cut_and_freed() {
     assert_e2fsck_clean(&rw.0.borrow(), "e2fs-removed");
 }
 
+/// No backups past group 0, every table in it: room for an extent of 32,768 blocks, which crosses a
+/// group, where each odd group's backup would leave none.
+fn unbroken(block_size: u32, blocks: u32, content: &[u8]) -> Vec<u8> {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static SEQ: AtomicU32 = AtomicU32::new(0);
+    let n = SEQ.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("nitrox-unbroken-{}-{n}", std::process::id()));
+    std::fs::create_dir_all(dir.join("tree/system")).unwrap();
+    std::fs::write(dir.join("tree/system/current-generation"), content).unwrap();
+    let status = std::process::Command::new("mke2fs")
+        .args(["-q", "-F", "-t", "ext4", "-O", "^has_journal,^64bit,^metadata_csum,^resize_inode,sparse_super2"])
+        .args(["-E", "num_backup_sb=0", "-b", &block_size.to_string(), "-d"])
+        .args([dir.join("tree"), dir.join("img")])
+        .arg(blocks.to_string())
+        .status()
+        .unwrap();
+    assert!(status.success(), "mke2fs");
+    let img = std::fs::read(dir.join("img")).unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    img
+}
+
 /// Patch the extent of the fixture's one-block file to `ee_len` and its size to `size`,
 /// returning the image and the block the extent starts at.
 fn patched(ee_len: u16, size: u64) -> (Vec<u8>, u64) {
-    let mut img = fixture_blocks(4096, 40000, 0, &[0xAB; 4096]);
+    let mut img = unbroken(4096, 40000, &[0xAB; 4096]);
     let r = ImageReader(img.clone());
     let sb = read_superblock(&r).unwrap();
     let (ino, inode) = resolve_path_ino(&r, &sb, b"/system/current-generation").unwrap();
@@ -248,11 +270,11 @@ fn a_full_length_extent_and_an_unwritten_one_read_as_e2fsprogs_reads_them() {
 /// as `0x8000`, and the next block starts another.
 #[test]
 fn an_extent_grows_to_32768_blocks_and_the_next_block_starts_another() {
-    let rw = RwImage(RefCell::new(fixture_blocks(1024, 40000, 0, b"x\n")));
+    let rw = RwImage(RefCell::new(unbroken(1024, 40000, b"x\n")));
     let sb = read_superblock(&rw).unwrap();
     let mut inode = [0u8; 256];
     empty_root(&mut inode);
-    let p = 2000;
+    let p = 4000; // past every group's tables, which `flex_bg` puts in group 0
     append(&rw, &sb, &mut inode, Extent::written(0, p, MAX_LEN - 1)).unwrap();
     append(&rw, &sb, &mut inode, Extent::written(MAX_LEN - 1, p + MAX_LEN - 1, 1)).unwrap();
     assert_eq!(rd_u16(&inode, 42), 1, "merged into one extent");
@@ -769,4 +791,16 @@ fn a_root_whose_keys_do_not_rise_is_corrupt_to_cut() {
     let before = rw.0.borrow().clone();
     assert_eq!(truncate(&rw, &sb, &mut cut, 150, None), Err(FsError::Corrupt));
     assert!(*rw.0.borrow() == before, "refused, it wrote nothing");
+}
+
+/// **The first data block is the primary superblock's**, refused as an extent's start as Linux
+/// refuses it; the block after it may be a file's.
+#[test]
+fn an_extent_starts_past_the_first_data_block() {
+    for bs in [1024u32, 4096] {
+        let sb = read_superblock(&RwImage(RefCell::new(fixture_blocks(bs, 4096, 0, b"x\n")))).unwrap();
+        let first = sb.first_data_block as u64;
+        assert!(!on_device(&sb, first, 1), "{bs}: the superblock's block");
+        assert!(on_device(&sb, first + 1, 1), "{bs}: the next");
+    }
 }

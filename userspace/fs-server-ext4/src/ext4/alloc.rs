@@ -70,6 +70,10 @@ pub(crate) fn alloc_run<RW: BlockReader + BlockWriter>(
             map.set(start + len)?;
             len += 1;
         }
+        // A free bit over metadata is a corrupt bitmap, and the run would be zeroed over the tables.
+        if !zone::clear(rw, sb, group_start + start as u64, len as u64)? {
+            return Err(FsError::Corrupt);
+        }
         rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
 
         // Decrement free-block counts: group descriptor (@12, u16) and superblock (@12, u32).
@@ -199,7 +203,7 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
     let bs = sb.block_size as usize;
     let per_group = sb.blocks_per_group as u64;
     let end = phys.checked_add(len).ok_or(FsError::Corrupt)?;
-    if phys < sb.first_data_block as u64 || end > sb.blocks_count {
+    if phys < sb.first_data_block as u64 || end > sb.blocks_count || !zone::clear(rw, sb, phys, len)? {
         return Err(FsError::Corrupt);
     }
     // What is freed may next be a file's, which the kernel writes behind this server's back: a
@@ -239,4 +243,16 @@ pub(crate) fn free_run<RW: BlockReader + BlockWriter>(
         blk += n as u64;
     }
     Ok(())
+}
+
+/// Whether block `blk`'s bit is set in its group's bitmap: what a test asks of each mapped block.
+#[cfg(test)]
+pub(crate) fn block_in_use<R: BlockReader>(r: &R, sb: &Superblock, blk: u64) -> bool {
+    let rel = blk - sb.first_data_block as u64;
+    let (group, index) = ((rel / sb.blocks_per_group as u64) as u32, (rel % sb.blocks_per_group as u64) as usize);
+    let mut gd = [0u8; 64];
+    r.read_at(sb.group_desc_offset(group), &mut gd[..(sb.desc_size as usize).min(64)]).unwrap();
+    let mut byte = [0u8; 1];
+    r.read_at(rd_u32(&gd, 0) as u64 * sb.block_size as u64 + index as u64 / 8, &mut byte).unwrap();
+    !Bitmap(&mut byte).is_free(index % 8).unwrap()
 }

@@ -13,7 +13,10 @@ mod listing;
 mod state;
 mod superblock;
 mod unservable;
+pub(crate) mod zone;
 
+#[cfg(test)]
+pub(crate) use alloc::block_in_use;
 pub(crate) use alloc::{alloc_block, alloc_run, free_block, free_run};
 use alloc::{alloc_inode, free_inode};
 use bitmap::Bitmap;
@@ -343,18 +346,6 @@ pub fn map_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [crate::BlockRun])
 /// `/` and no control character, as FAT refuses them; `e2fsck` calls a NUL illegal.
 fn writable_name(name: &[u8]) -> bool {
     !name.is_empty() && name.len() <= 255 && !name.iter().any(|&c| c == b'/' || c < 0x20 || c == 0x7F)
-}
-
-/// Whether block `blk`'s bit is set in its group's bitmap: what a test asks of each mapped block.
-#[cfg(test)]
-pub(crate) fn block_in_use<R: BlockReader>(r: &R, sb: &Superblock, blk: u64) -> bool {
-    let rel = blk - sb.first_data_block as u64;
-    let (group, index) = ((rel / sb.blocks_per_group as u64) as u32, (rel % sb.blocks_per_group as u64) as usize);
-    let mut gd = [0u8; 64];
-    r.read_at(sb.group_desc_offset(group), &mut gd[..(sb.desc_size as usize).min(64)]).unwrap();
-    let mut byte = [0u8; 1];
-    r.read_at(rd_u32(&gd, 0) as u64 * sb.block_size as u64 + index as u64 / 8, &mut byte).unwrap();
-    !Bitmap(&mut byte).is_free(index % 8).unwrap()
 }
 
 /// Resolve an absolute path to `(inode_number, inode_bytes)`, walking from the root inode.

@@ -144,3 +144,6 @@ holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds i
   which refuses one its length cannot hold. `garbage_in_any_structure_is_an_error_never_a_panic`
   (`volume/hostile_tests.rs`) holds the rule as a class, on real structures made wrong: a new
   reader of on-disk bytes belongs in what it exercises.
+- An extent, a tree node, a free or an allocation over the filesystem's own blocks: each asks
+  `ext4/zone.rs` first, and is `Corrupt` if it touches a superblock or descriptor copy, a bitmap or
+  an inode table. A new place that maps, frees or allocates blocks asks it too.

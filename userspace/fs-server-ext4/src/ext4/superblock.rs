@@ -3,6 +3,10 @@
 
 use super::*;
 
+const COMPAT_SPARSE_SUPER2: u32 = 0x0200;
+const RO_COMPAT_SPARSE_SUPER: u32 = 0x0001;
+const INCOMPAT_FLEX_BG: u32 = 0x0200;
+
 /// The parsed superblock facts the reader (and the write path) need.
 pub(crate) struct Superblock {
     pub(crate) block_size: u32,
@@ -17,9 +21,46 @@ pub(crate) struct Superblock {
     /// [`parse_superblock`] refuses). **The ceiling the allocator must not cross.**
     pub(crate) blocks_count: u64,
     pub(crate) inodes_count: u32,
+    /// Which groups hold a copy of the superblock and the descriptor table.
+    pub(crate) backups: Backups,
+    /// `s_reserved_gdt_blocks`: blocks kept after each descriptor-table copy for it to grow into.
+    pub(crate) reserved_gdt_blocks: u32,
+    /// Groups to a flex group, each keeping its tables inside it: `1` without `flex_bg`.
+    pub(crate) groups_per_flex: u64,
+}
+
+/// Which groups besides group 0 hold a copy of the superblock and the descriptor table.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Backups {
+    All,
+    /// `sparse_super`: group 1, and every power of 3, 5 and 7.
+    Sparse,
+    /// `sparse_super2`: the two `s_backup_bgs` names, `0` for none.
+    Named([u32; 2]),
 }
 
 impl Superblock {
+    /// Whether `group` holds a superblock and descriptor-table copy, as `ext4_bg_has_super` answers.
+    pub(crate) fn has_super(&self, group: u32) -> bool {
+        match self.backups {
+            _ if group == 0 => true,
+            Backups::All => true,
+            Backups::Sparse => crate::mkfs::sparse_group(group),
+            Backups::Named(groups) => groups.contains(&group),
+        }
+    }
+
+    /// Blocks from a group's start its copies take, where it has them: superblock, table, reserve.
+    pub(crate) fn super_blocks(&self) -> u64 {
+        let table = (self.group_count() as u64 * self.desc_size as u64).div_ceil(self.block_size as u64);
+        1 + table + self.reserved_gdt_blocks as u64
+    }
+
+    /// The blocks a group's inode table takes.
+    pub(crate) fn table_blocks(&self) -> u64 {
+        (self.inodes_per_group as u64 * self.inode_size as u64).div_ceil(self.block_size as u64)
+    }
+
     pub(crate) fn group_count(&self) -> u32 {
         let data = self.blocks_count.saturating_sub(self.first_data_block as u64);
         data.div_ceil(self.blocks_per_group as u64).max(1) as u32
@@ -116,6 +157,16 @@ fn parse_superblock(sb: &[u8; 1024]) -> Result<Superblock, Unservable> {
         first_data_block,
         blocks_count: rd_u32(sb, 4) as u64,
         inodes_count: rd_u32(sb, 0),
+        backups: match (rd_u32(sb, 92) & COMPAT_SPARSE_SUPER2, rd_u32(sb, 100) & RO_COMPAT_SPARSE_SUPER) {
+            (0, 0) => Backups::All,
+            (0, _) => Backups::Sparse,
+            _ => Backups::Named([rd_u32(sb, 0x24C), rd_u32(sb, 0x250)]),
+        },
+        reserved_gdt_blocks: rd_u16(sb, 0xCE) as u32,
+        groups_per_flex: match incompat & INCOMPAT_FLEX_BG {
+            0 => 1,
+            _ => 1u64 << sb[0x174].min(63),
+        },
     };
     if parsed.inodes_count as u64 != parsed.group_count() as u64 * inodes_per_group as u64 {
         return Err(Unservable::Geometry("s_inodes_count"));
@@ -149,15 +200,20 @@ pub fn check_device<R: BlockReader>(r: &R) -> Result<(), Unservable> {
     if mode & S_IFMT != S_IFDIR {
         return Err(Unservable::RootNotDirectory { mode });
     }
-    Ok(())
+    match r.read_only() {
+        true => Ok(()),
+        false => zone::layout(r, &sb),
+    }
 }
 
 /// **Whether a write here keeps the filesystem `r` holds**: `NotWritable` naming what it would not,
-/// for a supervisor to mount it read-only instead.
+/// or the layout the check keeping a file's blocks off metadata does not cover, for a supervisor to
+/// mount it read-only instead.
 pub fn check_writable<R: BlockReader>(r: &R) -> Result<(), Unservable> {
     let mut raw = [0u8; 1024];
     r.read_at(1024, &mut raw).map_err(|_| Unservable::Unreadable)?;
-    writable(&raw)
+    writable(&raw)?;
+    zone::layout(r, &parse_superblock(&raw)?)
 }
 
 fn writable(sb: &[u8; 1024]) -> Result<(), Unservable> {
