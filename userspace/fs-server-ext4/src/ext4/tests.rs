@@ -13,6 +13,9 @@ fn a_short_final_group_reports_only_the_blocks_it_has() {
         first_data_block: 1,
         blocks_count: 24576,
         inodes_count: 6144,
+        backups: super::superblock::Backups::Sparse,
+        reserved_gdt_blocks: 0,
+        groups_per_flex: 1,
     };
     assert_eq!(sb.group_count(), 3);
     assert_eq!(sb.blocks_in_group(0), 8192);
@@ -42,6 +45,9 @@ fn group_descriptors_are_a_flat_array_across_block_boundaries() {
         first_data_block: 1,
         blocks_count: 8 * 1024 * 1024,
         inodes_count: 262_144,
+        backups: super::superblock::Backups::Sparse,
+        reserved_gdt_blocks: 0,
+        groups_per_flex: 1,
     };
     assert_eq!(sb.group_desc_offset(0), 2048);
     assert_eq!(sb.group_desc_offset(31), 2048 + 31 * 32);

@@ -54,6 +54,18 @@ pub enum Unservable {
         /// The `incompat` bits missing.
         lacking: u32,
     },
+    /// A writable mount where a group keeps its tables outside its flex group, where the check that
+    /// keeps a file's blocks off them does not look. It can be served read-only.
+    Layout {
+        /// The first such group.
+        group: u32,
+    },
+    /// A writable mount of a filesystem whose flex groups have more descriptors than a block holds,
+    /// more than that check reads. It can be served read-only.
+    FlexTooWide {
+        /// The groups a flex group has.
+        groups: u64,
+    },
 }
 
 impl Unservable {
@@ -69,7 +81,9 @@ impl Unservable {
             | Unservable::BlockTooLarge { .. }
             | Unservable::NeedsRecovery
             | Unservable::Incompatible { .. } => FsError::Unsupported,
-            Unservable::NotWritable { .. } => FsError::ReadOnly,
+            Unservable::NotWritable { .. } | Unservable::Layout { .. } | Unservable::FlexTooWide { .. } => {
+                FsError::ReadOnly
+            }
         }
     }
 }
@@ -121,6 +135,16 @@ impl core::fmt::Display for Unservable {
                 }
                 Ok(())
             }
+            Unservable::Layout { group } => write!(
+                f,
+                "it can only be read here: group {group} keeps its tables outside its flex group, where this \
+                 server does not look for a file's blocks over them"
+            ),
+            Unservable::FlexTooWide { groups } => write!(
+                f,
+                "it can only be read here: flex groups of {groups}, more than this server reads to keep a \
+                 file's blocks off their tables"
+            ),
         }
     }
 }

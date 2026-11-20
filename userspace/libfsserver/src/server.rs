@@ -434,7 +434,7 @@ impl State<'_> {
     }
 
     /// Serve the control channel. A closed peer is ordinary: the channel leaves the wait set.
-    /// **The one request is `Meta::Unmount`**: record the filesystem cleanly unmounted, answer,
+    /// **The one request is `Meta::Unmount`**: record the unmount ([`Volume::mark_clean`]), answer,
     /// and exit; the supervisor has written back what the kernel held. A read-only mount writes
     /// nothing.
     fn serve_control<V: Volume>(&mut self, inbox: &mut Inbox, vol: &V) {

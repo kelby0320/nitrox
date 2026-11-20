@@ -1497,7 +1497,9 @@ resident page of a dirty object.
 administration Part C.3 a writable mount clears ext4's clean bit and an unmount sets it again, so
 a filesystem knows it was left mounted: a crash, a power cut, or, until Part E's shutdown, any
 boot of an installed machine. `fs-server-ext4` **reports** that and serves the filesystem
-anyway. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
+anyway. **Since pre-Phase-7 Part H.1 it stays marked**: an unmount records clean only what its mount
+found clean and nothing failed on, as FAT's always has, so an installed root a crash left not
+clean is reported so at every boot until something checks it, here or on another machine. There is no `e2fsck` here to run, and refusing would strand a disk that is most likely
 fine: this server writes metadata through at once, and a crash leaves at worst what
 `rename_path` and the two-phase free already document, an unattached inode that `e2fsck` puts in
 `lost+found`. **A FAT has no link count**, so a crash mid-rename leaves one file under two names,
@@ -1987,7 +1989,13 @@ gives back what it took when it fails for want of space or depth, not when the d
 of its writes. `alloc_run` and `alloc_inode` write the bitmap before the group descriptor's and
 superblock's counts, and return the error with the bits still set if a count write is lost; and
 `grow_file_from`'s last write, the inode's size, has no undo, so a leaf can map blocks past an
-unchanged size. `e2fsck` reports either and repairs it, and nothing but free space is lost. Found
+unchanged size until the file's next grow cuts them. `e2fsck` reports either and repairs it, and
+nothing but free space is lost. **Until pre-Phase-7 Part H.1 a directory lost more** (bug-bash
+fs-9): its growth's lost size write left a block mapped past its size, and every later growth was
+refused, so nothing more went into the directory until an offline `e2fsck`. A directory's growth
+now cuts past its size first, as a file's does, with `i_blocks` counted again from the tree, and a
+refused size write is undone; what a crash between an inode's write and its link still leaves is
+an unattached empty inode, which no undo can reach without a journal. Found
 in PR #380's review (finding 4): losing a grow's first or second write leaves `Block bitmap
 differences` and a wrong free count. **Trigger**: Part D's bug bash, or a disk refusing writes in
 the field — the fix is an order that can be undone (counts before bits, or the bits given back on

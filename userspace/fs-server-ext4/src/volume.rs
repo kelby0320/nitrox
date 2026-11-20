@@ -2,12 +2,74 @@
 
 use crate::ext4::{self, Unservable};
 use crate::{BlockReader, BlockRun, BlockWriter, FsError};
+use core::cell::Cell;
 use libfsserver::{DirEntry, Mapped, Refusal, Volume};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, DIRENT_KIND_UNKNOWN};
 
 /// **An ext4 filesystem on `R`**: the read-write disk, or the `ReadOnly` over it a read-only
-/// mount is served through.
-pub struct Ext4<'a, R>(pub &'a R);
+/// mount is served through, and what its unmount is to record.
+pub struct Ext4<'a, R> {
+    /// The device, as every operation reaches it.
+    dev: Watched<'a, R>,
+    /// `s_state` as a writable mount found it.
+    found: Cell<Option<u16>>,
+}
+
+/// **The device, noting each write it refuses**: a change may answer `Ok`, or `TooLarge`, with a
+/// write lost inside it, and its answer does not say so.
+struct Watched<'a, R> {
+    r: &'a R,
+    /// Whether a write failed, or an operation failed on the device or found corruption.
+    failed: Cell<bool>,
+}
+
+impl<R> Watched<'_, R> {
+    fn note(&self, out: Result<(), FsError>) -> Result<(), FsError> {
+        if matches!(out, Err(e) if e != FsError::ReadOnly) {
+            self.failed.set(true);
+        }
+        out
+    }
+}
+
+impl<R: BlockReader> BlockReader for Watched<'_, R> {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.r.read_at(offset, buf)
+    }
+    fn read_meta(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+        self.r.read_meta(offset, buf)
+    }
+    fn read_only(&self) -> bool {
+        self.r.read_only()
+    }
+}
+
+impl<R: BlockWriter> BlockWriter for Watched<'_, R> {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        self.note(self.r.write_at(offset, buf))
+    }
+    fn write_zeroes(&self, offset: u64, len: u64) -> Result<(), FsError> {
+        self.note(self.r.write_zeroes(offset, len))
+    }
+    fn forget(&self, offset: u64, len: u64) {
+        self.r.forget(offset, len)
+    }
+}
+
+impl<'a, R> Ext4<'a, R> {
+    /// The filesystem on `r`.
+    pub fn new(r: &'a R) -> Self {
+        Ext4 { dev: Watched { r, failed: Cell::new(false) }, found: Cell::new(None) }
+    }
+
+    /// What an operation answered, noting a failure on the device or corruption, on any path.
+    fn noted<T>(&self, out: Result<T, FsError>) -> Result<T, FsError> {
+        if matches!(out, Err(FsError::Io | FsError::Corrupt)) {
+            self.dev.failed.set(true);
+        }
+        out
+    }
+}
 
 impl Refusal for Unservable {
     fn fs_error(&self) -> FsError {
@@ -44,11 +106,11 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
     type Unservable = Unservable;
 
     fn read_only(&self) -> bool {
-        self.0.read_only()
+        self.dev.read_only()
     }
 
     fn check(&self) -> Result<(), Unservable> {
-        ext4::check_device(self.0)
+        ext4::check_device(&self.dev)
     }
 
     fn state_unwritable() -> Unservable {
@@ -56,83 +118,87 @@ impl<R: BlockReader + BlockWriter> Volume for Ext4<'_, R> {
     }
 
     fn was_left_clean(&self) -> Result<bool, FsError> {
-        ext4::was_left_clean(self.0)
+        ext4::was_left_clean(&self.dev)
     }
 
     fn mark_mounted(&self) -> Result<(), FsError> {
-        ext4::mark_mounted(self.0)
+        self.found.set(Some(ext4::mark_mounted(&self.dev)?));
+        Ok(())
     }
 
     fn mark_clean(&self) -> Result<(), FsError> {
-        ext4::mark_clean(self.0)
+        match self.found.get() {
+            Some(found) => ext4::mark_unmounted(&self.dev, found, self.dev.failed.get()),
+            None => Ok(()),
+        }
     }
 
     fn map_file(&self, path: &[u8], runs: &mut [BlockRun]) -> Result<Mapped, FsError> {
-        let m = ext4::map_file(self.0, path, runs)?;
+        let m = self.noted(ext4::map_file(&self.dev, path, runs))?;
         Ok(Mapped { size: m.size, block_size: m.block_size, runs: m.runs, id: m.ino as u64 })
     }
 
     fn read_file(&self, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
-        ext4::read_file(self.0, path, out)
+        self.noted(ext4::read_file(&self.dev, path, out))
     }
 
     fn read_file_range(&self, path: &[u8], offset: u64, len: usize, out: &mut [u8]) -> Result<usize, FsError> {
-        ext4::read_file_range(self.0, path, offset, len, out)
+        self.noted(ext4::read_file_range(&self.dev, path, offset, len, out))
     }
 
     fn create_file(&self, parent: &[u8], name: &[u8], now: i64) -> Result<(), FsError> {
-        ext4::create_file(self.0, parent, name, now).map(drop)
+        self.noted(ext4::create_file(&self.dev, parent, name, now).map(drop))
     }
 
     fn grow_file(&self, path: &[u8], size: usize, now: i64) -> Result<u64, FsError> {
-        ext4::grow_file_from(self.0, path, size, now).map(|(was, _)| was as u64)
+        self.noted(ext4::grow_file_from(&self.dev, path, size, now).map(|(was, _)| was as u64))
     }
 
     /// An ext4 file keeps its inode at any size, so a truncate ends no id.
     fn truncate_file(&self, path: &[u8], size: usize, now: i64) -> Result<Option<u64>, FsError> {
-        ext4::truncate_file(self.0, path, size, now).map(|_| None)
+        self.noted(ext4::truncate_file(&self.dev, path, size, now).map(|_| None))
     }
 
     fn resolve_dir(&self, path: &[u8]) -> Result<u64, FsError> {
-        ext4::resolve_dir(self.0, path).map(u64::from)
+        self.noted(ext4::resolve_dir(&self.dev, path).map(u64::from))
     }
 
     fn read_dir(&self, dir: u64, cursor: u64, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
-        ext4::read_dir_stat(self.0, ino(dir)?, cursor, |id, ft, name, st| {
+        self.noted(ext4::read_dir_stat(&self.dev, ino(dir)?, cursor, |id, ft, name, st| {
             emit(&DirEntry { id, kind: map_kind(ft, st.mode), mode: st.mode, size: st.size, mtime: st.mtime, name })
-        })
+        }))
     }
 
     fn mkdir_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        ext4::mkdir_at(self.0, ino(dir)?, name, now)
+        self.noted(ext4::mkdir_at(&self.dev, ino(dir)?, name, now))
     }
 
     fn unlink_at(&self, dir: u64, name: &[u8], now: i64) -> Result<Option<u64>, FsError> {
-        ext4::unlink_at(self.0, ino(dir)?, name, now).map(|orphan| orphan.map(u64::from))
+        self.noted(ext4::unlink_at(&self.dev, ino(dir)?, name, now).map(|orphan| orphan.map(u64::from)))
     }
 
     fn rmdir_at(&self, dir: u64, name: &[u8], now: i64, freeing: impl FnOnce(u64)) -> Result<(), FsError> {
-        ext4::rmdir_at(self.0, ino(dir)?, name, now, |i| freeing(u64::from(i)))
+        self.noted(ext4::rmdir_at(&self.dev, ino(dir)?, name, now, |i| freeing(u64::from(i))))
     }
 
     fn touch_at(&self, dir: u64, name: &[u8], now: i64) -> Result<(), FsError> {
-        ext4::touch_at(self.0, ino(dir)?, name, now)
+        self.noted(ext4::touch_at(&self.dev, ino(dir)?, name, now))
     }
 
     fn rename_at(&self, dir: u64, old: &[u8], new: &[u8], now: i64) -> Result<(), FsError> {
-        ext4::rename_at(self.0, ino(dir)?, old, new, now)
+        self.noted(ext4::rename_at(&self.dev, ino(dir)?, old, new, now))
     }
 
     fn rename_path(&self, old: &[u8], new: &[u8], replace: bool, now: i64) -> Result<Option<u64>, FsError> {
-        ext4::rename_path(self.0, old, new, replace, now).map(|replaced| replaced.map(u64::from))
+        self.noted(ext4::rename_path(&self.dev, old, new, replace, now).map(|replaced| replaced.map(u64::from)))
     }
 
     fn touch_file(&self, id: u64, now: i64) -> Result<(), FsError> {
-        ext4::touch_file(self.0, ino(id)?, now)
+        self.noted(ext4::touch_file(&self.dev, ino(id)?, now))
     }
 
     fn release(&self, id: u64, now: i64) -> Result<(), FsError> {
-        ext4::release_inode(self.0, ino(id)?, now)
+        self.noted(ext4::release_inode(&self.dev, ino(id)?, now))
     }
 }
 
@@ -164,7 +230,7 @@ mod tests {
         use crate::test_support::RwImage;
         use libfsserver::serve::{MAX_SUFFIX, directory_open};
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"g\n")));
-        let vol = Ext4(&rw);
+        let vol = Ext4::new(&rw);
         let mut path = Vec::new();
         for c in *b"abcd" {
             vol.mkdir_at(vol.resolve_dir(&path).unwrap(), &[c; 254], 0).unwrap();
@@ -197,7 +263,7 @@ mod tests {
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
 
-        match serve_resolve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve_resolve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::File { reply_len, content_len } => {
                 assert_eq!(&content[..content_len], b"nitrox-gen-0001\n");
                 // The reply is a success ResolveReply echoing the request id.
@@ -221,7 +287,7 @@ mod tests {
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
 
-        match serve_resolve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve_resolve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::Error { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 assert_eq!(m.request_id, 7);
@@ -240,7 +306,7 @@ mod tests {
         let (req, req_len) = make_request(1, b"system"); // a directory
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
-        match serve_resolve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve_resolve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::Error { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 let e = parse_error(m.body).unwrap();
@@ -258,7 +324,7 @@ mod tests {
         let n = encode(&mut buf, librsproto::OP_PING, 9, 0, &[], 0).unwrap();
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
-        match serve_resolve(&Ext4(&r), &buf[..n], &mut content, &mut reply) {
+        match serve_resolve(&Ext4::new(&r), &buf[..n], &mut content, &mut reply) {
             Served::Error { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 assert_eq!(m.request_id, 9);
@@ -275,7 +341,7 @@ mod tests {
         let garbage = [0u8; 8]; // too short / bad magic
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
-        match serve_resolve(&Ext4(&r), &garbage, &mut content, &mut reply) {
+        match serve_resolve(&Ext4::new(&r), &garbage, &mut content, &mut reply) {
             Served::Error { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 assert_eq!(m.request_id, 0); // unrecoverable id
@@ -312,7 +378,7 @@ mod tests {
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
 
-        match serve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::LazyBlocks { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 assert_eq!(m.op, OP_NS_RESOLVE);
@@ -358,7 +424,7 @@ mod tests {
         use libfsserver::RUN_UNWRITTEN;
         use libfsserver::serve::serve_grown;
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
-        let vol = Ext4(&rw);
+        let vol = Ext4::new(&rw);
         vol.create_file(b"/system", b"g", 0).unwrap();
         assert_eq!(vol.grow_file(b"/system/g", 4196, 0), Ok(0), "grown from nothing");
         let was = vol.grow_file(b"/system/g", 5 * 4096, 0).unwrap();
@@ -417,9 +483,9 @@ mod tests {
         let (req, req_len) = make_lazy_request(12, b"system/current-generation");
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
-        let served = serve(&Ext4(&crate::ReadOnly(&r)), &req[..req_len], &mut content, &mut reply);
+        let served = serve(&Ext4::new(&crate::ReadOnly(&r)), &req[..req_len], &mut content, &mut reply);
         assert_eq!(flags_of(served, &reply), librsproto::namespace::FILE_BLOCKS_READ_ONLY);
-        let served = serve(&Ext4(&r), &req[..req_len], &mut content, &mut reply);
+        let served = serve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply);
         assert_eq!(flags_of(served, &reply), 0);
     }
 
@@ -444,7 +510,7 @@ mod tests {
         use libfsserver::serve::{Resized, apply_size};
         use librsproto::namespace::{RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_TRUNCATE};
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
-        let vol = Ext4(&rw);
+        let vol = Ext4::new(&rw);
         let grow = RESOLVE_CREATE | RESOLVE_GROW;
         let long = [b"system/" as &[u8], &[b'a'; 300]].concat();
         assert_eq!(apply_size(&vol, &req(grow, b"system/big", 64 << 20), 0), Err(FsError::TooLarge));
@@ -452,7 +518,8 @@ mod tests {
         assert_eq!(apply_size(&vol, &req(RESOLVE_TRUNCATE, b"system/none", 0), 0), Ok(Resized::default()));
         let grown = Resized { grown_from: Some(0), ended: None };
         assert_eq!(apply_size(&vol, &req(grow, b"system/new", 8192), 0), Ok(grown));
-        let ro = Ext4(&crate::ReadOnly(&rw));
+        let read_only = crate::ReadOnly(&rw);
+        let ro = Ext4::new(&read_only);
         assert_eq!(apply_size(&ro, &req(grow, b"system/other", 8192), 0), Err(FsError::ReadOnly));
         let cut = req(RESOLVE_TRUNCATE, b"system/current-generation", 0);
         assert_eq!(apply_size(&ro, &cut, 0), Err(FsError::ReadOnly), "a read-only truncate changed nothing");
@@ -475,16 +542,16 @@ mod tests {
             runs.flat_map(|r| r.device_lba..r.device_lba + r.length as u64).collect::<Vec<_>>()
         };
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
-        Ext4(&rw).create_file(b"/system", b"big", 0).unwrap();
-        Ext4(&rw).grow_file(b"/system/big", 40960, 0).unwrap();
+        Ext4::new(&rw).create_file(b"/system", b"big", 0).unwrap();
+        Ext4::new(&rw).grow_file(b"/system/big", 40960, 0).unwrap();
         let base = rw.0.into_inner();
         let all = Failing::after(base.clone(), u64::MAX);
-        let had = blocks(&Ext4(&all));
-        apply_size(&Ext4(&all), &req(RESOLVE_TRUNCATE, b"system/big", 4096), 0).unwrap();
+        let had = blocks(&Ext4::new(&all));
+        apply_size(&Ext4::new(&all), &req(RESOLVE_TRUNCATE, b"system/big", 4096), 0).unwrap();
         for n in 0..all.writes.get() {
             for once in [true, false] {
                 let rw = if once { Failing::once(base.clone(), n) } else { Failing::after(base.clone(), n) };
-                let vol = Ext4(&rw);
+                let vol = Ext4::new(&rw);
                 let sb = read_superblock(&rw).unwrap();
                 let named = match apply_size(&vol, &req(RESOLVE_TRUNCATE, b"system/big", 4096), 0) {
                     Err(_) => had.clone(),
@@ -502,7 +569,7 @@ mod tests {
     fn a_directory_moves_beside_a_name_that_begins_with_its_own_but_never_into_itself() {
         use crate::test_support::{RwImage, assert_e2fsck_clean};
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
-        let vol = Ext4(&rw);
+        let vol = Ext4::new(&rw);
         for name in [b"ab" as &[u8], b"abc", b"d", b"dd"] {
             vol.mkdir_at(2, name, 0).unwrap();
         }
@@ -523,7 +590,7 @@ mod tests {
     fn a_name_past_255_bytes_is_refused_by_every_insert() {
         use crate::test_support::{RwImage, assert_e2fsck_clean};
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
-        let vol = Ext4(&rw);
+        let vol = Ext4::new(&rw);
         let sys = vol.resolve_dir(b"/system").unwrap();
         for len in [256, 300] {
             let long = vec![b'a'; len];
@@ -548,7 +615,7 @@ mod tests {
     fn a_removal_gives_its_id_before_any_write_it_can_fail_after() {
         use crate::test_support::{Failing, RwImage};
         let rw = RwImage(std::cell::RefCell::new(fixture(4096, b"seed\n")));
-        let vol = Ext4(&rw);
+        let vol = Ext4::new(&rw);
         let sys = vol.resolve_dir(b"/system").unwrap();
         vol.mkdir_at(sys, b"gone", 0).unwrap();
         let gone = vol.resolve_dir(b"/system/gone").unwrap();
@@ -558,15 +625,15 @@ mod tests {
         assert_eq!(vol.rmdir_at(sys, b"full", 0, |id| given = Some(id)), Err(FsError::NotEmpty));
         assert_eq!(vol.rmdir_at(sys, b"current-generation", 0, |id| given = Some(id)), Err(FsError::Unsupported));
         let ro = crate::ReadOnly(&rw);
-        assert_eq!(Ext4(&ro).rmdir_at(sys, b"gone", 0, |id| given = Some(id)), Err(FsError::ReadOnly));
+        assert_eq!(Ext4::new(&ro).rmdir_at(sys, b"gone", 0, |id| given = Some(id)), Err(FsError::ReadOnly));
         assert_eq!(given, None, "a refusal gives no id");
 
         let image = rw.0.into_inner();
         for n in 0.. {
             let f = Failing::once(image.clone(), n);
             let mut given = None;
-            let r = Ext4(&f).rmdir_at(sys, b"gone", 0, |id| given = Some(id));
-            let after = Ext4(&f.image);
+            let r = Ext4::new(&f).rmdir_at(sys, b"gone", 0, |id| given = Some(id));
+            let after = Ext4::new(&f.image);
             match given {
                 Some(id) => assert_eq!(id, gone, "write {n} failing"),
                 None => {
@@ -590,7 +657,7 @@ mod tests {
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
 
-        match serve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::File { reply_len, content_len } => {
                 assert_eq!(content_len, 6);
                 assert_eq!(&content[..content_len], b"456789");
@@ -612,7 +679,7 @@ mod tests {
         let (req, req_len) = make_range_request(23, 4, 4096, b"system/current-generation");
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
-        match serve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::File { content_len, .. } => {
                 assert_eq!(content_len, 4);
                 assert_eq!(&content[..content_len], b"EFG\n");
@@ -630,7 +697,7 @@ mod tests {
         let (req, req_len) = make_range_request(24, 0, 4096, b"system/nope");
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
-        match serve(&Ext4(&r), &req[..req_len], &mut content, &mut reply) {
+        match serve(&Ext4::new(&r), &req[..req_len], &mut content, &mut reply) {
             Served::Error { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 assert_eq!(m.op, OP_FILE_READ_RANGE);
@@ -690,3 +757,6 @@ mod hostile_tests;
 
 #[cfg(test)]
 mod crash_tests;
+
+#[cfg(test)]
+mod unmount_tests;

@@ -619,8 +619,9 @@ exercises until they need it, when there is no administrator to ask. The first b
 image beside that copy, logged in on serial as the live image's own `alice`: `with admin disk`
 remounts the disk's root writable, and `account --password alice --users
 /storage/nitrox-root/system/users` sets a new password in **that disk's** file — `libusers` on the
-file, no view and no service — before an unmount leaves it clean. The host then carves the
-partition out: `e2fsck -fn` clean, and `/system/users` changed in `alice`'s line alone, under a
+file, no view and no service — before an unmount leaves it as it was found, marked not cleanly
+unmounted, since nothing checked it. The host then carves the partition out: `e2fsck -fn` clean,
+the superblock still marked not clean, and `/system/users` changed in `alice`'s line alone, under a
 fresh salt. The second boot is the disk alone: the old password is refused at the login and the
 new one taken. Neither boot may print either password.
 
@@ -632,9 +633,10 @@ disk the host can read afterwards. On serial, the disk's `nitrox-root` is auto-m
 and refuses a write — as `disk --eject` of it is refused, it not being removable — `with admin disk`
 remounts it writable, and `test-pattern` writes a pattern through a mapping and **exits without a
 sync**. The host reads the disk mid-run and finds the file without the pattern, so what it finds
-after `with admin disk --unmount`, the unmount put there. With the machine stopped, the host carves
-the partition out: `e2fsck -fn` clean, the superblock's `s_state` clean, and the file holding the
-pattern, read with `debugfs` rather than the library that wrote it. **Since Phase 6 Part D it plugs
+after `with admin disk --unmount`, the unmount put there; found not cleanly unmounted, the root is
+left so, and the table and the service's line say it. With the machine stopped, the host carves
+the partition out: `e2fsck -fn` clean, the superblock's `s_state` still not clean, and the file
+holding the pattern, read with `debugfs` rather than the library that wrote it. **Since Phase 6 Part D it plugs
 sticks in over QMP** after that: the boot stick passed over; an MBR stick with two ext4 partitions,
 each auto-mounted **writable** (Part F) and written without a sync, an eject of the first refused
 while `test-pattern --eject-held` holds a file on the second, both left mounted, then both ejected

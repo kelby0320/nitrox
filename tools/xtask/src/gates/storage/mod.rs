@@ -37,11 +37,12 @@ pub(crate) fn storage_pattern_byte(i: usize) -> u8 {
 /// - `with admin disk` mounts it writable, and `test-pattern` writes a pattern through a mapping
 ///   and **exits without a sync**. The host sees the file on the disk without the pattern;
 /// - `test-pattern --check` reads it back through `/storage`, and `with admin disk --unmount`
-///   runs the chain, after which the table says clean.
+///   runs the chain, after which the table still says no: found not clean, the filesystem is left
+///   so for a check, as the server's line says.
 ///
 /// Then the machine is stopped, and the host carves `nitrox-root` out of the disk: `e2fsck -fn`
-/// clean, the superblock marked clean, and the file holding the pattern — read with `debugfs`,
-/// not with the library that wrote it.
+/// clean, the superblock still marked not clean, and the file holding the pattern — read with
+/// `debugfs`, not with the library that wrote it.
 pub(crate) fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     preflight_accel(accel)?;
     require_tool("e2fsck")?;
@@ -125,7 +126,7 @@ pub(crate) fn cmd_check_storage(accel: Accel, size: DisplaySize) -> R<()> {
     check_formatted_stick(&work.join(BLANK_STICK_EXT4), &stick_blank, &work)?;
     println!(
         "\nxtask: a file written through a mapping and never synced reached the disk through an \
-         unmount, and the filesystem was left clean ✓"
+         unmount, and a filesystem found not clean was left so ✓"
     );
     Ok(())
 }
@@ -516,8 +517,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     // 6. **On the host, the file is on the disk and the pattern is not** — so what the last step
     //    finds, the unmount put there. Read while the guest runs: QEMU writes the image file as
     //    the guest writes the disk, and nothing on this filesystem is moving between steps. The
-    //    file's being there, at its size, is what makes the pattern's absence mean something, and
-    //    the superblock says it is mounted writable, so a clean one at the end is the unmount's.
+    //    file's being there, at its size, is what makes the pattern's absence mean something.
     let fs_img = storage_root_fs(disk, work)?;
     let path = format!("/{STORAGE_PATTERN_FILE}");
     match debugfs_cat(&fs_img, &path)? {
@@ -545,18 +545,7 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
         }
         Some(_) => {}
     }
-    let state = ext4_s_state(&fs_img)?;
-    if state & EXT4_VALID_FS != 0 {
-        return Err(format!(
-            "the superblock says clean (s_state {state:#06x}) while the filesystem is mounted \
-             writable, so a clean one at the end would not be the unmount's doing"
-        )
-        .into());
-    }
-    println!(
-        "  ok: on the host meanwhile: the file is there at {STORAGE_PATTERN_LEN} bytes without the \
-         pattern, and the superblock says mounted"
-    );
+    println!("  ok: on the host meanwhile: the file is there at {STORAGE_PATTERN_LEN} bytes without the pattern");
 
     // 7. Read back through `/storage` in the guest: from the kernel's cache, the one object.
     s.send(&format!("test-pattern --check {at}"))?;
@@ -564,15 +553,14 @@ fn run_storage_steps(s: &mut Session, disk: &Path, work: &Path) -> R<()> {
     s.expect("/home>")?;
     println!("  ok: test-pattern reads it back through /storage");
 
-    // 8. **The unmount**: written back, marked clean, the drive flushed.
+    // 8. **The unmount**: written back, the drive flushed, and the filesystem left as it was found.
     admin(s, &format!("disk --unmount {ROOT_PARTLABEL}"))?;
-    s.expect("fs-server: unmounted, and the filesystem recorded clean")?;
-    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, left clean"))?;
+    s.expect("fs-server: unmounted, and the filesystem left marked for a check")?;
+    s.expect(&format!("storage-service: unmounted {ROOT_PARTLABEL}, not left clean"))?;
     s.expect(&format!("disk: unmounted {ROOT_PARTLABEL}"))?;
     s.expect("/home>")?;
-    // And the table, which said no after the read-only unmount, now says yes.
-    clean_now(s, true)?;
-    println!("  ok: `with admin disk --unmount` ran the chain, and the table says clean");
+    clean_now(s, false)?;
+    println!("  ok: `with admin disk --unmount` ran the chain, and the table still says not clean, as it was found");
     Ok(())
 }
 

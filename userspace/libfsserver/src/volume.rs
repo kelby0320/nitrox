@@ -62,7 +62,8 @@ pub trait Volume {
     fn was_left_clean(&self) -> Result<bool, FsError>;
     /// Record the filesystem mounted, before `Ready`, so it never looks clean while it can change.
     fn mark_mounted(&self) -> Result<(), FsError>;
-    /// Record the filesystem cleanly unmounted, as an unmount's last write.
+    /// Record the unmount, as its last write: cleanly unmounted, unless the mount found the
+    /// filesystem not clean or something failed during it, when it is left marked for a check.
     fn mark_clean(&self) -> Result<(), FsError>;
     /// **Whether this mount now refuses every change**, as a read-only one does, since a change
     /// found the filesystem corrupt or could not be undone. The server says so once.

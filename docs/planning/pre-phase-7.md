@@ -18,7 +18,7 @@ J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6
 2026-11-16, #444 merged; Part F detailed 2026-11-16, and F.1 to F.5 built the same day; Part F done
 2026-11-17, #450 merged and its Miri run clean; Part G detailed 2026-11-17, G.1 to G.3 built the
 same day, G.4 to G.6 2026-11-18, and G.7 2026-11-19, and Miri at its end the same day; Part G done
-2026-11-19; Part H detailed 2026-11-19.** Each later part gets its detail pass when it is next. Ten
+2026-11-19; Part H detailed 2026-11-19, and H.1 built 2026-11-20.** Each later part gets its detail pass when it is next. Ten
 parts, A–J, in the order below: Part I between D and E, and **Part J between Part E's two halves**
 (the maintainer's call, 2026-11-02). Part E is the syscall-surface consolidation, planned separately
 in [`syscall-surface.md`](syscall-surface.md).

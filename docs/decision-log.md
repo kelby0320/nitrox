@@ -38865,3 +38865,28 @@ on `main` at `3c6919a4`.
   - **ext4 keeps a volume found unclean, or one whose change failed, unclean**, as FAT does.
   - **`$env` is judged by the record an assignment would leave**, not by its syntax.
   - **A reclaimed session's client is told to resolve again**, not handed `PeerClosed`.
+
+## 2026-11-20 — Before Phase 7: H.1, ext4's two defects and a volume recorded clean
+
+Part H's detail pass merged, #459. H.1 on `pre-phase-7/h1-ext4`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.1 plans it.
+
+- **A directory whose growth lost its size write grows again** (bug-bash fs-9). A growth cuts the
+  tree at the size first, a directory's as a file's, and counts `i_blocks` from the tree when that
+  freed anything: nothing on the disk says whether blocks past the size were counted. A refused
+  size write is undone, and a create whose inode write is refused frees the inode.
+- **No extent, free or allocation over the filesystem's own blocks** (fs-11). `ext4/zone.rs`
+  answers from the superblock and one flex group's descriptors, with no table, since the library
+  has no `alloc` and `nxinstall` mounts nothing. A writable mount of a layout it does not cover is
+  served read-only, as a feature this writer does not keep is.
+- **An unmount records clean only what its mount found clean and nothing failed on**, as FAT's
+  does and as Linux puts back the state it found. **Nothing** is any write the device refused,
+  seen where it is refused, since a change can answer `Ok` with one lost inside it, and any
+  operation answering `Io` or `Corrupt`, **reads included**, as Linux marks an error found on any
+  path: the maintainer's call on the review, FAT keeping its rule of a change alone. **The consequence, worth stating**: with no check
+  here (`TODO(fs-repair)`), an installed root a crash left not clean is reported so at every boot
+  until something checks it. `check-storage` and `check-recovery`, which mark their copy's root not
+  clean and unmount it writable, now expect it left so.
+- **A test fixture held a copy of its own image**, fixed on the way; four older tests that used
+  blocks no file can hold were moved onto layouts that have them.
+

@@ -18,7 +18,10 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
 
 ## Structure
 
-- **`src/ext4.rs` + `src/lib.rs` — the parser + write path.** Pure logic behind the
+- **`src/ext4.rs` and `src/ext4/` + `src/lib.rs` — the parser + write path.** `ext4.rs` reads and
+  names; `ext4/` holds the superblock (`superblock.rs`), `s_state` (`state.rs`), allocating and
+  freeing (`alloc.rs`), a file's growth (`grow.rs`), a directory's insert (`insert.rs`) and the
+  system zone (`zone.rs`). Pure logic behind the
   `BlockReader` (`read_at`) and `BlockWriter` (`write_at`) traits, so it is 100%
   host-tested against an `mke2fs` fixture — including `e2fsck` on the mutated image
   after `grow_file`. `no_std`, **no `alloc`**: buffer-based (`read_file` into a
@@ -51,7 +54,8 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   growing or creating first; a `RESOLVE_RENAME` handled **before** the directory-session path,
   which infers "directory open" from the suffix naming a directory), `File::Forget` before an
   unlinked or replaced file's `release_inode`, and the control channel's `Meta::Unmount`, which
-  `mark_clean`s, replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
+  records the unmount (`mark_unmounted`: clean only if the mount found it clean, no write was
+  lost and nothing failed or found it corrupt), replies and exits. See `userspace/libfsserver/CLAUDE.md`. The device is
   `libfsserver::disk::Disk`: a 4 KiB block per `sys_io_submit` into a one-page scratch
   `MemoryObject`, a write smaller than a block reading the block first (this said
   "sector-at-a-time" until 2026-10-06), and a grow's zeroes up to 64 KiB a submit
@@ -99,7 +103,9 @@ another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entrie
 files with data, a file at four extents, or a removal of a file Linux wrote at its name. A
 grow, create, `mkdir` or rename that fails for want of space or depth now gives back what it took.
 A rename that loses a write midway is undone, and a stop there leaves no name reaching what a
-removal frees (2026-10-23); a grow that loses one is not yet (`TODO(ext4-failed-write-undo)`).
+removal frees (2026-10-23); a grow that loses one is not yet (`TODO(ext4-failed-write-undo)`),
+though every growth, a directory's too, cuts what a lost one left past the size, and counts
+`i_blocks` again from the tree when that frees anything (pre-Phase-7 Part H.1).
 
 ## This crate's library has a second consumer
 
@@ -142,3 +148,6 @@ holds `BIND_NAMESPACE` — the supervisor (init, or the storage service) binds i
   which refuses one its length cannot hold. `garbage_in_any_structure_is_an_error_never_a_panic`
   (`volume/hostile_tests.rs`) holds the rule as a class, on real structures made wrong: a new
   reader of on-disk bytes belongs in what it exercises.
+- An extent, a tree node, a free or an allocation over the filesystem's own blocks: each asks
+  `ext4/zone.rs` first, and is `Corrupt` if it touches a superblock or descriptor copy, a bitmap or
+  an inode table. A new place that maps, frees or allocates blocks asks it too.

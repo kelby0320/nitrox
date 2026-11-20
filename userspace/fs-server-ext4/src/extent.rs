@@ -27,7 +27,7 @@
 //! No `alloc`: a walk holds one block per level on the stack, a cut two, at most [`MAX_DEPTH`]
 //! levels below the inode.
 
-use crate::ext4::{MAX_BLOCK, Superblock, alloc_block, free_block};
+use crate::ext4::{MAX_BLOCK, Superblock, alloc_block, free_block, zone};
 use crate::{BlockReader, BlockWriter, FsError, rd_u16, rd_u32};
 
 /// `eh_magic`.
@@ -158,9 +158,14 @@ fn first_of(node: &[u8], h: Header, i: usize) -> Result<u64, FsError> {
     Ok(if h.depth == 0 { read_extent(node, i)?.lblock } else { read_index(node, i).0 })
 }
 
-/// Whether `len` blocks from `phys` are all on the filesystem, past its first data block.
+/// Whether `len` blocks from `phys` are on the filesystem, past its first data block, a superblock.
 fn on_device(sb: &Superblock, phys: u64, len: u64) -> bool {
-    phys >= sb.first_data_block as u64 && phys != 0 && phys.saturating_add(len) <= sb.blocks_count
+    phys > sb.first_data_block as u64 && phys.saturating_add(len) <= sb.blocks_count
+}
+
+/// Whether `len` blocks from `phys` may be a file's: on the device, and clear of its metadata.
+fn usable<R: BlockReader>(r: &R, sb: &Superblock, phys: u64, len: u64) -> Result<bool, FsError> {
+    Ok(on_device(sb, phys, len) && zone::clear(r, sb, phys, len)?)
 }
 
 /// Check that `node`'s keys rise and lie in `keys`, the range its parent's entry gives it. So a
@@ -193,7 +198,7 @@ fn read_node<R: BlockReader>(
     keys: (u64, u64),
     buf: &mut [u8; MAX_BLOCK],
 ) -> Result<Header, FsError> {
-    if !on_device(sb, blk, 1) {
+    if !usable(r, sb, blk, 1)? {
         return Err(FsError::Corrupt);
     }
     let bs = sb.block_size as usize;
@@ -228,6 +233,8 @@ pub(crate) struct Lookup {
     leaf: [u8; MAX_BLOCK],
     /// The leaf in `leaf`, once one is read.
     span: Option<Span>,
+    /// The last extent found clear of metadata, so a walk through it asks once.
+    clear: Option<(u64, u64)>,
 }
 
 /// A leaf held by a [`Lookup`]: its bytes, entry capacity, and the logical blocks `lo..hi` it
@@ -260,7 +267,7 @@ impl Lookup {
     pub(crate) fn new(inode: &[u8; 256]) -> Self {
         let mut root = [0u8; 60];
         root.copy_from_slice(&inode[ROOT]);
-        Lookup { root, leaf: [0; MAX_BLOCK], span: None }
+        Lookup { root, leaf: [0; MAX_BLOCK], span: None, clear: None }
     }
 
     pub(crate) fn block<R: BlockReader>(&mut self, r: &R, sb: &Superblock, lb: u64) -> Result<u64, FsError> {
@@ -291,6 +298,12 @@ impl Lookup {
                 return Ok(Seg { phys: 0, len: x.lblock - lb });
             }
             if lb < x.end() {
+                if self.clear != Some((x.phys, x.len)) {
+                    if !zone::clear(r, sb, x.phys, x.len)? {
+                        return Err(FsError::Corrupt);
+                    }
+                    self.clear = Some((x.phys, x.len));
+                }
                 let len = x.end() - lb;
                 let phys = if x.unwritten { 0 } else { x.phys + (lb - x.lblock) };
                 return Ok(Seg { phys, len });
@@ -336,7 +349,7 @@ impl Lookup {
                 return Err(FsError::Corrupt); // index entries out of order
             }
             (lo, hi) = (first, next);
-            if !on_device(sb, child, 1) {
+            if !usable(r, sb, child, 1)? {
                 return Err(FsError::Corrupt);
             }
             let bs = sb.block_size as usize;
@@ -578,14 +591,14 @@ fn new_node<RW: BlockReader + BlockWriter>(
 /// written there with the new root before what it dropped is freed, as each tree block is, so no
 /// write lost after leaves it mapping a freed block. Its caller writes it again afterwards, with
 /// `i_blocks` and whatever else changed. `None` for an inode already freed, whose blocks an error
-/// here only leaks.
+/// here only leaks. Answers how many blocks it freed.
 pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
     inode: &mut [u8; 256],
     keep: u64,
     at: Option<u64>,
-) -> Result<(), FsError> {
+) -> Result<u64, FsError> {
     let mut root = [0u8; 60];
     root.copy_from_slice(&inode[ROOT]);
     let h = header(&root, ROOT_ENTRIES)?;
@@ -605,7 +618,45 @@ pub(crate) fn truncate<RW: BlockReader + BlockWriter>(
     // Whatever was freed before an error is gone from the tree too, so the inode takes both.
     inode[ROOT].copy_from_slice(&root);
     count(inode, sb, -(freed as i64));
-    done
+    done.map(|()| freed)
+}
+
+/// **Cut what lies past `keep` before a growth**, then count `i_blocks` from the tree if that freed
+/// anything: an `fallocate` that kept the size counted those blocks, a growth whose inode write was
+/// lost did not, and nothing on the disk says which.
+pub(crate) fn cut_past<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    inode: &mut [u8; 256],
+    keep: u64,
+    at: Option<u64>,
+) -> Result<(), FsError> {
+    if truncate(rw, sb, inode, keep, at)? == 0 {
+        return Ok(());
+    }
+    let xattr = rd_u32(inode, 104) != 0 || rd_u16(inode, 118) != 0;
+    let blocks = held(rw, sb, &inode[ROOT], ROOT_ENTRIES, END)? + xattr as u64;
+    let units = (blocks * (sb.block_size / 512) as u64).min(u32::MAX as u64) as u32;
+    inode[28..32].copy_from_slice(&units.to_le_bytes());
+    Ok(())
+}
+
+/// The blocks under `node`, its keys below `hi`, as `i_blocks` counts them: extents' and nodes'.
+fn held<R: BlockReader>(r: &R, sb: &Superblock, node: &[u8], cap: usize, hi: u64) -> Result<u64, FsError> {
+    let h = header(node, cap)?;
+    let mut buf = [0u8; MAX_BLOCK];
+    let mut blocks = 0;
+    for i in 0..h.entries {
+        if h.depth == 0 {
+            blocks += read_extent(node, i)?.len;
+        } else {
+            let keys = child_keys(node, h, i, hi);
+            read_node(r, sb, read_index(node, i).1, h.depth - 1, keys, &mut buf)?;
+            let bs = sb.block_size as usize;
+            blocks += 1 + held(r, sb, &buf[..bs], block_cap(sb), keys.1)?;
+        }
+    }
+    Ok(blocks)
 }
 
 /// Cut `node`, whose keys run below `hi`, at `keep`, returning whether it changed. A child left
@@ -636,7 +687,7 @@ fn cut<RW: BlockReader + BlockWriter>(
             if x.lblock < keep {
                 break;
             }
-            if !on_device(sb, x.phys, x.len) {
+            if !usable(rw, sb, x.phys, x.len)? {
                 return Err(FsError::Corrupt);
             }
         } else if read_index(node, n - 1).0 < keep {
@@ -653,7 +704,7 @@ fn cut<RW: BlockReader + BlockWriter>(
         let x = read_extent(node, n - 1)?;
         if x.end() > keep {
             let kept = keep - x.lblock;
-            if !on_device(sb, x.phys + kept, x.len - kept) {
+            if !usable(rw, sb, x.phys + kept, x.len - kept)? {
                 return Err(FsError::Corrupt);
             }
             write_extent(node, n - 1, Extent { len: kept, ..x });

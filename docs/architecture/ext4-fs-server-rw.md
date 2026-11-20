@@ -118,7 +118,10 @@ the name and left an unattached inode holding its blocks.
   rather than the block a file's next data would continue into.
 - **Growing** appends **a run at a time** — the blocks the allocator hands out contiguously, up
   to the 32,768 an extent can hold — so a tree changes once a run rather than once a block.
-  Blocks past `i_size` (an `fallocate` that kept the size leaves them) are cut first.
+  Blocks past `i_size` are cut first, a file's and a directory's alike: an `fallocate` that kept
+  the size leaves them, and so does a growth whose size write was lost after its leaf's. **A cut
+  that frees any counts `i_blocks` again from the tree** (`extent::cut_past`), since nothing on the
+  disk says whether they were counted: the `fallocate` counted them, the lost write did not.
 - **Cutting** (`extent::truncate`) frees every block from a logical block on, drops the extents
   that held them, shortens the one across it, frees each tree block left empty, and **folds**
   what is left back into the inode while it fits: an index over one child of four entries or fewer
@@ -145,7 +148,11 @@ block it had taken stayed in use, on a filesystem the grow did not fit all of it
 create whose directory cannot grow gives its inode back; a `mkdir` gives back its inode, its block
 and its group's count of directories, which is now **its own group's** — it was always group 0's;
 and a rename within a directory that cannot take the new name puts the old one back, where the
-file had been left with none.
+file had been left with none. **A directory's growth whose block or size write is refused is
+undone**, its size put back and the block cut off, and a create whose inode write is refused gives
+the inode back (pre-Phase-7 Part H.1). Until then a lost size write left the directory's leaf
+mapping a block past its size, and every later growth appended there again and was refused
+`Corrupt`: no create, `mkdir` or rename into it worked until an offline `e2fsck`.
 
 **What is freed is out of the tree on the disk first** (PR #371 review, 2026-10-13). A cut takes an
 extent out of its node — the node's header counting what is left — and writes the node, a tree block
@@ -186,6 +193,21 @@ worst. An unlink or a replacing rename that answered an error once its name was 
 orphan with it, since the server releases one only on `Ok`. `volume/crash_tests.rs` stops each at
 every write, refused once or from there on, and asks `e2fsck` what it left.
 
+**No file has a block of the filesystem's own** (pre-Phase-7 Part H.1, bug-bash fs-11). Each
+group's superblock and descriptor-table copies, its reserve for the table, its two bitmaps and its
+inode table are the *system zone*, as Linux names it (`ext4_sb_block_valid`), and `ext4/zone.rs`
+answers whether a run touches it: the copies from the superblock's own fields (`sparse_super`,
+`sparse_super2`, `s_reserved_gdt_blocks`), the tables from the descriptors of the run's flex
+group. There is no table of it, since the library has no `alloc` and `nxinstall` writes with no
+mount. It is asked where an extent is used — the extent a lookup lands in, every tree node read,
+and what a cut drops, before it writes — where a run is freed (`free_run`, which every free goes
+through), and where one is allocated (`alloc_run`, so a bitmap bit cleared over a table is refused,
+not handed out). Each answers `Corrupt`. Until then a crafted stick's extent over an inode table was
+handed to the kernel to write back into, and freed by an unlink or a cut for the next file to zero;
+a test zeroed the root inode. **The first data block itself**, the primary superblock on 1 KiB
+blocks, is no extent's to start at, as Linux refuses it. An extent over another file's blocks is
+not caught, as Linux does not catch it: only a check's whole scan can.
+
 The tree is held to **e2fsprogs** in the host tests: `debugfs`' reading of every map, and `e2fsck
 -fn` clean — 4,096 files of 16 KiB in one directory; two files grown in turn to two levels at both
 block sizes and cut back through each; a two-level tree `mke2fs -d` wrote, read, cut and removed;
@@ -213,20 +235,32 @@ replayed (`needs_recovery`), since a replay after a write here would undo it. A 
 `dir_nlink` and `extra_isize`, refuses a writable mount only: `metadata_csum` and `uninit_bg`
 checksums a write would leave stale, so `e2fsck` and Linux called the filesystem corrupt after the
 first, and `bigalloc` and quotas count what this writer does not. So does a filesystem lacking
-`filetype` or `extent`, which every write here makes. Until then each was mounted writable. The
-storage service mounts such a filesystem read-only, saying why (`check_writable`). The table is
-`ext4/features.rs`. **`dir_index`**, a compatible feature, asks one thing of a writer that keeps no
+`filetype` or `extent`, which every write here makes. Until then each was mounted writable. **So
+does a layout the system zone's check does not cover** (pre-Phase-7 Part H.1): a group whose
+bitmaps or inode table lie outside its flex group, or flex groups with more descriptors than a
+block, which a fallback of `mke2fs` or a `resize2fs` can leave; `mke2fs`'s own layouts and this
+crate's `mkfs` are inside it. The storage service mounts such a filesystem read-only, saying why
+(`check_writable`). The table is `ext4/features.rs`. **`dir_index`**, a compatible feature, asks one thing of a writer that keeps no
 hash tree: a directory Linux indexed is made linear before a name goes in, as an older writer makes
 one, since its blocks read linearly as they are. An insert wrote over the tree's root instead.
 
 **A filesystem knows how it was left.** A writable mount clears `s_state`'s clean bit
 (`mark_mounted`) before it answers `Ready`, so the filesystem never looks clean while it can
 change, and a mount that cannot write that is refused (`Unservable::StateUnwritable`). An
-unmount sets the bit again as its last write (`mark_clean`), on `Meta::Unmount` from its
-supervisor on the control channel. The server then replies and exits
+unmount, on `Meta::Unmount` from its supervisor on the control channel, sets the bit again as its
+last write (`mark_unmounted`) **only if the mount found the filesystem clean, no write was lost
+and no operation failed on the device or found it corrupt**; otherwise it leaves `s_state` as it
+was found, its error bit with it, or as the mount left it, not clean (pre-Phase-7 Part H.1). A lost
+write is seen where it is lost, since `Ext4` reaches its device only through a watcher that notes
+each refused write: a change can answer `Ok` or `TooLarge` with one lost inside it. **A read that
+finds corruption marks it too**, as Linux marks an error found on any path; FAT's mark comes from a
+change alone. Until then a crash's damage, or a failed change's, was recorded clean at the next
+unmount and hidden from `e2fsck -p`.
+A state with its error bit set counts as not clean (`was_left_clean`), as `e2fsck -p` counts it.
+The server then replies and exits
 ([`rsproto-wire-format.md`](../spec/rsproto-wire-format.md) § *Meta::Unmount*). A filesystem found
-not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway;
-a repair tool is `TODO(fs-repair)`. **`init`'s mounts are unmounted by a shutdown** (administration
+not clean is reported (`the filesystem was not cleanly unmounted last time`) and served anyway, and
+stays marked until something checks it; a repair tool is `TODO(fs-repair)`. **`init`'s mounts are unmounted by a shutdown** (administration
 Part E.4): a flush of the mount, then `Meta::Unmount`, last mounted first. A machine turned off
 without one is still reported on its next boot.
 

@@ -28,7 +28,7 @@ Namespace). The power node, which has neither right, still cannot be bound.
 
 So the process that stops the machine is the one the kernel started first. That is deliberate:
 `init` mounted the root, and a shutdown's last steps are its own — its mounts written back and
-marked clean, then the power write.
+their unmounts recorded, clean where each was found so, then the power write.
 
 It is a **handle, not a syscap**. A syscap is ambient: every process `init` spawns with it could
 stop the machine. The node is held, so exactly one process can.

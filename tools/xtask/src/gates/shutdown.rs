@@ -224,7 +224,8 @@ fn check_shutdown_sequence(transcript: &str) -> R<()> {
         "logging-service: asked to stop, exiting",
         "auth-service: asked to stop, exiting",
         "service-mgr: every service has been asked to stop; telling init to finish",
-        "init: / unmounted, and its server left the filesystem clean",
+        "init: / unmounted, and its server recorded how it was left",
+        "fs-server: unmounted, and the filesystem recorded clean",
         "power: stopping every processor, to halt",
     ] {
         if !transcript.contains(line) {
@@ -299,7 +300,22 @@ pub(crate) fn check_left_clean(fs_img: &Path) -> R<()> {
     check_ext4_clean(fs_img, &format!("the disk's {ROOT_PARTLABEL}"))
 }
 
-pub(crate) fn check_ext4_clean(fs_img: &Path, what: &str) -> R<()> {
+/// **A root found not clean, after its unmount**: `e2fsck -fn` finds nothing, and it is still not.
+pub(crate) fn check_left_as_found(fs_img: &Path) -> R<()> {
+    e2fsck_finds_nothing(fs_img, &format!("the disk's {ROOT_PARTLABEL}"))?;
+    let state = ext4_s_state(fs_img)?;
+    if state & EXT4_VALID_FS != 0 {
+        return Err(format!(
+            "the superblock's s_state is {state:#06x}: recorded clean, though the mount found it not \
+             cleanly unmounted and nothing checked it"
+        )
+        .into());
+    }
+    println!("  ok: the superblock still says not cleanly unmounted, as it was found (s_state {state:#06x})");
+    Ok(())
+}
+
+fn e2fsck_finds_nothing(fs_img: &Path, what: &str) -> R<()> {
     // `e2fsck -fn` exits 0 while reporting problems, so its output is what is read.
     let out = Command::new("e2fsck")
         .args(["-fn", &fs_img.display().to_string()])
@@ -310,6 +326,11 @@ pub(crate) fn check_ext4_clean(fs_img: &Path, what: &str) -> R<()> {
         return Err(format!("e2fsck is not happy with {what}:\n{text}").into());
     }
     println!("  ok: e2fsck -fn finds it clean");
+    Ok(())
+}
+
+pub(crate) fn check_ext4_clean(fs_img: &Path, what: &str) -> R<()> {
+    e2fsck_finds_nothing(fs_img, what)?;
     let state = ext4_s_state(fs_img)?;
     if state & EXT4_VALID_FS == 0 || state & EXT4_ERROR_FS != 0 {
         return Err(format!(
