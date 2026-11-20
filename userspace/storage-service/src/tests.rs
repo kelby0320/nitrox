@@ -938,3 +938,15 @@ fn each_note_is_the_log_lines_reason_and_null_where_nothing_is_kept_from_anyone(
     let at = Mounted { device: 4, at: String::from("/storage/INTERNAL"), by: By::Storage, mode: Mode::Rw };
     assert_eq!(note(&all[2], &all, Some(&at)), None, "mounted, by hand");
 }
+
+/// **An unmount is recorded only by its server's answer to it**, a reply with no error.
+#[test]
+fn an_unmount_is_recorded_only_by_the_answer_to_it() {
+    use crate::mounts::{UNMOUNT_ID, unmount_recorded};
+    use librsproto::{OP_READY, OP_UNMOUNT, RS_FLAG_ERROR as ERROR, RS_FLAG_REPLY as REPLY};
+    assert!(unmount_recorded(OP_UNMOUNT, REPLY, UNMOUNT_ID));
+    assert!(!unmount_recorded(OP_UNMOUNT, REPLY | ERROR, UNMOUNT_ID), "a failure");
+    assert!(!unmount_recorded(OP_UNMOUNT, REPLY, UNMOUNT_ID + 1), "another request's answer");
+    assert!(!unmount_recorded(OP_UNMOUNT, 0, UNMOUNT_ID), "a request, not a reply");
+    assert!(!unmount_recorded(OP_READY, REPLY, UNMOUNT_ID), "another op");
+}

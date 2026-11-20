@@ -353,6 +353,15 @@ pub mod mounts {
     /// storage.rs`): what makes a disk removable. A SATA disk never is, whatever its bay.
     pub const USB_STORAGE: &[u8] = b"usb-storage";
 
+    /// The id each `Meta::Unmount` this service sends carries, and its answer must.
+    pub const UNMOUNT_ID: u64 = 1;
+
+    /// Whether a mount's control channel brought the unmount recorded: a reply to [`UNMOUNT_ID`].
+    pub fn unmount_recorded(op: u16, flags: u32, request_id: u64) -> bool {
+        use librsproto::{OP_UNMOUNT, RS_FLAG_ERROR, RS_FLAG_REPLY};
+        op == OP_UNMOUNT && request_id == UNMOUNT_ID && flags & (RS_FLAG_REPLY | RS_FLAG_ERROR) == RS_FLAG_REPLY
+    }
+
     /// The server that serves a filesystem, spawned from the store's copy: the root is mounted by
     /// now.
     #[derive(Copy, Clone, Debug, PartialEq, Eq)]

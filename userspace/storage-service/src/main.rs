@@ -662,13 +662,13 @@ impl Service {
         }
         // 4. **The server records the unmount and exits**, clean unless found not clean or a change
         //    failed. The mount is gone whatever the answer: a server that cannot record it exits.
-        let told = server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok();
+        let told = server::send(&x.control, OP_UNMOUNT, mounts::UNMOUNT_ID, 0, &[], &mut Carried::new()).is_ok();
         let answer = if told && wait_until(&x.control, within(READY_TIMEOUT_NS)) {
             recv(&x.control).ok().flatten()
         } else {
             None
         };
-        let recorded = answer.is_some_and(|(a, _)| a.op == OP_UNMOUNT && a.flags & RS_FLAG_ERROR == 0);
+        let recorded = answer.is_some_and(|(a, _)| mounts::unmount_recorded(a.op, a.flags, a.request_id));
         drop((x.ns, x.control, x.process));
         if !recorded {
             return Err((
@@ -861,7 +861,7 @@ impl Service {
     fn tear_down(&mut self, i: usize) {
         let x = self.mounted.remove(i);
         let _ = sync_mount(&x.ns);
-        if server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok()
+        if server::send(&x.control, OP_UNMOUNT, mounts::UNMOUNT_ID, 0, &[], &mut Carried::new()).is_ok()
             && wait_until(&x.control, within(READY_TIMEOUT_NS))
         {
             let _ = recv(&x.control);
