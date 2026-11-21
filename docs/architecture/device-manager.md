@@ -46,7 +46,7 @@ are Tier 1. Matching a device to a driver module, and handing a driver process a
 | Piece | Where | What it does |
 |---|---|---|
 | The device table | `kernel/src/device.rs` | Every `DeviceNode`, with its kind, the index its path serves it at, its parent, and what its driver did |
-| `/dev/registry` | `kernel/src/object/kernel_server.rs` (`registry_server`) | Root namespace only. The bare path is a snapshot (a header with the record count, then a 144-byte record per node); `/<id>` is that node |
+| `/dev/registry` | `kernel/src/object/kernel_server.rs` (`registry_server`) | Root namespace only. The bare path is a snapshot (a header with the record count, then a 160-byte record per node); `/<id>` is that node |
 | The reader | `userspace/libkern/src/device.rs` | Reads a snapshot by its count, not its page-rounded size; `DeviceRecord::block_index` gives a block record's `/dev/blk` index |
 | `device-mgr` | `userspace/device-mgr/` | The library decides: names, classes, owners, tables, and what a suffix may ask for where it arrived. The binary is the event loop |
 | The `Devices` protocol | `userspace/librsproto/src/devices.rs` | `Arrived`, `Settled` and `Departed`, category `0x0Fxx` |

@@ -1921,7 +1921,7 @@ Found 21, refuted by a boot 0, reported 16.
   are skipped (main.rs:586). Unverified: time `cat /dev/storage/all.tsm` on a throttled QEMU
   usb-storage stick with no filesystem, and run `ls /storage` meanwhile. Lens: trust-boundary.
   Medium. **Later.**
-  Fixed in `fc18dc44`: `rescan::Rescan` has a table's resolve probe at most once in two seconds from the last probe's end, or when the mounts have changed, and a name that names no device probe nothing; fails without it: `a_probe_waits_out_the_interval_from_the_last_ones_end` and `a_change_of_mounts_probes_and_an_unknown_name_never_does`.
+  Fixed in `fc18dc44`: `rescan::Rescan` has a table's resolve probe, then wait two seconds from the probe's end, or four times its length if more, unless the mounts have changed, and a name that names no device probe nothing; fails without it: `a_probe_waits_out_the_interval_from_the_last_ones_end`, `a_slow_probe_waits_four_times_its_length` and `a_change_of_mounts_probes_and_an_unknown_name_never_does`.
 
 - [ ] **sup-6** `userspace/storage-service/src/main.rs:704` — media sessions
   (`MAX_MEDIA_SESSIONS` = 2) and directory sessions (`MAX_DIRS` = 9) are one pool shared by every

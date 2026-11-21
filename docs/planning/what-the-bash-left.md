@@ -516,11 +516,14 @@ services.
   `boot-probe`'s storage test, which checks `nitrox-root` is `init`'s at `/`, fails without it. The
   GUID is the record's last field, at offset 144: 160 bytes, `REGISTRY_VERSION` 3.
 - **sup-5's probe runs when the mounts have changed, too**, whatever the time: a device just
-  unmounted was last read before its mount. The interval is two seconds. An administrator's
-  `Mount` and `Reread` read their devices as before.
+  unmounted was last read before its mount. The interval is two seconds, or four times the last
+  probe's length if more, so probes hold a fifth of the thread at most. An administrator's `Mount`
+  and `Reread` read their devices as before.
 - **sec-10's bind is `spawning::grant`**, not a module of its own beside `clock.rs`: `lib.rs` is
   at its size entry. `test-interactive`'s step 20b holds it, a `with admin whoami` inside
-  `with admin nxsh`, which fails without it as the bug bash's boot did.
+  `with admin nxsh`, which fails without it as the bug bash's boot did. Its review added the
+  kernel's log, a fresh snapshot in place of an outer view's, and the `disks` grant, which takes
+  out what the copy held first.
 - **No code moved out of storage-service's `main.rs`**: each fix fitted, the resolve's file arm
   going to `Service::table_file` in `disks.rs`, and `main.rs` fell from 1,160 lines to 1,149. The
   unmount's answer is `mounts::unmount_recorded`, in the library.

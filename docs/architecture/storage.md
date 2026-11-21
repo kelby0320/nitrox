@@ -67,7 +67,7 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 | The manifest reader | `userspace/libinittoml/` | `init.toml`'s schema and parser, shared with `init` so the two cannot read it differently |
 | The ext4 checks | `userspace/fs-server-ext4/src/ext4.rs` | `check_device`, `volume_label` and `was_left_clean`: what the server itself runs, so the service never offers a filesystem the server would refuse |
 | The FAT checks | `userspace/fs-server-fat/src/volume.rs` | `Fat::check`, the label and `was_left_clean`, for the same reason; the check's refusal is the reason a FAT is not served (Phase 6 Part E.5) |
-| The partition-table reader | `userspace/libgpt/` | Each disk's entries, for `init.toml`'s UUID sources |
+| The GPT names | `userspace/libgpt/` | `INSTALL_SOURCE_LABEL`, the name the build gives the installer's source, which the service never mounts. It reads no table: a `gpt-partuuid:` source is matched on the registry's record (§ 5) |
 | The `Storage` codec | `userspace/librsproto/src/storage.rs` | `Mount`, `Unmount` and `InUse` bodies ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)) |
 | The busy check | `kernel/src/syscall/table/flush.rs` (`held`) | How many of a mount's files something still holds, after the finished IRPs have let go |
 
@@ -423,12 +423,14 @@ The watch is pinged for a change in the devices as well as the mounts for this.
 block device in registry order, then one `<name>.tsm` per device. **A name is `/dev/devices`' own**,
 `blk-<n>` for `/dev/blk/<n>`, so a row in either table names the same device.
 
-**A resolve of a table reads the devices nothing has mounted again first, at most once in two
-seconds** (`storage_service::rescan`): a read waits on its device and cannot be cut short, so a
-client asking again and again held the service's one thread, and every `/storage` resolve with it,
-in probe after probe of a slow device. Between probes a table says what the last one found, unless
-what is mounted has changed since, as a device just unmounted was last read before its mount. A
-name that names no device reads none, and `Reread` reads its device whatever the time.
+**A resolve of a table reads the devices nothing has mounted again first, then waits two seconds
+from that probe's end, and four times as long as it took if more** (`storage_service::rescan`): a
+read waits on its device and cannot be cut short, so a client asking again and again held the
+service's one thread, and every `/storage` resolve with it, in probe after probe of a slow device.
+Now probes hold the thread a fifth of the time at most. Between probes a table says what the last
+one found, unless what is mounted has changed since, as a device just unmounted was last read
+before its mount. A name that names no device reads none, a clock that cannot be read probes and
+records nothing, and `Reread` reads its device whatever the time.
 
 | Column | Type | Holds |
 |---|---|---|

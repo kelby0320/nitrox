@@ -38928,10 +38928,14 @@ H.2 merged, #461. H.3 on `pre-phase-7/h3-storage-broker`, as
   own, so a root the kernel published, however its table reads to `libgpt`, is `init`'s. The record
   is not an input to the ABI version hash. **The test image's root is named by its GUID**, so every
   test-image boot holds the match.
-- **A resolve of the storage table probes the unmounted devices at most once in two seconds**
-  (sup-5), or when the mounts have changed: a probe waits on its device and cannot be cut short.
+- **A resolve of the storage table probes the unmounted devices, then waits two seconds from the
+  probe's end, or four times its length if more** (sup-5), unless the mounts have changed: a probe
+  waits on its device and cannot be cut short, so probes hold the thread a fifth of the time at
+  most (the #462 review).
 - **A grant in a view made from a view binds the broker's endpoint** (sec-10) in place of the
-  caller's binding; the kernel's log and the clock keep the caller's, as before.
+  caller's binding. **So is the kernel's log**, a fresh snapshot in place of an outer view's (the
+  maintainer's call, 2026-11-20, on the #462 review); the clock keeps the caller's, the same node.
+  The `disks` grant takes out what the copy held first, so a disk in use now is not bound.
 - **The storage service's unmount answer is held to its request**, the #461 review's finding 6,
   as `init`'s is. **No code moved out of its `main.rs`**, which the H.2 entry above expected: each
   fix fitted, and the file fell from 1,160 lines to 1,149.
