@@ -897,12 +897,10 @@ impl Broker {
                     let direct = Rights::TRANSFER | Rights::DUPLICATE;
                     let snapshot: Option<Handle<Memory, MapRead>> =
                         lookup(&self.root_ns, KERNEL_LOG, Rights::MAP_READ | Rights::INSPECT | direct);
-                    let bind = snapshot.as_ref().map(|s| view_ns.bind(KERNEL_LOG, s));
-                    // A caller that already binds `/dev/log` keeps its own.
-                    kernel_log_ours = matches!(bind, Some(Ok(())));
-                    let kept = matches!(&bind, Some(Err(e)) if e.code() == KError::AlreadyExists);
-                    drop(snapshot); // The bind took its own reference.
-                    if !kernel_log_ours && !kept {
+                    // In place of an outer view's, taken when that one was made.
+                    kernel_log_ours =
+                        snapshot.is_some_and(|s| grant(&view_ns, KERNEL_LOG, || view_ns.bind(KERNEL_LOG, &s)));
+                    if !kernel_log_ours {
                         return Err("the kernel's log is not there to grant");
                     }
                 }

@@ -182,6 +182,7 @@ fn a_label_source_is_the_first_partition_with_that_name() {
     let mut records = release_records();
     records.insert(0, rec(2, DeviceKind::Disk, 9, NO_PARENT, "nitrox-root", 1)); // a disk, not a partition
     records.push(rec(9, DeviceKind::Partition, 5, 3, "nitrox-root", 1)); // published later
+    records.push(rec(10, DeviceKind::Partition, 6, 3, "", 1));
     assert_eq!(source_device("gpt-partlabel:nitrox-root", &records), Some(7));
     assert_eq!(source_device("gpt-partlabel:ESP", &records), Some(6));
     assert_eq!(source_device("gpt-partlabel:nothing", &records), None);

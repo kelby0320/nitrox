@@ -469,6 +469,11 @@ pub(crate) fn interactive_services_and_relogin(s: &mut Session) -> R<usize> {
     s.send("date --set 2031-01-03T00:00:00Z --unix")?;
     s.expect("wall clock: set to 1925164800 (Unix epoch seconds, UTC); the RTC holds it")?;
     s.expect("/home>")?;
+    //          **And a view made in it reads the kernel's log as it is made**: past that set, not
+    //          the shell's own view's snapshot, taken before it.
+    with_admin_asked(s, "log --kernel | last 1")?;
+    s.expect("wall clock: set to 1925164800")?;
+    s.expect("/home>")?;
     s.send("exit")?;
     s.expect("/home>")?;
     steps += 1;

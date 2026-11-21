@@ -498,6 +498,27 @@ pub(crate) enum RootDevice {
     /// The `nitrox-live` partition inside `root.img`, a Limine module the kernel publishes as a RAM
     /// disk.
     Live,
+    /// The disk the live stick installs: `nxinstall` makes its root's GUID, so it is named by its
+    /// label in every build.
+    Installed,
+}
+
+/// The `init.toml` an initramfs for `mode` and `root` carries: its root named as that disk answers.
+fn init_toml_for(mode: BuildMode, root: RootDevice) -> R<String> {
+    let disk = format!("device = \"gpt-partlabel:{ROOT_PARTLABEL}\"");
+    if INIT_TOML.matches(&disk).count() != 1 {
+        return Err(format!("INIT_TOML no longer names its root as {disk:?} exactly once").into());
+    }
+    let named = match root {
+        RootDevice::Live => format!("gpt-partlabel:{LIVE_ROOT_PARTLABEL}"),
+        RootDevice::Disk if mode.stages_test_data() => format!("gpt-partuuid:{TEST_ROOT_PARTUUID}"),
+        RootDevice::Disk | RootDevice::Installed => format!("gpt-partlabel:{ROOT_PARTLABEL}"),
+    };
+    let init_toml = INIT_TOML.replace(&disk, &format!("device = \"{named}\""));
+    Ok(match mode.stages_test_data() {
+        true => format!("{}{init_toml}{TEST_BINDS_TOML}", test_preamble()),
+        false => init_toml,
+    })
 }
 
 /// A **test** manifest opens with comments past a page, so a one-page reader finds no mount.
@@ -510,20 +531,7 @@ fn test_preamble() -> String {
 /// with a single manifest line changed — `check-images` holds it to exactly that.
 pub(crate) fn build_initramfs_for(out: &Path, mode: BuildMode, root: RootDevice) -> R<()> {
     let mut buf = Vec::new();
-    let mut init_toml = String::from(INIT_TOML);
-    let disk = format!("device = \"gpt-partlabel:{ROOT_PARTLABEL}\"");
-    if init_toml.matches(&disk).count() != 1 {
-        return Err(format!("INIT_TOML no longer names its root as {disk:?} exactly once").into());
-    }
-    if root == RootDevice::Live {
-        init_toml = init_toml.replace(&disk, &format!("device = \"gpt-partlabel:{LIVE_ROOT_PARTLABEL}\""));
-    } else if mode.stages_test_data() {
-        init_toml = init_toml.replace(&disk, &format!("device = \"gpt-partuuid:{TEST_ROOT_PARTUUID}\""));
-    }
-    if mode.stages_test_data() {
-        init_toml = format!("{}{init_toml}{TEST_BINDS_TOML}", test_preamble());
-    }
-    cpio_entry(&mut buf, 1, "etc/init.toml", init_toml.as_bytes());
+    cpio_entry(&mut buf, 1, "etc/init.toml", init_toml_for(mode, root)?.as_bytes());
     // The declarations and the profile manifest are on the root, as this archive on the FAT ESP is
     // never written. Every program ELF is packed at `sbin/<name>`. **The list is the same in every
     // build mode**, so the boot path under test is the one that ships.
@@ -756,4 +764,27 @@ pub(crate) fn test_limine_conf(base: &str) -> R<String> {
         return Err("boot/limine.conf no longer has one entry with its initramfs line once".into());
     }
     Ok(base.replacen(initramfs_line, &format!("{initramfs_line}    module_path: boot():{SCRATCH_ESP_PATH}\n"), 1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **Each root is named as its disk answers**: a test disk by the GUID its table is built with,
+    /// and the disk the live stick installs, whose GUID is `nxinstall`'s, by its label always.
+    #[test]
+    fn each_root_is_named_as_its_disk_answers() {
+        let named = |mode, root| {
+            let toml = init_toml_for(mode, root).unwrap();
+            toml.lines().filter(|l| l.contains("gpt-part")).map(String::from).collect::<Vec<_>>()
+        };
+        let label = |l: &str| vec![format!("device = \"gpt-partlabel:{l}\"")];
+        let uuid = vec![format!("device = \"gpt-partuuid:{TEST_ROOT_PARTUUID}\"")];
+        for mode in [BuildMode::Normal, BuildMode::Selftest, BuildMode::TestHarness] {
+            let test = mode.stages_test_data();
+            assert_eq!(named(mode, RootDevice::Disk), if test { uuid.clone() } else { label(ROOT_PARTLABEL) });
+            assert_eq!(named(mode, RootDevice::Installed), label(ROOT_PARTLABEL), "what the stick installs");
+            assert_eq!(named(mode, RootDevice::Live), label(LIVE_ROOT_PARTLABEL));
+        }
+    }
 }

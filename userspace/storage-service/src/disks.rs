@@ -78,12 +78,11 @@ pub(super) fn take_block(root: &Root) -> Result<(Chan, Vec<(DeviceRecord, Node)>
 impl Service {
     /// **Table file `name`**, the unmounted devices probed again first if due; `None` if no device.
     pub(super) fn table_file(&mut self, name: &str) -> Option<Vec<u8>> {
-        let now = || libos::time::now().unwrap_or(u64::MAX);
-        let mounted: Vec<u32> = self.all_mounts().iter().map(|m| m.device).collect();
-        if self.rescan.due(&self.devices, name, now(), &mounted) {
-            self.refresh_unmounted();
-            self.rescan.probed(now(), mounted);
-        }
+        let mounted = self.all_mounts().iter().map(|m| m.device).collect();
+        let mut rescan = core::mem::take(&mut self.rescan);
+        let named = storage_service::rescan::names(&self.devices, name);
+        rescan.run(named, mounted, || libos::time::now().ok(), || self.refresh_unmounted());
+        self.rescan = rescan;
         let mounts = self.all_mounts();
         match name {
             "all" => Some(table::all(&self.devices, &mounts)),

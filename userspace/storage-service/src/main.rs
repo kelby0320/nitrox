@@ -219,7 +219,7 @@ type Refused = (KError, &'static [u8]);
 impl Service {
     /// **Read device `id` again.** The boot's probe goes stale as soon as anything writes the
     /// device, a mount of this service's or a raw writer through the `disks` grant, so what reads
-    /// a device's `found` (a table, an administrator's mount) refreshes it first. **This is the
+    /// a device's `found` (a mount; a table, as [`Rescan`] paces) refreshes it first. **This is the
     /// one place `found` changes after the boot**: the unmount reads the device for its own line
     /// with [`read_found`](Self::read_found), which stores nothing.
     fn refresh(&mut self, id: u32) {

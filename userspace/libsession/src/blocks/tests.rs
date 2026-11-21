@@ -102,6 +102,17 @@ fn a_withheld_device_is_not_handed_on() {
     assert!(entries(all_withheld.as_ref()).is_empty());
 }
 
+/// **A view made from a view holds what is shared as it is made**: a device its caller's copy bound
+/// and now withheld is taken out of it, and one still shared is bound again.
+#[test]
+fn a_copy_that_held_a_device_withheld_now_loses_it() {
+    mock::reset();
+    let (from, to) = (source(), Ns::create().unwrap());
+    assert_eq!(share_block_devices(lookup_only(&from), &to, &[]), 2, "the outer view's");
+    assert_eq!(share_block_devices(lookup_only(&from), &to, &[10]), 1, "the inner view's, blk-0 in use");
+    assert_eq!(paths(&entries(to.as_ref())), ["/dev/blk/1"]);
+}
+
 /// A source with no registry, or one that is no snapshot, hands nothing on.
 #[test]
 fn a_source_with_no_registry_hands_nothing_on() {
