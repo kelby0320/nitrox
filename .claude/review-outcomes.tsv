@@ -961,3 +961,14 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-20	461	d406f5e2	8	tests	optional	unverified	fixed	afd8f700	the session lists' walk moved into routes::serve_each with a host test; stepping past a removal, or ignoring pick, fails it
 2026-11-20	461	d406f5e2	9	rules-and-docs	optional	demonstrated	fixed	afd8f700	swept with -W missing_docs (Found.essential, running too); the lib denies missing_docs, and a removed field doc fails to compile
 2026-11-20	461	d406f5e2	10	architecture	optional	demonstrated	fixed	afd8f700	maintainer's call: fix here; libsession::open_views_session_from resolves the broker channel again when none or gone; four controls fail its test
+2026-11-20	462	d0670d10	1	logic+rules-and-docs+architecture	worth-fixing	demonstrated	fixed	28cb0ff5	device-manager.md and deferred-decisions.md say 160 bytes; the decision log and planning docs left as records
+2026-11-20	462	d0670d10	2	logic+rules-and-docs	worth-fixing	demonstrated	fixed	28cb0ff5	storage.md's libgpt row names INSTALL_SOURCE_LABEL alone and says no table is read
+2026-11-20	462	d0670d10	3	logic+architecture	worth-fixing	demonstrated	fixed	5b327e75	share_block_devices withdraws first; a_copy_that_held_a_device_withheld_now_loses_it fails without it
+2026-11-20	462	d0670d10	4	logic+error-paths	worth-fixing	unverified	fixed	5b327e75	reproduced by building the selftest stick: its installer named the test GUID; RootDevice::Installed; each_root_is_named_as_its_disk_answers fails treating it as Disk
+2026-11-20	462	d0670d10	5	tests	worth-fixing	demonstrated	fixed	5b327e75	an empty-named partition in the label test; the guard removed fails it
+2026-11-20	462	d0670d10	6	tests	worth-fixing	demonstrated	refuted		the host gap is real but test-interactive 20b fails on each call site reverted: storage grant, then policy grant
+2026-11-20	462	d0670d10	7	logic	optional	unverified	fixed	5b327e75	reproduced: a 3 s probe due 2 s after; the wait is 4x the probe if more; a_slow_probe_waits_four_times_its_length fails without the term
+2026-11-20	462	d0670d10	8	error-paths	optional	demonstrated	fixed	5b327e75	clock as Option: probes and records nothing; recording u64::MAX fails a_clock_that_cannot_be_read_probes_and_records_nothing
+2026-11-20	462	d0670d10	9	error-paths	optional	demonstrated	fixed	5b327e75	refresh()'s doc says a table as Rescan paces
+2026-11-20	462	d0670d10	10	tests	optional	unverified	fixed	5b327e75	Rescan::run holds the decision, the probe and its record over a fake clock; the probe closure in the binary is the one call left untested
+2026-11-20	462	d0670d10	11	architecture	optional	unverified	fixed	5b327e75	maintainer's call: a fresh snapshot through spawning::grant; test-interactive 20g(d) times out with the old arm
