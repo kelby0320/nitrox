@@ -11,13 +11,15 @@ use libos::{CanLookup, MapRead, Memory, Namespace, NsMutable, ReadWrite, Ref, Re
 /// `disks` grant, the only way a disk reaches a program; it withholds what is in use, since a raw
 /// write would land underneath a live server. `sys_ns_bind` cannot re-bind the kernel-server
 /// `/dev/blk`, so each device is bound singly. **Only a source with a registry hands anything
-/// on**; the broker's is the root namespace.
+/// on**; the broker's is the root namespace. **What `to` held before is taken out first**: a view
+/// made in a view copies its caller's, which may name a device in use now.
 pub fn share_block_devices<'a, 'b, M: CanLookup + 'a>(
     from: impl Into<Ref<'a, Namespace, M>>,
     to: impl Into<Ref<'b, Namespace, NsMutable>>,
     withheld: &[u32],
 ) -> usize {
     let (from, to) = (from.into(), to.into());
+    withdraw_block_devices(to);
     let mut bound = 0;
     for n in block_indices(from, withheld) {
         let path = blk_path(n, false);

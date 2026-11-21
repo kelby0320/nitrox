@@ -123,7 +123,7 @@ fn assemble_live_image(bootx64: &Path, kernel: &Path, initramfs: &Path, out: &Pa
     // in the same mode as the rest, so the kernel beside it and its initramfs agree.
     let install_esp = work.join("install-esp.img");
     let install_initramfs = work.join("initramfs");
-    build_initramfs_for(&install_initramfs, mode, RootDevice::Disk)?;
+    build_initramfs_for(&install_initramfs, mode, RootDevice::Installed)?;
     let esp_payload = [bootx64, kernel, install_initramfs.as_path()]
         .iter()
         .map(|p| fs::metadata(p).map(|m| m.len()))

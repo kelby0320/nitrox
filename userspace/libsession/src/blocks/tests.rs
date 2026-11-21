@@ -18,7 +18,7 @@ const DEVICE: Rights = Rights::from_bits(
 );
 
 fn record(id: u32, kind: DeviceKind, served: u32, flags: u8) -> DeviceRecord {
-    let mut r = DeviceRecord::read(&[0u8; 144]).unwrap();
+    let mut r = DeviceRecord::read(&[0u8; size_of::<DeviceRecord>()]).unwrap();
     (r.id, r.kind, r.served, r.flags) = (id, kind.as_u32(), served, flags);
     r
 }
@@ -28,7 +28,7 @@ fn snapshot(records: &[DeviceRecord]) -> Vec<u8> {
     out[0..4].copy_from_slice(&REGISTRY_MAGIC.to_le_bytes());
     out[4..8].copy_from_slice(&REGISTRY_VERSION.to_le_bytes());
     out[8..12].copy_from_slice(&(records.len() as u32).to_le_bytes());
-    out[12..16].copy_from_slice(&144u32.to_le_bytes());
+    out[12..16].copy_from_slice(&(size_of::<DeviceRecord>() as u32).to_le_bytes());
     for r in records {
         out.extend_from_slice(r.as_bytes());
     }
@@ -100,6 +100,17 @@ fn a_withheld_device_is_not_handed_on() {
     let all_withheld = Ns::create().unwrap();
     assert_eq!(share_block_devices(lookup_only(&from), &all_withheld, &[10, 11]), 0);
     assert!(entries(all_withheld.as_ref()).is_empty());
+}
+
+/// **A view made from a view holds what is shared as it is made**: a device its caller's copy bound
+/// and now withheld is taken out of it, and one still shared is bound again.
+#[test]
+fn a_copy_that_held_a_device_withheld_now_loses_it() {
+    mock::reset();
+    let (from, to) = (source(), Ns::create().unwrap());
+    assert_eq!(share_block_devices(lookup_only(&from), &to, &[]), 2, "the outer view's");
+    assert_eq!(share_block_devices(lookup_only(&from), &to, &[10]), 1, "the inner view's, blk-0 in use");
+    assert_eq!(paths(&entries(to.as_ref())), ["/dev/blk/1"]);
 }
 
 /// A source with no registry, or one that is no snapshot, hands nothing on.

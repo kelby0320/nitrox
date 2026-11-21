@@ -75,16 +75,20 @@ pub(super) fn take_block(root: &Root) -> Result<(Chan, Vec<(DeviceRecord, Node)>
     }
 }
 
-pub(super) fn read_table(io: &DeviceIo, disk: u32) -> Option<DiskTable> {
-    let mut front = alloc::vec![0u8; libgpt::table::FRONT_BYTES];
-    io.read_at(0, &mut front).ok()?;
-    let t = libgpt::table::read(&front).ok()?;
-    let entries = t
-        .partitions()
-        .iter()
-        .map(|p| TableEntry { guid: p.unique_guid, name: p.name().to_vec(), blocks: p.blocks() })
-        .collect();
-    Some(DiskTable { disk, entries })
+impl Service {
+    /// **Table file `name`**, the unmounted devices probed again first if due; `None` if no device.
+    pub(super) fn table_file(&mut self, name: &str) -> Option<Vec<u8>> {
+        let mounted = self.all_mounts().iter().map(|m| m.device).collect();
+        let mut rescan = core::mem::take(&mut self.rescan);
+        let named = storage_service::rescan::names(&self.devices, name);
+        rescan.run(named, mounted, || libos::time::now().ok(), || self.refresh_unmounted());
+        self.rescan = rescan;
+        let mounts = self.all_mounts();
+        match name {
+            "all" => Some(table::all(&self.devices, &mounts)),
+            _ => table::one(&self.devices, &mounts, name),
+        }
+    }
 }
 
 /// `init`'s manifest, or why it could not be read: each way it can fail says so.

@@ -51,7 +51,7 @@ use view_broker::pacing::{Held, MAX_FAILURES};
 use view_broker::policy::{self, Auth, Decision, Grant};
 use view_broker::sessions::Sessions;
 use view_broker::slots::Load;
-use view_broker::spawning::{StartError, Started, spawn_program};
+use view_broker::spawning::{StartError, Started, grant, spawn_program};
 use view_broker::suffix::{self, Suffix};
 use wire::{Ch, Root, lookup, now_ns, recv, recv_full, reply_error, reply_outcome, send, wait_until};
 
@@ -258,7 +258,7 @@ fn bind_endpoint_at(
     view_ns: &Handle<Namespace, NsMutable>,
     at: &str,
 ) -> bool {
-    endpoint(root, slot, from).is_some_and(|e| view_ns.bind(at, e).is_ok())
+    endpoint(root, slot, from).is_some_and(|e| grant(view_ns, at, || view_ns.bind(at, e)))
 }
 
 impl Broker {
@@ -822,7 +822,7 @@ impl Broker {
     /// Bind this broker's forwarding endpoint at `at` in `view_ns`, with `base` naming the session
     /// it serves. `false` if it would not bind, or there is none.
     fn bind_forwarding(&self, view_ns: &Handle<Namespace, NsMutable>, at: &str, base: &str) -> bool {
-        self.forwarding.as_ref().is_some_and(|f| view_ns.bind_server(at, f.as_ref(), base).is_ok())
+        self.forwarding.as_ref().is_some_and(|f| grant(view_ns, at, || view_ns.bind_server(at, f.as_ref(), base)))
     }
 
     fn start(&mut self, i: usize, op: u16, request_id: u64, mut p: Pending, principal: &str) {
@@ -897,12 +897,10 @@ impl Broker {
                     let direct = Rights::TRANSFER | Rights::DUPLICATE;
                     let snapshot: Option<Handle<Memory, MapRead>> =
                         lookup(&self.root_ns, KERNEL_LOG, Rights::MAP_READ | Rights::INSPECT | direct);
-                    let bind = snapshot.as_ref().map(|s| view_ns.bind(KERNEL_LOG, s));
-                    // A caller that already binds `/dev/log` keeps its own.
-                    kernel_log_ours = matches!(bind, Some(Ok(())));
-                    let kept = matches!(&bind, Some(Err(e)) if e.code() == KError::AlreadyExists);
-                    drop(snapshot); // The bind took its own reference.
-                    if !kernel_log_ours && !kept {
+                    // In place of an outer view's, taken when that one was made.
+                    kernel_log_ours =
+                        snapshot.is_some_and(|s| grant(&view_ns, KERNEL_LOG, || view_ns.bind(KERNEL_LOG, &s)));
+                    if !kernel_log_ours {
                         return Err("the kernel's log is not there to grant");
                     }
                 }

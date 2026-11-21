@@ -1,7 +1,7 @@
 //! What a program in a view is started with, apart from the message that follows it.
 
 use alloc::string::String;
-use libkern::{Rights, SysCaps};
+use libkern::{KError, Rights, SysCaps};
 use libos::{CanLookup, Channel, Handle, Namespace, NsMutable, Only, Process, Spawn, block_on};
 
 /// A program started in a view, and this process's end of each channel it was handed.
@@ -68,11 +68,20 @@ pub fn spawn_program<'a, M: CanLookup + 'a>(
     Ok(Started { process, setup: setup_ours, life: life_ours })
 }
 
+/// **Bind a grant at `at` in `view_ns` with `bind`, in place of what the caller had there**, as a
+/// view made in a view holds its grants already: whether it bound.
+pub fn grant(view_ns: &Handle<Namespace, NsMutable>, at: &str, bind: impl Fn() -> libos::Result<()>) -> bool {
+    match bind() {
+        Err(e) if e.code() == KError::AlreadyExists => view_ns.unbind(at).is_ok() && bind().is_ok(),
+        bound => bound.is_ok(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libkern::{KError, RawHandle};
-    use libos::{Carried, MapReadWrite, Memory, Msg, mock};
+    use libkern::RawHandle;
+    use libos::{Carried, MapRead, MapReadWrite, Memory, Msg, mock};
 
     fn root() -> Handle<Namespace, NsMutable> {
         mock::reset();
@@ -114,6 +123,31 @@ mod tests {
         assert!(setup.recv(&mut Msg::new()).is_ok(), "the setup end reads what is sent");
         let refused = life.recv(&mut Msg::new()).err().unwrap().code();
         assert_eq!(refused, KError::NoAccess, "the life end can do nothing");
+    }
+
+    /// **A grant in a view made from a view is the broker's**: the caller's namespace has the path
+    /// bound by the view it is in, and the grant was refused as not there.
+    #[test]
+    fn a_grant_in_a_view_made_from_a_view_is_the_brokers() {
+        let _root = root();
+        let object = || Handle::<Memory, MapReadWrite>::create(4096).unwrap();
+        let (ours, theirs) = (object(), object());
+        let resolves_to_ours = |view: &Handle<Namespace, NsMutable>| {
+            let got: Handle<Memory, MapRead> = block_on(view.lookup("/svc/x", Rights::MAP_READ)).unwrap();
+            mock::same_object(got.raw().0, ours.raw().0)
+        };
+        let fresh = Handle::<Namespace, NsMutable>::create().unwrap();
+        assert!(grant(&fresh, "/svc/x", || fresh.bind("/svc/x", &ours)) && resolves_to_ours(&fresh));
+        let within = Handle::<Namespace, NsMutable>::create().unwrap();
+        within.bind("/svc/x", &theirs).unwrap();
+        assert!(grant(&within, "/svc/x", || within.bind("/svc/x", &ours)), "in a view");
+        assert!(resolves_to_ours(&within), "the broker's, not the caller's");
+        mock::fail_next_bind(KError::NoAccess as i32);
+        assert!(!grant(&within, "/svc/x", || within.bind("/svc/x", &theirs)), "any other refusal stands");
+        assert!(resolves_to_ours(&within), "and unbinds nothing");
+        let (endpoint, _peer) = Handle::<Channel, Only>::pair(4).unwrap();
+        let served = || within.bind_server("/svc/x", (&endpoint).into(), "/s/1");
+        assert!(grant(&within, "/svc/x", served), "a forwarding grant the same way");
     }
 
     #[test]

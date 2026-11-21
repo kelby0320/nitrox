@@ -70,9 +70,8 @@ impl DeviceKind {
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
 pub const REGISTRY_MAGIC: u32 = 0x4745_5244;
-/// The snapshot layout this kernel writes: 2, whose header carries the table's
-/// generation.
-pub const REGISTRY_VERSION: u32 = 2;
+/// The snapshot layout this kernel writes: 3, whose records carry a partition's unique GUID.
+pub const REGISTRY_VERSION: u32 = 3;
 /// [`DeviceRecord::served`] for a node no indexed path serves (a PCI function, the console).
 pub const NOT_SERVED: u32 = 0xFFFF_FFFF;
 /// [`DeviceRecord::parent`] for a node that belongs to nothing else.
@@ -184,6 +183,9 @@ pub struct DeviceRecord {
     /// What to call it: a disk's model and serial, a partition's label, a module's path, a USB
     /// device's product and serial (or `vvvv:pppp` when it has no strings).
     pub name: [u8; MAX_DEVICE_NAME],
+    /// A GPT partition's unique GUID, in the table's byte order: what `by-partuuid` names it by.
+    /// Zero for every other node.
+    pub guid: [u8; 16],
 }
 crate::libkern::pod::pod!(DeviceRecord {
     id,
@@ -209,10 +211,11 @@ crate::libkern::pod::pod!(DeviceRecord {
     name_len,
     block_count,
     driver,
-    name
+    name,
+    guid
 });
 
-const _: () = assert!(size_of::<DeviceRecord>() == 144);
+const _: () = assert!(size_of::<DeviceRecord>() == 160);
 const _: () = assert!(offset_of!(DeviceRecord, subclass) == 29);
 const _: () = assert!(offset_of!(DeviceRecord, prog_if) == 30);
 const _: () = assert!(offset_of!(DeviceRecord, revision) == 31);
@@ -238,6 +241,7 @@ const _: () = assert!(offset_of!(DeviceRecord, name_len) == 44);
 const _: () = assert!(offset_of!(DeviceRecord, block_count) == 48);
 const _: () = assert!(offset_of!(DeviceRecord, driver) == 56);
 const _: () = assert!(offset_of!(DeviceRecord, name) == 72);
+const _: () = assert!(offset_of!(DeviceRecord, guid) == 144);
 
 impl Default for DeviceRecord {
     fn default() -> Self {
@@ -266,6 +270,7 @@ impl Default for DeviceRecord {
             block_count: 0,
             driver: [0; MAX_DRIVER_NAME],
             name: [0; MAX_DEVICE_NAME],
+            guid: [0; 16],
         }
     }
 }

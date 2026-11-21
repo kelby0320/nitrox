@@ -568,15 +568,16 @@ mod tests {
         use crate::devices::{Arrival, Notice, Table, notice};
         use libkern::device::{DeviceKind, DeviceRecord};
         use librsproto::devices::{
-            OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, build_arrived, build_departed, build_settled,
+            OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, RECORD_LEN, build_arrived, build_departed,
+            build_settled,
         };
 
         fn arrived(id: u32, kind: DeviceKind) -> Vec<u8> {
-            let mut raw = [0u8; 144];
+            let mut raw = [0u8; RECORD_LEN];
             raw[0..4].copy_from_slice(&id.to_le_bytes());
             raw[8..12].copy_from_slice(&kind.as_u32().to_le_bytes());
             let r = DeviceRecord::read(&raw).unwrap();
-            let mut out = [0u8; 144];
+            let mut out = [0u8; RECORD_LEN];
             let n = build_arrived(&mut out, r.as_bytes()).unwrap();
             out[..n].to_vec()
         }
@@ -586,7 +587,7 @@ mod tests {
             let kbd = arrived(6, DeviceKind::Keyboard);
             assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd, 1), Notice::Arrived { id: 6, kind: DeviceKind::Keyboard });
             assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd, 0), Notice::Malformed, "no node");
-            assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd[..143], 1), Notice::Malformed, "a record short");
+            assert_eq!(notice(OP_DEVICES_ARRIVED, &kbd[..RECORD_LEN - 1], 1), Notice::Malformed, "a record short");
             let disk = arrived(2, DeviceKind::Disk);
             assert_eq!(notice(OP_DEVICES_ARRIVED, &disk, 1), Notice::NotInput { id: 2, kind: DeviceKind::Disk });
             let mut w = [0u8; 4];

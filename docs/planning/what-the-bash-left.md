@@ -1,6 +1,6 @@
 # What the bash left
 
-**Status: detailed 2026-11-19; H.1 and H.2 built 2026-11-20.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
+**Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
 bug bash triaged **later**, which [`bug-bash.md`](bug-bash.md) records, checked against `main` and
 fixed, each with a test that fails without it.
 
@@ -509,6 +509,25 @@ services.
 
 **Gates:** `check-storage`, `check-media`, `check-install`, `check-recovery` and `test-interactive`
 (`with`).
+
+**Built 2026-11-20**, in five commits. Where it departs from the above:
+- **sup-2's boot is the test image's**: its root partition is built with a fixed unique GUID and
+  its `init.toml` names it by `gpt-partuuid:`, so every test-image boot holds the match, and
+  `boot-probe`'s storage test, which checks `nitrox-root` is `init`'s at `/`, fails without it. The
+  GUID is the record's last field, at offset 144: 160 bytes, `REGISTRY_VERSION` 3.
+- **sup-5's probe runs when the mounts have changed, too**, whatever the time: a device just
+  unmounted was last read before its mount. The interval is two seconds, or four times the last
+  probe's length if more, so probes hold a fifth of the thread at most. An administrator's `Mount`
+  and `Reread` read their devices as before.
+- **sec-10's bind is `spawning::grant`**, not a module of its own beside `clock.rs`: `lib.rs` is
+  at its size entry. `test-interactive`'s step 20b holds it, a `with admin whoami` inside
+  `with admin nxsh`, which fails without it as the bug bash's boot did. Its review added the
+  kernel's log, a fresh snapshot in place of an outer view's, and the `disks` grant, which takes
+  out what the copy held first.
+- **No code moved out of storage-service's `main.rs`**: each fix fitted, the resolve's file arm
+  going to `Service::table_file` in `disks.rs`, and `main.rs` fell from 1,160 lines to 1,149. The
+  unmount's answer is `mounts::unmount_recorded`, in the library.
+- **The probe tests were the implementer's**, each mutation run again by the author.
 
 ### H.4 Every shared server, part one: the mechanism, the broker, storage-service and device-mgr
 

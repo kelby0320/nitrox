@@ -116,7 +116,10 @@ policy's reason. On `Started`:
 
 - the broker has **copied the namespace again** and built the view in the copy, so the caller holds
   no handle to it;
-- it has bound the profile's grants there;
+- it has bound the profile's grants there, **each endpoint grant in place of what the copy had
+  at its path**: a view made from inside a view binds them already, and the caller's binding is
+  not the broker's. So is the kernel's log, a snapshot taken as this view is made; the clock keeps
+  the caller's, the same node;
 - it has resolved `/bin/<program>` in **its own** namespace — a caller can prune what it sent, and a
   name must not fall through to a shorter binding;
 - it has spawned the program in the view with no syscaps beyond the profile's, and a setup message

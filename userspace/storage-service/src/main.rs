@@ -64,7 +64,8 @@ use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, OP_READY, OP_UNMOUNT, RS_FLAG_
 use storage_service::fit::{SCRATCH, ScratchRead, scratch_read};
 use storage_service::mounts::{self, Plan, Reread, RereadRefusal, automount, explicit, in_use};
 use storage_service::probe::{Found, probe_record};
-use storage_service::sources::{DiskTable, InitMount, TableEntry, init_known, init_mounts, live_boot};
+use storage_service::rescan::Rescan;
+use storage_service::sources::{InitMount, init_known, init_mounts, live_boot};
 use storage_service::suffix::{self, Asked, session_only};
 use storage_service::table::{self, By, Device, Mounted};
 use storage_service::watch::{Sent, Watches};
@@ -208,6 +209,8 @@ struct Service {
     watches: Watches,
     watch_ends: BTreeMap<u64, Chan>,
     dirs: Vec<(Chan, Listing)>,
+    /// When a resolve of the table probes the unmounted devices again.
+    rescan: Rescan,
 }
 
 /// A request refused: the error, and the reason its reply carries.
@@ -216,7 +219,7 @@ type Refused = (KError, &'static [u8]);
 impl Service {
     /// **Read device `id` again.** The boot's probe goes stale as soon as anything writes the
     /// device, a mount of this service's or a raw writer through the `disks` grant, so what reads
-    /// a device's `found` (a table, an administrator's mount) refreshes it first. **This is the
+    /// a device's `found` (a mount; a table, as [`Rescan`] paces) refreshes it first. **This is the
     /// one place `found` changes after the boot**: the unmount reads the device for its own line
     /// with [`read_found`](Self::read_found), which stores nothing.
     fn refresh(&mut self, id: u32) {
@@ -280,21 +283,12 @@ impl Service {
         match asked {
             Asked::Directory => self.open_dir(from, m.request_id, Listing::Tables),
             Asked::Mounts => self.open_dir(from, m.request_id, Listing::Mounts),
-            Asked::File(name) => {
-                self.refresh_unmounted();
-                let mounts = self.all_mounts();
-                let bytes = if name == "all" {
-                    Some(table::all(&self.devices, &mounts))
-                } else {
-                    table::one(&self.devices, &mounts, name)
-                };
-                match bytes {
-                    Some(b) => {
-                        server::reply_object(from, m.request_id, &b);
-                    }
-                    None => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+            Asked::File(name) => match self.table_file(name) {
+                Some(b) => {
+                    server::reply_object(from, m.request_id, &b);
                 }
-            }
+                None => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
+            },
             Asked::Mount { label, consumed } => match self.mounted.iter().find(|x| x.label == label) {
                 Some(x) => {
                     server::reply_subnamespace(from, m.request_id, x.ns.as_ref(), consumed, b"/");
@@ -668,13 +662,13 @@ impl Service {
         }
         // 4. **The server records the unmount and exits**, clean unless found not clean or a change
         //    failed. The mount is gone whatever the answer: a server that cannot record it exits.
-        let told = server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok();
+        let told = server::send(&x.control, OP_UNMOUNT, mounts::UNMOUNT_ID, 0, &[], &mut Carried::new()).is_ok();
         let answer = if told && wait_until(&x.control, within(READY_TIMEOUT_NS)) {
             recv(&x.control).ok().flatten()
         } else {
             None
         };
-        let recorded = answer.is_some_and(|(a, _)| a.op == OP_UNMOUNT && a.flags & RS_FLAG_ERROR == 0);
+        let recorded = answer.is_some_and(|(a, _)| mounts::unmount_recorded(a.op, a.flags, a.request_id));
         drop((x.ns, x.control, x.process));
         if !recorded {
             return Err((
@@ -867,7 +861,7 @@ impl Service {
     fn tear_down(&mut self, i: usize) {
         let x = self.mounted.remove(i);
         let _ = sync_mount(&x.ns);
-        if server::send(&x.control, OP_UNMOUNT, 1, 0, &[], &mut Carried::new()).is_ok()
+        if server::send(&x.control, OP_UNMOUNT, mounts::UNMOUNT_ID, 0, &[], &mut Carried::new()).is_ok()
             && wait_until(&x.control, within(READY_TIMEOUT_NS))
         {
             let _ = recv(&x.control);
@@ -973,22 +967,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     };
 
     let mut devices = Vec::new();
-    let mut tables = Vec::new();
     let mut nodes = Vec::new();
     for (record, node) in held {
         let io = DeviceIo::new(&node, &record, &scratch);
-        if matches!(record.kind(), DeviceKind::Disk | DeviceKind::RamDisk)
-            && let Some(t) = read_table(&io, record.id)
-        {
-            tables.push(t);
-        }
         devices.push(Device { found: probe_record(&io, &record), record });
         nodes.push((record.id, node));
     }
     let records: Vec<DeviceRecord> = devices.iter().map(|d| d.record).collect();
 
     let init_list: Option<Vec<InitMount>> = match read_manifest(&root) {
-        Ok(m) => Some(init_mounts(&m, &records, &tables)),
+        Ok(m) => Some(init_mounts(&m, &records)),
         Err(why) => {
             Line::new()
                 .s(b"storage-service: init.toml could not be read (")
@@ -1051,6 +1039,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         admin_ends: Vec::new(),
         admin_sessions: Vec::new(),
         dirs: Vec::new(),
+        rescan: Rescan::default(),
     };
     let mounts = s.all_mounts();
     Line::new().s(b"storage-service: ").u(s.devices.len() as u64).s(b" block device(s)").end();

@@ -24,7 +24,7 @@ pub const OP_DEVICES_DEPARTED: u16 = 0x0F02;
 
 /// Bytes of a registry record — `libkern::device::DeviceRecord`'s size, which `librsproto` asserts
 /// under its `io` feature.
-pub const RECORD_LEN: usize = 144;
+pub const RECORD_LEN: usize = 160;
 #[cfg(feature = "io")]
 const _: () = assert!(RECORD_LEN == core::mem::size_of::<libkern::device::DeviceRecord>());
 /// Bytes of a `Settled` or `Departed` body.

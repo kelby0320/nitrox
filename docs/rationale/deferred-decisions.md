@@ -475,7 +475,7 @@ retires a record in place instead** (2026-10-05): it is marked departed, and its
 resolving. **An input node's slot is given back** too, under an epoch, so sixteen bound the devices
 attached rather than every device ever attached. What remains is **the table's growth**: every
 arrival costs a record per node — two for a keyboard or a mouse, its device and its input node —
-at 144 bytes each, in every snapshot after it, and the device manager reads the whole snapshot at
+at 160 bytes each, in every snapshot after it, and the device manager reads the whole snapshot at
 each change. A connector whose contact bounces adds them each time. The maintainer's call
 (2026-10-05) was to keep them for the boot. Trigger: the snapshot's size being felt — a machine
 whose devices come and go thousands of times in one boot.

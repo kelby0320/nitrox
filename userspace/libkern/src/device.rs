@@ -71,8 +71,8 @@ impl DeviceKind {
 
 /// The first four bytes of a snapshot, `"DREG"` read as a little-endian `u32`.
 pub const REGISTRY_MAGIC: u32 = 0x4745_5244;
-/// The snapshot layout this build reads; version 2's header carries the table's generation.
-pub const REGISTRY_VERSION: u32 = 2;
+/// The snapshot layout this build reads; version 3's records carry a partition's unique GUID.
+pub const REGISTRY_VERSION: u32 = 3;
 /// [`DeviceRecord::served`] for a node no indexed path serves.
 pub const NOT_SERVED: u32 = 0xFFFF_FFFF;
 /// [`DeviceRecord::parent`] for a node that belongs to nothing else.
@@ -169,9 +169,12 @@ pub struct DeviceRecord {
     /// What to call it: a disk's model and serial, a partition's label, a module's path, a USB
     /// device's product and serial (or `vvvv:pppp`).
     pub name: [u8; MAX_DEVICE_NAME],
+    /// A GPT partition's unique GUID, in the table's byte order: what `by-partuuid` names it by.
+    /// Zero for every other node.
+    pub guid: [u8; 16],
 }
 
-const _: () = assert!(size_of::<DeviceRecord>() == 144);
+const _: () = assert!(size_of::<DeviceRecord>() == 160);
 const _: () = assert!(offset_of!(DeviceRecord, id) == 0);
 const _: () = assert!(offset_of!(DeviceRecord, class) == 4);
 const _: () = assert!(offset_of!(DeviceRecord, kind) == 8);
@@ -197,6 +200,7 @@ const _: () = assert!(offset_of!(DeviceRecord, logical_block_size) == 40);
 const _: () = assert!(offset_of!(DeviceRecord, block_count) == 48);
 const _: () = assert!(offset_of!(DeviceRecord, driver) == 56);
 const _: () = assert!(offset_of!(DeviceRecord, name) == 72);
+const _: () = assert!(offset_of!(DeviceRecord, guid) == 144);
 
 impl DeviceRecord {
     /// One record from exactly its size in bytes — a snapshot's slot, or what a
@@ -536,8 +540,8 @@ mod tests {
         h
     }
 
-    fn record(id: u32, kind: DeviceKind) -> [u8; 144] {
-        let mut r = [0u8; 144];
+    fn record(id: u32, kind: DeviceKind) -> [u8; 160] {
+        let mut r = [0u8; 160];
         r[0..4].copy_from_slice(&id.to_le_bytes());
         r[8..12].copy_from_slice(&kind.as_u32().to_le_bytes());
         r
@@ -547,8 +551,8 @@ mod tests {
     fn a_padded_snapshot_reads_exactly_its_count() {
         let mut page = [0u8; 4096];
         page[..24].copy_from_slice(&header(2));
-        page[24..168].copy_from_slice(&record(0, DeviceKind::Disk));
-        page[168..312].copy_from_slice(&record(1, DeviceKind::Keyboard));
+        page[24..184].copy_from_slice(&record(0, DeviceKind::Disk));
+        page[184..344].copy_from_slice(&record(1, DeviceKind::Keyboard));
         let rs = records(&page).unwrap();
         assert_eq!(rs.len(), 2);
         assert_eq!(rs.generation(), 7, "the header's generation (Phase 6 Part C)");
@@ -562,7 +566,7 @@ mod tests {
 
     #[test]
     fn a_snapshot_that_does_not_add_up_is_refused() {
-        let mut short = [0u8; 24 + 144];
+        let mut short = [0u8; 24 + 160];
         short[..24].copy_from_slice(&header(2));
         assert_eq!(records(&short).err(), Some(SnapshotError::Truncated));
         let mut huge = [0u8; 24];
@@ -571,9 +575,11 @@ mod tests {
         let mut magic = header(0);
         magic[0] ^= 1;
         assert_eq!(records(&magic).err(), Some(SnapshotError::BadMagic));
-        let mut version = header(0);
-        version[4] = 1;
-        assert_eq!(records(&version).err(), Some(SnapshotError::BadVersion), "version 1, before Part C");
+        for old in [1, 2] {
+            let mut version = header(0);
+            version[4] = old;
+            assert_eq!(records(&version).err(), Some(SnapshotError::BadVersion), "version {old}");
+        }
         let mut size = header(0);
         size[12] = 1;
         assert_eq!(records(&size).err(), Some(SnapshotError::BadRecordSize));
@@ -616,12 +622,13 @@ mod tests {
 
     #[test]
     fn a_record_reads_from_exactly_its_bytes() {
-        let mut buf = [0u8; 1 + 145];
-        buf[1..145].copy_from_slice(&record(7, DeviceKind::Mouse));
-        let r = DeviceRecord::read(&buf[1..145]).unwrap();
-        assert_eq!((r.id, r.kind()), (7, DeviceKind::Mouse));
-        assert!(DeviceRecord::read(&buf[1..144]).is_none());
-        assert!(DeviceRecord::read(&buf[1..146]).is_none());
+        let mut buf = [0u8; 1 + 161];
+        buf[1..161].copy_from_slice(&record(7, DeviceKind::Mouse));
+        buf[145..161].copy_from_slice(&[0xA5; 16]);
+        let r = DeviceRecord::read(&buf[1..161]).unwrap();
+        assert_eq!((r.id, r.kind(), r.guid), (7, DeviceKind::Mouse, [0xA5; 16]), "the GUID last, at 144");
+        assert!(DeviceRecord::read(&buf[1..160]).is_none());
+        assert!(DeviceRecord::read(&buf[1..162]).is_none());
     }
 
     /// Bytes are laid out by hand as the kernel's `repr(C)` writes them, not by this crate's structs.
