@@ -578,4 +578,30 @@ mod tests {
             assert!(parse_read_reply(&good[..k]).is_none(), "prefix of {k}");
         }
     }
+
+    /// **A source, a principal and a message are a `u16` long at most in a reply, a source in an
+    /// append**: one past is refused, not wrapped.
+    #[test]
+    fn a_string_one_past_its_field_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; 3 * past.len() + 128];
+        assert!(encode_append(&mut out, LEVEL_INFO, b"m", None, None, Some(&at)).is_some());
+        assert_eq!(encode_append(&mut out, LEVEL_INFO, b"m", None, None, Some(&past)), None);
+        let rec = |principal, source, message| ReadRecord {
+            sequence: 1,
+            time: None,
+            timestamp: 0,
+            tier: 0,
+            level: LEVEL_INFO,
+            principal,
+            source,
+            message,
+        };
+        // A writer each, with room for the record, so only its length refuses it.
+        let push = |r: &ReadRecord| ReadReplyWriter::new(&mut out.clone(), 0).unwrap().push(r);
+        assert!(push(&rec(&at, Some(&at), &at)));
+        assert!(!push(&rec(&past, None, b"m")), "the principal");
+        assert!(!push(&rec(b"p", Some(&past), b"m")), "the source");
+        assert!(!push(&rec(b"p", None, &past)), "the message");
+    }
 }

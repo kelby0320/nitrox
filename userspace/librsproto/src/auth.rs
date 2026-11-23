@@ -333,4 +333,28 @@ mod tests {
         refuses_every_prefix(&b[..n], |x| parse_account_list(x).is_some());
         survives_corruption(&b[..n], |x| parse_account_list(x).map(|l| l.iter().count()).is_some());
     }
+
+    /// **Each field is its width long at most**: a `u16` for a request's and a reply's, a byte for a
+    /// listed account's; one past is refused, not wrapped. A list holds `u16::MAX` accounts.
+    #[test]
+    fn a_field_one_past_its_width_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; 2 * past.len() + 64];
+        let request = |out: &mut [u8], u: &[u8], p: &[u8]| build_authenticate_request(out, u, p);
+        assert_eq!(request(&mut out, &at, &at), Some(AUTH_REQUEST_PREFIX_LEN + 2 * at.len()));
+        assert_eq!(request(&mut out, &past, b"p"), None, "the username");
+        assert_eq!(request(&mut out, b"u", &past), None, "the password");
+        let reply = |out: &mut [u8], who: &[u8], home: &[u8]| build_authenticate_reply(out, 0, who, home);
+        assert_eq!(reply(&mut out, &at, &at), Some(AUTH_REPLY_PREFIX_LEN + 2 * at.len()));
+        assert_eq!(reply(&mut out, &past, b"/"), None, "the principal");
+        assert_eq!(reply(&mut out, b"p", &past), None, "the home");
+        let mut w = AccountListWriter::new(&mut out).unwrap();
+        assert_eq!(w.push(&at[..255], &at[..255]), Some(()));
+        assert_eq!(w.push(&at[..256], b"/"), None, "a name of 256 bytes");
+        assert_eq!(w.push(b"n", &at[..256]), None, "a home of 256 bytes");
+        let mut many = vec![0u8; 2 * 65_536 + 2];
+        let mut w = AccountListWriter::new(&mut many).unwrap();
+        assert!((0..u16::MAX).all(|_| w.push(b"", b"").is_some()), "u16::MAX accounts");
+        assert_eq!(w.push(b"", b""), None, "and one more");
+    }
 }

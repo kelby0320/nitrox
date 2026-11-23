@@ -245,4 +245,16 @@ mod tests {
         let n = build_in_use(&mut b, &[1, 2, 3]).unwrap();
         refuses_every_prefix(&b[..n], |x| parse_in_use(x, |_| {}));
     }
+
+    /// **A device and a label are a `u16` long at most**: one past is refused, not wrapped.
+    #[test]
+    fn a_device_or_a_label_one_past_its_field_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; 2 * past.len() + 64];
+        assert_eq!(build_mount(&mut out, &at, &at), Some(MOUNT_PREFIX_LEN + 2 * at.len()));
+        assert_eq!(build_mount(&mut out, &past, b"l"), None, "the device");
+        assert_eq!(build_mount(&mut out, b"d", &past), None, "the label");
+        assert_eq!(build_mounted(&mut out, &at, None), Some(MOUNTED_PREFIX_LEN + at.len()));
+        assert_eq!(build_mounted(&mut out, &past, None), None);
+    }
 }
