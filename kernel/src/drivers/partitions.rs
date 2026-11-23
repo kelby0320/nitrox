@@ -335,7 +335,7 @@ mod tests {
         for (i, &(kind, first, last, name)) in given.iter().enumerate() {
             let e = img.at(2 * BLOCK + 128 * i);
             e[0] = kind;
-            e[16] = 0xA0 + i as u8;
+            e[16] = 0xA0u8.wrapping_add(i as u8);
             e[32..40].copy_from_slice(&first.to_le_bytes());
             e[40..48].copy_from_slice(&last.to_le_bytes());
             for (j, c) in name.bytes().enumerate() {
@@ -414,6 +414,34 @@ mod tests {
         let mut img = gpt_image(64, 4, &[]);
         img.at(BLOCK + 84)[..4].copy_from_slice(&96u32.to_le_bytes());
         assert!(matches!(img.read(), Err(Unread::Unsupported(_))));
+    }
+
+    /// **An entry size under 128 is refused, and one that does not divide a block**: read as 64, an
+    /// entry in use is sliced past its end; read as 192, entries straddle blocks, as no GPT has.
+    #[test]
+    fn an_entry_size_under_its_floor_or_not_dividing_a_block_is_unsupported() {
+        init_global_heap();
+        for size in [64u32, 192] {
+            let mut img = gpt_image(64, 4, &[(0x83, 34, 40, "nitrox-root")]);
+            img.at(BLOCK + 84)[..4].copy_from_slice(&size.to_le_bytes());
+            assert!(matches!(img.read(), Err(Unread::Unsupported(_))), "entries of {size} bytes");
+        }
+    }
+
+    /// **The entries are what the header declares, to the cap**: a stale sixth in the block after
+    /// five is no partition, and a header declaring 0xFFFFFFFF reads its first 128.
+    #[test]
+    fn the_entries_are_those_declared_to_the_cap() {
+        init_global_heap();
+        let six: [(u8, u64, u64, &str); 6] =
+            core::array::from_fn(|i| (0x83, 100 + 10 * i as u64, 105 + 10 * i as u64, "p"));
+        assert_eq!(gpt_image(4096, 5, &six).read().unwrap().parts.len(), 5, "five declared");
+        let last_two: [(u8, u64, u64, &str); 129] = core::array::from_fn(|i| {
+            if i < 127 { (0, 0, 0, "") } else { (0x83, 100 + 10 * i as u64, 105 + 10 * i as u64, "p") }
+        });
+        let t = gpt_image(4096, u32::MAX, &last_two).read().unwrap();
+        let firsts: std::vec::Vec<u64> = t.parts.iter().map(|p| p.first_lba).collect();
+        assert_eq!(firsts, [100 + 10 * 127], "the 128th entry read, and not the 129th");
     }
 
     /// **An MBR's primary entries** are numbered by slot; a protective one is skipped, an extended

@@ -1,7 +1,7 @@
 # What the bash left
 
 **Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
-2026-11-23, H.5 folded into it; H.6 and H.7 built 2026-11-23.** Part H of
+2026-11-23, H.5 folded into it; H.6, H.7 and H.8 built 2026-11-23.** Part H of
 [`pre-phase-7.md`](pre-phase-7.md): the findings of the bug bash triaged **later**, which
 [`bug-bash.md`](bug-bash.md) records, checked against `main` and fixed, each with a test that fails
 without it.
@@ -731,6 +731,20 @@ today because the broken code and the correct code give the same answer on the e
   - sizing read-backs that keep their type bits, as hardware returns them.
 - **drv-15:** `logical_min` 1 with the first usage at `0x05`, so the filter alone decides. The test
   compares `Layout::read`'s `Held`, as events cannot show a held usage that maps no key.
+
+**Built 2026-11-23**, a commit a finding, every mutation each names failing a test, 39 in all.
+Where it departs from the above:
+- **USB storage refuses before it queues anything**: `command_for` answers `InvalidArgument` for a
+  request past 64 fragments, and `issue`'s slice stays as the bound of the array it fills.
+- **The zero-length walk runs on a thread of its own**, and a test fails when it has not ended in
+  five seconds; a descriptor of one byte is held beside it.
+- **The PCI fixtures answer a sizing read with their type bits**, the 64-bit one too, so each
+  mask's control fails; a 32-bit prefetchable BAR holds the 32-bit memory mask.
+- **drv-15's `FIRST_KEY` bound is held as well**, by slots naming usages 3 and 2.
+- **Its review (#466) held the cap where it falls**, the 128th entry read and the 129th not, and
+  the window node's wrapping end by its own guard. A long HID item past its bytes is refused as a
+  short one is, a mouse collection inside the first does not end it, and `issue` asserts the
+  fragments `command_for` refuses.
 
 ### H.9 The parsers and the credential path, held
 

@@ -13,6 +13,19 @@ fn partition_rebase_maps_relative_to_absolute() {
     assert_eq!(partition_rebase(count * ss, ss, start, count, ss), None);
 }
 
+/// **Each of `partition_rebase`'s overflows is refused by itself**: wrapped, each would land back
+/// inside the window and send the request elsewhere on the disk.
+#[test]
+fn each_overflow_partition_rebase_makes_is_refused_by_itself() {
+    let ss = 512;
+    let wraps_to_a_block = (1 << 55) + 1;
+    assert_eq!(partition_rebase(0, ss, 0, wraps_to_a_block, ss), None, "the window's size");
+    assert_eq!(partition_rebase(u64::MAX - 511, 2 * ss, 0, 1 << 40, ss), None, "the request's end");
+    assert_eq!(partition_rebase(0, ss, wraps_to_a_block, 1, ss), None, "the window's start");
+    assert_eq!(partition_rebase(ss, ss, u64::MAX / ss, 2, ss), None, "the start and the offset");
+    assert_eq!(partition_rebase(0, ss, u64::MAX / ss - 1, 2, ss), Some((u64::MAX / ss - 1) * ss), "just short");
+}
+
 /// A window refuses a rescan itself, and once retired refuses everything with
 /// `PeerClosed`.
 #[test]
@@ -68,13 +81,14 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let part = Ref::new(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
     // An IRP through the partition node's backend; returns its status after
     // any refusal's completion has run.
-    let submit = |op: IrpOp, offset: u64| {
-        let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+    let submit_of = |op: IrpOp, offset: u64, length: u64| {
+        let mut irp = Irp::new_block(op, core::ptr::null(), offset, length, IrpBuffer::NONE, core::ptr::null_mut(), 0);
         // SAFETY: the test's IRP, which outlives its dispatch.
         part.block_backend().unwrap().submit(unsafe { crate::io::block::InFlight::for_test(&mut irp) });
         crate::dpc::run_pending();
         irp.status
     };
+    let submit = |op: IrpOp, offset: u64| submit_of(op, offset, 512);
     let pending = crate::io::irp::IrpStatus::Pending as i32;
     assert_eq!(submit(IrpOp::Read, 512), pending, "forwarded, for the disk to complete");
     assert_eq!(seen.0.borrow().as_slice(), &[(IrpOp::Read as u32, 2049 * 512)], "rebased to the disk");
@@ -85,6 +99,14 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let flush = (IrpOp::Flush as u32, 0);
     assert_eq!(seen.0.borrow().last(), Some(&flush), "a flush is the disk's cache: not rebased");
     assert_eq!(submit(IrpOp::Read, 100 * 512), KError::InvalidArgument as i32, "past the window's end");
+    // Its end wraps to 512, inside the window, and its start rebases below the top: only the end
+    // is past the window.
+    let below_top = u64::MAX - (1 << 20) - 511;
+    assert_eq!(
+        submit_of(IrpOp::Read, below_top, (1 << 20) + 1024),
+        KError::InvalidArgument as i32,
+        "an end that wraps"
+    );
 
     assert!(!retire_window(&disk), "a disk's node is no window");
     assert!(retire_window(&part));
@@ -171,7 +193,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
 }
 
 /// **A block request off its device's blocks, or at an odd buffer offset, reaches no driver**,
-/// through both dispatches.
+/// through both dispatches, and nor does one past its device's fragments.
 #[test]
 fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let _exclusive = crate::dpc::exclusive();
@@ -188,12 +210,12 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     }
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
-    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 8);
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 2);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
     let disk = Ref::new(node);
-    let buffer = Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
+    let buffer = Ref::new(MemoryObject::try_new(3 * PAGE_SIZE).unwrap());
     let po = || Ref::new(PendingOperation::try_new().unwrap());
     let frames = [PhysAddr(0x10_0000), PhysAddr(0x20_0000)];
     // Each request through both entry points, its operation's status once settled.
@@ -232,6 +254,10 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     assert_eq!(at(PAGE_SIZE as u64 - 1), Err(KError::InvalidArgument), "an odd buffer offset");
     assert_eq!(seen.0.borrow().len(), 2, "and it reached no driver");
     assert_eq!(at(PAGE_SIZE as u64 - 2), Ok(()), "an even one across a page goes down");
+    let pages = |n: u64| dispatch_block_irp(&disk, &buffer, &po(), IoOpcode::Read, 0, 0, n * PAGE_SIZE as u64);
+    assert_eq!(pages(3), Err(KError::InvalidArgument), "three fragments to a device of two");
+    assert_eq!(seen.0.borrow().len(), 3, "and it reached no driver");
+    assert_eq!(pages(2), Ok(()), "two go down");
     for irp in seen.0.borrow_mut().drain(..) {
         // SAFETY: each the IRP of a box a dispatch made, completed once.
         unsafe { finish(irp) };
