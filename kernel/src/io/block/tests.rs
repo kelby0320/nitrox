@@ -171,7 +171,7 @@ fn frames_go_to_the_device_as_one_irp_and_more_than_it_takes_are_refused() {
 }
 
 /// **A block request off its device's blocks, or at an odd buffer offset, reaches no driver**,
-/// through both dispatches.
+/// through both dispatches, and nor does one past its device's fragments.
 #[test]
 fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     let _exclusive = crate::dpc::exclusive();
@@ -188,12 +188,12 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     }
     fn disk_poll(_: *mut ()) {}
     let seen = Seen(RefCell::new(std::vec::Vec::new()));
-    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 8);
+    let backend = crate::io::block::test_backend(disk_submit, disk_poll, &seen as *const Seen as *mut (), 2);
     let geometry = BlockGeometry { logical_block_size: 512, block_count: 64 };
     let node =
         DeviceNode::try_new_block(ResourceDescriptor::ZERO, geometry, BlockKind::Disk, b"disk", backend).unwrap();
     let disk = Ref::new(node);
-    let buffer = Ref::new(MemoryObject::try_new(2 * PAGE_SIZE).unwrap());
+    let buffer = Ref::new(MemoryObject::try_new(3 * PAGE_SIZE).unwrap());
     let po = || Ref::new(PendingOperation::try_new().unwrap());
     let frames = [PhysAddr(0x10_0000), PhysAddr(0x20_0000)];
     // Each request through both entry points, its operation's status once settled.
@@ -232,6 +232,10 @@ fn a_block_request_off_its_devices_blocks_or_words_reaches_no_driver() {
     assert_eq!(at(PAGE_SIZE as u64 - 1), Err(KError::InvalidArgument), "an odd buffer offset");
     assert_eq!(seen.0.borrow().len(), 2, "and it reached no driver");
     assert_eq!(at(PAGE_SIZE as u64 - 2), Ok(()), "an even one across a page goes down");
+    let pages = |n: u64| dispatch_block_irp(&disk, &buffer, &po(), IoOpcode::Read, 0, 0, n * PAGE_SIZE as u64);
+    assert_eq!(pages(3), Err(KError::InvalidArgument), "three fragments to a device of two");
+    assert_eq!(seen.0.borrow().len(), 3, "and it reached no driver");
+    assert_eq!(pages(2), Ok(()), "two go down");
     for irp in seen.0.borrow_mut().drain(..) {
         // SAFETY: each the IRP of a box a dispatch made, completed once.
         unsafe { finish(irp) };

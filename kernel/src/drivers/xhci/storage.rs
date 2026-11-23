@@ -532,6 +532,10 @@ impl Dev {
     }
 
     fn command_for(&self, irp: InFlight, lun: u8) -> Result<IrpCmd, (InFlight, KError)> {
+        // **Refused, not clamped**: a command of its first 64 would complete as the whole request.
+        if irp.frags().len() > MAX_FRAGS as usize {
+            return Err((irp, KError::InvalidArgument));
+        }
         let unit = self.luns.get(lun as usize).copied().unwrap_or_default();
         let op = irp.op();
         match irp_command(op, irp.offset(), irp.length(), unit) {

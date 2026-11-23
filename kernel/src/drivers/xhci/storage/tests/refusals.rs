@@ -59,6 +59,22 @@ fn a_submit_the_device_cannot_take_is_refused_with_its_error() {
     assert_eq!(off, invalid(&raw mut unaligned), "off a block");
 }
 
+/// **A request past the fragments a command carries is refused**, not issued as its first 64 and
+/// completed whole; one at them starts.
+#[test]
+fn a_request_past_the_fragments_a_command_carries_is_refused() {
+    init_global_heap();
+    let disks = Disks::new();
+    let mut fake = Fake::new();
+    let (i, epoch) = disks.take(fake.dev(5)).unwrap();
+    let frags: std::vec::Vec<PhysFrag> =
+        (0..=MAX_FRAGS as u64).map(|k| PhysFrag { base: 0x10_0000 + k * 0x1000, len: 512 }).collect();
+    let (mut over, mut at) = (irp(IrpOp::Read, 0, 65 * 512, &frags), irp(IrpOp::Read, 0, 64 * 512, &frags[..64]));
+    let refused = Action::Complete { irp: was(&raw mut over), status: KError::InvalidArgument as i32, transferred: 0 };
+    assert_eq!(disks.submit(fly(&mut over), context(i, 0, epoch), 0).lax(), refused);
+    assert_eq!(disks.submit(fly(&mut at), context(i, 0, epoch), 0).lax(), Action::None, "started");
+}
+
 /// **A departure completes its queue `PeerClosed` at once**, and hands back the command in flight,
 /// which the controller may still move.
 #[test]
