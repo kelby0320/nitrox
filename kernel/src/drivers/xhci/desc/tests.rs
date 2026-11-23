@@ -100,7 +100,7 @@ fn a_configuration_that_lies_about_lengths_is_not_read_past_its_bytes() {
     assert_eq!(interfaces(&runs).count(), 0);
     let mut zero = keyboard_config();
     zero[9] = 0;
-    assert_eq!(interfaces(&zero).count(), 0, "a zero length ends the walk instead of looping");
+    assert_eq!(ending(move || interfaces(&zero).count()), 0, "a zero length ends the walk instead of looping");
     assert_eq!(interfaces(&keyboard_config()[..8]).count(), 0, "not even a configuration");
 }
 
@@ -377,4 +377,70 @@ fn a_nameless_device_is_named_by_its_ids() {
     assert_eq!(ids_into(0xABCD, 0xF00D, &mut out), 9);
     assert_eq!(&out[..9], b"abcd:f00d");
     assert_eq!(out[9], 0xAA, "nothing past its nine bytes");
+}
+
+/// `walk`'s answer, or a failure if it has not ended within a few seconds: a walk that stops
+/// advancing loops rather than fails.
+fn ending<R: Send + 'static>(walk: impl FnOnce() -> R + Send + 'static) -> R {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || tx.send(walk()));
+    rx.recv_timeout(std::time::Duration::from_secs(5)).expect("the walk did not end")
+}
+
+/// A configuration of `descs` after its own nine bytes, its total their length.
+fn config(descs: &[&[u8]]) -> Vec<u8> {
+    let mut c = vec![9, 2, 0, 0, 1, 1, 0, 0xA0, 50];
+    descs.iter().for_each(|d| c.extend_from_slice(d));
+    let total = c.len() as u16;
+    c[2..4].copy_from_slice(&total.to_le_bytes());
+    c
+}
+
+/// **A descriptor shorter than its kind is passed over by every reader**: each would read its
+/// fields past its end, a panic from a device's bytes. Each is last, so its slice ends with it.
+#[test]
+fn a_descriptor_shorter_than_its_kind_is_passed_over() {
+    const HID_IF: [u8; 9] = [9, 4, 0, 0, 1, 3, 1, 1, 0];
+    const STORAGE_IF: [u8; 9] = [9, 4, 0, 0, 2, 8, 6, 0x50, 0];
+    const BULK_IN: [u8; 7] = [7, 5, 0x81, 2, 0, 2, 0];
+    let short_if: &[u8] = &[4, 4, 0, 0];
+    assert_eq!(interfaces(&config(&[short_if])).count(), 0, "an interface for `interfaces`");
+    assert_eq!(hid_interfaces(&config(&[short_if])).count(), 0, "an interface for HID");
+    let hid = hid_interfaces(&config(&[&HID_IF, &[6, 0x21, 0x11, 0x01, 0, 1]])).next().unwrap();
+    assert_eq!(hid.report_len, 0, "a HID descriptor");
+    let hid = hid_interfaces(&config(&[&HID_IF, &[4, 5, 0x81, 3]])).next().unwrap();
+    assert_eq!(hid.endpoint, None, "an endpoint for HID");
+    let hid = hid_interfaces(&config(&[&HID_IF, &[7, 5, 0x81, 3, 8, 0, 10], &[2, 0x30]])).next().unwrap();
+    assert_eq!(hid.endpoint.unwrap().burst, 0, "a companion for HID");
+    assert_eq!(storage_interface(&config(&[short_if])), None, "an interface for storage");
+    assert_eq!(storage_interface(&config(&[&STORAGE_IF, &[4, 5, 0x81, 2]])), None, "an endpoint for storage");
+    assert_eq!(storage_interface(&config(&[&STORAGE_IF, &BULK_IN, &[2, 0x30]])), None, "a companion for storage");
+}
+
+/// **A descriptor of no length, or one byte, ends the walk**: read as one, its kind is past its end.
+#[test]
+fn a_descriptor_of_no_length_or_one_byte_ends_the_walk() {
+    for len in [0u8, 1] {
+        let c = config(&[&[9, 4, 0, 0, 1, 3, 1, 1, 0], &[len, 5, 0x81, 3, 8, 0, 10]]);
+        let found = ending(move || hid_interfaces(&c).map(|h| h.endpoint).collect::<Vec<_>>());
+        assert_eq!(found, [None], "a descriptor of {len} bytes");
+    }
+}
+
+/// **A configuration descriptor shorter than its nine bytes is none**, whatever its total says.
+#[test]
+fn a_configuration_shorter_than_its_nine_bytes_is_none() {
+    let mut c = keyboard_config();
+    c[0] = 8;
+    assert_eq!((configuration_total(&c), configuration_value(&c)), (None, None));
+    c[0] = 9;
+    assert_eq!((configuration_total(&c), configuration_value(&c)), (Some(34), Some(1)));
+}
+
+/// **An interface's first interrupt-IN endpoint is its own**: a second does not replace it.
+#[test]
+fn an_interfaces_first_interrupt_in_endpoint_is_the_one_taken() {
+    let c = config(&[&[9, 4, 0, 0, 2, 3, 1, 1, 0], &[7, 5, 0x81, 3, 8, 0, 10], &[7, 5, 0x82, 3, 4, 0, 1]]);
+    let first = Endpoint { address: 0x81, max_packet: 8, burst: 0, interval: 10 };
+    assert_eq!(hid_interfaces(&c).next().unwrap().endpoint, Some(first));
 }
