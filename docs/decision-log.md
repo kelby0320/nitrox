@@ -38988,3 +38988,8 @@ H.4 merged, #463. H.6 on `pre-phase-7/h6-shell-env`, as
   which stays `cd`'s, holds a value its field's type does not fit or a null, or a `HOME` that is not
   a String.
 - **`cd` and `exit` take one argument, or none** (nxsh-2): a second is refused, and a flag named.
+- **`$env` is one environment, not a binding** (the maintainer's call, 2026-11-23, on the #464
+  review): the prompt, a `def` and a closure read and write the one record, so a write or a `cd`
+  inside a call no longer leaves the prompt's `$env` behind. No binding takes its name. The copy
+  an assignment makes is also held to the encoding a program is handed, nested values and size
+  included, and a variable keeps its type whichever form assigns it.

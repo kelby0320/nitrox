@@ -88,8 +88,11 @@ was demonstrated: each is read from the source, and is reproduced before it is f
     `HOME=/home/a` in the stage's environment, `/home/a` after a `cd`, and the new field refused.
     Logic. Medium. **Later.**
   Fixed in `8fba9098`: an assignment rooted at `$env` writes a copy of the environment, replaced
-  whole or refused whole, a new field a new variable, `PWD` `cd`'s; fails without it: every test in
-  `nxsh/src/env_tests.rs` but the two below.
+  whole or refused whole, a new field a new variable, `PWD` `cd`'s; fails without it:
+  `a_field_assigned_is_what_a_program_gets`, `a_new_field_is_a_variable`,
+  `cd_and_tilde_read_what_was_assigned`, `a_whole_record_that_keeps_pwd_is_the_environment` and
+  `each_form_that_would_break_the_environment_is_refused_whole`. PR #464's review made `$env` one
+  environment, in a `def` and a closure too: `a_def_and_a_closure_write_the_one_environment`.
 - [x] **nxsh-2** `userspace/nxsh/src/eval.rs:1268` — `cd` and `exit` each read their first
   positional argument and ignore the rest.
   - `cd a b` goes to `a`, and `exit 1 2` exits with 1, each saying nothing, against the shell's

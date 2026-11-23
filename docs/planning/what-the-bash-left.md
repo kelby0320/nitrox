@@ -631,6 +631,14 @@ unchanged, so H.10 tests its bounds as they are.
   is what the tests and the spec use.
 - **`rebind_env` stays in `eval.rs`**, as the binding's slot is private there; `set_env_entry`
   moved to `environment.rs` with the assignment. `eval.rs` fell from 4,140 lines to 4,126.
+- **Its review (#464) made `$env` one environment, not a binding** (the maintainer's call,
+  2026-11-23): a `def` or a closure writing it left the prompt's `$env` behind, as a `cd` in a
+  `def` already did. `$env` now reads the record wherever it is read, `rebind_env` is gone, and no
+  binding takes its name, refused by the parser. `parse.rs`'s argument-list tests moved to a file
+  of their own to make room.
+- **And held the copy to more**: each name once and none empty, a variable to the type it had
+  whichever form assigns it, a Table refused as itself, and the whole of it encoded as a program's
+  setup message would be, so nothing nested or oversized reaches a stage.
 
 ### H.7 The kernel's guards, held
 
