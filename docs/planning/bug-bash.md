@@ -71,7 +71,7 @@ was demonstrated: each is read from the source, and is reproduced before it is f
     **Fix**: done by `7fcda1ff`, in PR #388's review: nothing moves until the pointer has gone 4
     pixels; `a_click_that_shakes_by_less_than_the_threshold_moves_nothing_and_snaps_nothing` holds
     it.
-- [ ] **nxsh-1** `userspace/nxsh/src/eval.rs:636` — assigning to an existing `$env` field changes
+- [x] **nxsh-1** `userspace/nxsh/src/eval.rs:636` — assigning to an existing `$env` field changes
   the `$env` binding alone: a spawned program still gets the old value, and the next `cd` reverts
   the binding.
   - Scenario, with `PWD=/` and `HOME=/home/a`: after `$env.HOME = "/x"`, `$env.HOME` reads `/x`,
@@ -87,7 +87,10 @@ was demonstrated: each is read from the source, and is reproduced before it is f
   - Demonstrated by PR #385's review, and again by a temporary host test: `/x` from `$env.HOME`,
     `HOME=/home/a` in the stage's environment, `/home/a` after a `cd`, and the new field refused.
     Logic. Medium. **Later.**
-- [ ] **nxsh-2** `userspace/nxsh/src/eval.rs:1268` — `cd` and `exit` each read their first
+  Fixed in `8fba9098`: an assignment rooted at `$env` writes a copy of the environment, replaced
+  whole or refused whole, a new field a new variable, `PWD` `cd`'s; fails without it: every test in
+  `nxsh/src/env_tests.rs` but the two below.
+- [x] **nxsh-2** `userspace/nxsh/src/eval.rs:1268` — `cd` and `exit` each read their first
   positional argument and ignore the rest.
   - `cd a b` goes to `a`, and `exit 1 2` exits with 1, each saying nothing, against the shell's
     fail-loud rule.
@@ -95,6 +98,8 @@ was demonstrated: each is read from the source, and is reproduced before it is f
     does `exit`'s check (`:1293-1318`).
   - Demonstrated by a temporary host test: `cd /a /b` left `PWD` at `/a`, and `exit 1 2` exited
     with 1, neither with an error. Logic. Low. **Later.**
+  Fixed in `aa0a9b18`: both take their argument through `builtins::one_or_none`, a second refused
+  and a flag named; fails without it: `cd_and_exit_take_one_argument_or_none`.
 
 ### Found on PR #385's CI — main at 226a54f6, 2026-10-19
 

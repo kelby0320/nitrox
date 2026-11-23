@@ -38972,3 +38972,19 @@ H.3 merged, #462. H.4 on `pre-phase-7/h4-index-and-eject`.
   - **A media session closes once it has answered its request**, as its comment and the spec said
     it was held for one. The eject moved out of storage-service's `main.rs`, which fell to 1,107
     lines.
+
+## 2026-11-23 — Before Phase 7: H.6, the shell's environment
+
+H.4 merged, #463. H.6 on `pre-phase-7/h6-shell-env`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.6 plans it.
+
+- **An assignment to `$env` writes the environment** (nxsh-1, the maintainer's call of
+  2026-11-19). It changed the binding alone, so a program, `cd` and `~` read the old record and the
+  next `cd` put the binding back. Now an assignment rooted at `$env`, a field, a name index or the
+  whole record, writes a copy, which replaces the environment whole or is refused whole. A field it
+  lacks is a new variable. `shell-language.md` v1.5 says so, and `$args` stays unassignable.
+- **The copy is judged by what a program can be handed**, not as a record of strings as the plan
+  had it: `PATH` is a List in every login. It is refused when it is not a record, moves `PWD`,
+  which stays `cd`'s, holds a value its field's type does not fit or a null, or a `HOME` that is not
+  a String.
+- **`cd` and `exit` take one argument, or none** (nxsh-2): a second is refused, and a flag named.
