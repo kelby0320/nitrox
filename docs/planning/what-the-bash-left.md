@@ -575,6 +575,13 @@ at any load.
   directory" are `profile_server::index`'s. The release gates' boots show the last:
   `/applications` and `/manual` are each built once, every package without one counted read.
 - **`boot-probe`'s storage admin test opens a second media session** for its second eject.
+- **Its review (#463) narrowed when a view not kept is built again**: at a listing's first page and
+  for a name it lacks, which is `WouldBlock` while a package that may hold it has not read. Each
+  later page reads the view its listing began with. The package's read moved into the library.
+- **And found libfsserver answering `NotFound` for a directory whose walk lost a read**: it fell
+  through to the file path, where a directory is `NotFound`, which the profile server takes for
+  "no such directory". Only a walk that finds no directory falls through now; any other failure is
+  the answer.
 
 ### H.5 Folded into H.4
 

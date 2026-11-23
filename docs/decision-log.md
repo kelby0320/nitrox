@@ -38963,7 +38963,12 @@ H.3 merged, #462. H.4 on `pre-phase-7/h4-index-and-eject`.
 - **What was wrong at any load is fixed.**
   - **The profile server keeps a projection's index only once every package read whole.** A
     package refused while the root filesystem's table was full had its programs unlisted and
-    unresolved until a restart. A package with no such directory is read whole.
+    unresolved until a restart. A package with no such directory is read whole. One not kept is
+    built again at a listing's first page and for a name it lacks, which is `WouldBlock` while a
+    package that may hold it has not read; a listing's later pages read the view it began with
+    (the #463 review).
+  - **A filesystem server answers a failed walk with the failure** (the #463 review): one that lost
+    a read fell through to the file path, where a directory is `NotFound`.
   - **A media session closes once it has answered its request**, as its comment and the spec said
     it was held for one. The eject moved out of storage-service's `main.rs`, which fell to 1,107
     lines.
