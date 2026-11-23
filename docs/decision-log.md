@@ -39013,3 +39013,21 @@ H.6 merged, #464. H.7 on `pre-phase-7/h7-kernel-guards`, as
 - **The #465 review held each intersection from both sides**: a lookup's rights, a server's
   memory reply's and a spawned child's handle's are each no more than what was asked and what was
   held, and a map no more writable or executable than its handle.
+
+## 2026-11-23 — Before Phase 7: H.8, the drivers' guards held
+
+H.7 merged, #465. H.8 on `pre-phase-7/h8-driver-guards`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.8 plans it: tests, and one fix.
+
+- **USB storage refuses a request past the 64 fragments a command carries** (drv-12), as AHCI's
+  backstop does. It issued the first 64 and completed the request whole: a short transfer read as
+  a full one. `dispatch_block_irp`'s own check, before either driver, is held beside it.
+- **Each guard on a device's or a disk's bytes is held by an input only it decides** (drv-9 to
+  drv-11, drv-13 to drv-15): a GPT's entry size and the entries it declares, each of a partition
+  window's four overflows, a USB descriptor shorter than its kind at each reader, a HID item cut
+  short after a valid mouse, PCI's multifunction header and its BAR masks, and a key array's slots
+  below its minimum. The surviving mutants passed because the broken code and the correct code
+  gave the same answer on the inputs the tests had.
+- **The tests of `pci`, the HID descriptor and the xHCI descriptors are files of their own**, and
+  `pci/mod.rs` leaves the size baseline.
+

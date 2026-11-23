@@ -1080,7 +1080,7 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   Fixed in `ea25abea`, as drv-d4: a second AHCI controller is declined before it is touched, shown
   by a boot with one behind a root port.
 
-- [ ] **drv-9** `kernel/src/drivers/partitions.rs:97` — Test gap in untrusted-input guards: the GPT
+- [x] **drv-9** `kernel/src/drivers/partitions.rs:97` — Test gap in untrusted-input guards: the GPT
   entry-size range check, the `.min(entries)` clamp on the array and the `.min(GPT_ENTRY_BLOCKS_MAX)`
   cap are each deletable with all 14 partitions tests passing. The `is_multiple_of` half of the size
   guard is also deletable with nothing failing. The existing test uses only entry size 96, which
@@ -1090,8 +1090,11 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   0xFFFFFFFF entries asks `try_reserve` for 512 GiB, so the disk reads as NoMemory instead of its
   first 128 entries. Demonstrated: temporary tests showed the first two (panic; left 6, right 5),
   restored by `git checkout`. The third is from reading. Lens: tests. Medium. **Later.**
+  Fixed in `6ddf8319`: entry sizes 64 and 192 unsupported, five entries of six read as five, and
+  `u32::MAX` declared read to the cap; fails without it: the range, the divisor, the declared clamp
+  and the cap each fail a test in `partitions::tests`.
 
-- [ ] **drv-10** `kernel/src/io/block.rs:526` — Test gap on the partition sandbox boundary:
+- [x] **drv-10** `kernel/src/io/block.rs:526` — Test gap on the partition sandbox boundary:
   `partition_rebase`'s three overflow guards (`block_count.checked_mul(sector_size)`,
   `offset.checked_add(length)` and the final `checked_add` of `start_lba*sector_size`) can each
   become `wrapping_*` with all 8 io::block tests passing. The one existing test uses small values.
@@ -1101,8 +1104,11 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   `checked_add` alone currently catches one wrap shape, so the guards cover each other and the pair
   is untested. Demonstrated by per-guard mutation: each left 8/8 passing. Lens: tests. Medium.
   **Later.**
+  Fixed in `4c816592`: each of `partition_rebase`'s four checked operations refused by a case of
+  its own, and a dispatch through a partition node at a wrapping offset; fails without it:
+  `each_overflow_partition_rebase_makes_is_refused_by_itself`, with each made wrapping.
 
-- [ ] **drv-11** `kernel/src/drivers/xhci/desc.rs:131` — Test gap: the `len >= 9` guard on
+- [x] **drv-11** `kernel/src/drivers/xhci/desc.rs:131` — Test gap: the `len >= 9` guard on
   interface descriptors in `interfaces()` is not pinned, and removing it passes all 19 desc tests.
   The `wTotalLength`-versus-`b.len()` bound, the `len<2` check in `descriptors()`, the
   `(b[0] as usize) < 9` check in `configuration_total` and the first-endpoint-wins check in
@@ -1112,8 +1118,12 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   That is a kernel panic from a USB device's bytes if the guard regresses. Demonstrated by a
   temporary test `probe_short_iface` with the guard removed, then restored. Lens: tests. Medium.
   **Later.**
+  Fixed in `fe175c4c`: a descriptor shorter than its kind at each reader and each arm, a length of
+  0 or 1 under a five-second bound, a configuration under nine bytes, and two interrupt-IN
+  endpoints; fails without it: each guard named here and the seven arms' each fail a test in
+  `xhci::desc::tests`.
 
-- [ ] **drv-12** `kernel/src/io/block.rs:127` — Test gap: `dispatch_block_irp`'s own `max_frags`
+- [x] **drv-12** `kernel/src/io/block.rs:127` — Test gap: `dispatch_block_irp`'s own `max_frags`
   check, which the code calls the PRDT-overflow protection, has no test. Changing `>` to
   `> max_frags + 1` passes all io::block tests, and only the `_into_frames` variant is tested.
   AHCI's backstop in `submit()` would still refuse, but the USB path only clamps
@@ -1121,8 +1131,12 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   whole. Deleting the storage.rs clamps (in `issue()` and `start()`) also fails no test. Only the
   boot-time self-test (drivers/mod.rs:147) exercises the limit. Demonstrated by mutation: io::block
   8 passed, storage 27 passed. Lens: tests. Low. **Later.**
+  Fixed in `abba85bf`: USB storage refuses a request past its 64 fragments rather than clamping
+  it, and the dispatch refuses one past its device's; fails without it:
+  `a_request_past_the_fragments_a_command_carries_is_refused` and
+  `a_block_request_off_its_devices_blocks_or_words_reaches_no_driver`.
 
-- [ ] **drv-13** `kernel/src/drivers/hid/descriptor.rs:222` — Test gap: several of `walk()`'s
+- [x] **drv-13** `kernel/src/drivers/hid/descriptor.rs:222` — Test gap: several of `walk()`'s
   untrusted-input rejections have no test. Each of these mutations passed all 14 descriptor tests:
   a truncated item at the end, a truncated long item, Pop with nothing pushed (`checked_sub` to
   `saturating_sub`), a Push past `STACK_MAX` (to modulo), an Input item in a seventeenth report ID,
@@ -1131,8 +1145,11 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   layout from a corrupt descriptor instead of falling back to the boot protocol: a second
   collection's fields would overwrite the first's, or a mouse's offsets would come from state a
   Pop never restored. Demonstrated by mutation. Lens: tests. Low. **Later.**
+  Fixed in `8e37c016`: each rejection after a valid mouse, a second collection holding a wheel the
+  first lacks, a second key array, and sixteen report IDs beside a seventeenth; fails without it:
+  each of the seven, and `id_slot`'s bound, fail a test in `hid::descriptor::tests`.
 
-- [ ] **drv-14** `kernel/src/pci/mod.rs:195` — Test gap: the multifunction mask in
+- [x] **drv-14** `kernel/src/pci/mod.rs:195` — Test gap: the multifunction mask in
   `decode_function` (`header_type_raw(cfg) & 0x7F == 0`) is not pinned, and replacing it with
   `== 0` passes all 28 pci tests. The I/O BAR address mask (`0xFFFF_FFFC` versus `..F0`) and the
   low-nibble mask on a 64-bit BAR's low dword are also unpinned. If the multifunction mask
@@ -1141,13 +1158,19 @@ Found 24, refuted by a boot 0, reported 16 (24 reports merged into 16 distinct d
   silently declines the controller, and only a boot on such hardware would show it. A dropped bit 2
   in the I/O mask would size 4- or 8-byte I/O BARs wrongly. Demonstrated by mutation. Lens: tests.
   Low. **Later.**
+  Fixed in `4cae7706`: a multifunction header's BARs, and 4- and 8-byte I/O BARs sized from
+  read-backs that keep their type bits; fails without it: the multifunction mask, the I/O masks
+  and each memory BAR's low mask fail a test in `pci::tests`.
 
-- [ ] **drv-15** `kernel/src/drivers/hid/keyboard.rs:132` — Test gap: the key array's
+- [x] **drv-15** `kernel/src/drivers/hid/keyboard.rs:132` — Test gap: the key array's
   `value >= a.logical_min` filter and the `FIRST_KEY` lower bound in `hold()` are not pinned.
   Replacing the filter with `true` passes all 14 keyboard tests, because every test layout uses
   `logical_min` 0. A report descriptor with `logical_min` 1 sends 0 in an empty slot. Without the
   filter `hold()` gets `first + (0 - 1)`, which can land on a real usage and press a phantom key on
   every report. Demonstrated by mutation. Lens: tests. Low. **Later.**
+  Fixed in `d3892959`: a slot below a logical minimum of 1, and slots naming usages 3 and 2, hold
+  nothing; fails without it: `a_slot_below_its_minimum_or_the_first_key_holds_nothing`, with the
+  filter or `FIRST_KEY` taken out.
 
 - [x] **drv-16** `kernel/src/power.rs:89` — `flush_every_disk` walks `/dev/blk/<n>` from 0 and
   stops at the first index `find_block_device` answers None. A departed device's served index is
