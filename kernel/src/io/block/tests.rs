@@ -81,13 +81,14 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let part = Ref::new(DeviceNode::try_new_partition(ResourceDescriptor::ZERO, geometry(100), b"p", window).unwrap());
     // An IRP through the partition node's backend; returns its status after
     // any refusal's completion has run.
-    let submit = |op: IrpOp, offset: u64| {
-        let mut irp = Irp::new_block(op, core::ptr::null(), offset, 512, IrpBuffer::NONE, core::ptr::null_mut(), 0);
+    let submit_of = |op: IrpOp, offset: u64, length: u64| {
+        let mut irp = Irp::new_block(op, core::ptr::null(), offset, length, IrpBuffer::NONE, core::ptr::null_mut(), 0);
         // SAFETY: the test's IRP, which outlives its dispatch.
         part.block_backend().unwrap().submit(unsafe { crate::io::block::InFlight::for_test(&mut irp) });
         crate::dpc::run_pending();
         irp.status
     };
+    let submit = |op: IrpOp, offset: u64| submit_of(op, offset, 512);
     let pending = crate::io::irp::IrpStatus::Pending as i32;
     assert_eq!(submit(IrpOp::Read, 512), pending, "forwarded, for the disk to complete");
     assert_eq!(seen.0.borrow().as_slice(), &[(IrpOp::Read as u32, 2049 * 512)], "rebased to the disk");
@@ -98,7 +99,14 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let flush = (IrpOp::Flush as u32, 0);
     assert_eq!(seen.0.borrow().last(), Some(&flush), "a flush is the disk's cache: not rebased");
     assert_eq!(submit(IrpOp::Read, 100 * 512), KError::InvalidArgument as i32, "past the window's end");
-    assert_eq!(submit(IrpOp::Read, u64::MAX - 511), KError::InvalidArgument as i32, "an offset that wraps");
+    // Its end wraps to 512, inside the window, and its start rebases below the top: only the end
+    // is past the window.
+    let below_top = u64::MAX - (1 << 20) - 511;
+    assert_eq!(
+        submit_of(IrpOp::Read, below_top, (1 << 20) + 1024),
+        KError::InvalidArgument as i32,
+        "an end that wraps"
+    );
 
     assert!(!retire_window(&disk), "a disk's node is no window");
     assert!(retire_window(&part));
