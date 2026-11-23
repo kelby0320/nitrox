@@ -346,7 +346,8 @@ fn sizes_64bit_prefetchable_mmio() {
     c.set(REG_HEADER, 0); // header type 0
     c.set(REG_BAR0, 0x8000_000C); // bits: mem(0)=0, type(2:1)=10, prefetch(3)=1
     c.set(REG_BAR0 + 4, 0x0000_0000);
-    c.set_sizing(REG_BAR0, 0xFFF0_0000);
+    // As hardware answers: the type bits kept below the size mask.
+    c.set_sizing(REG_BAR0, 0xFFF0_000C);
     c.set_sizing(REG_BAR0 + 4, 0xFFFF_FFFF);
     let bars = size_bars(&c);
     assert_eq!(bars[0].kind, BAR_MMIO);
@@ -354,6 +355,32 @@ fn sizes_64bit_prefetchable_mmio() {
     assert_eq!(bars[0].size, 0x10_0000);
     assert_eq!(bars[0].flags, BAR_FLAG_64 | BAR_FLAG_PREFETCH);
     assert_eq!(bars[1].kind, BAR_NONE);
+}
+
+/// **A function of a multifunction device has its BARs sized**: header type `0x80` is type 0.
+#[test]
+fn a_multifunction_devices_function_has_its_bars() {
+    let mut c = ahci_fake();
+    c.set(REG_HEADER, 0x0080_0000);
+    let bars = decode_function(&c, 0, 0, 0x1F, 2).bars;
+    assert_eq!((bars[5].kind, bars[5].base, bars[5].size), (BAR_MMIO, 0xFEBF_1000, 0x2000));
+}
+
+/// **I/O BARs of four and eight bytes, and a 32-bit prefetchable one**, each sized from a read-back
+/// that keeps its type bits, as hardware returns it.
+#[test]
+fn small_io_bars_and_a_prefetchable_one_size_from_a_hardware_read_back() {
+    let mut c = FakeCfg::new();
+    c.set(REG_BAR0, 0xC005);
+    c.set_sizing(REG_BAR0, 0xFFFF_FFFD);
+    c.set(REG_BAR0 + 4, 0xC009);
+    c.set_sizing(REG_BAR0 + 4, 0xFFFF_FFF9);
+    c.set(REG_BAR0 + 8, 0xFEBF_1008);
+    c.set_sizing(REG_BAR0 + 8, 0xFFFF_E008);
+    let bars = size_bars(&c);
+    assert_eq!((bars[0].kind, bars[0].base, bars[0].size), (BAR_IO, 0xC004, 4));
+    assert_eq!((bars[1].kind, bars[1].base, bars[1].size), (BAR_IO, 0xC008, 8));
+    assert_eq!((bars[2].base, bars[2].size, bars[2].flags), (0xFEBF_1000, 0x2000, BAR_FLAG_PREFETCH));
 }
 
 #[test]
