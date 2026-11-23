@@ -224,6 +224,29 @@ mod tests {
         }
     }
 
+    /// **An object made on a frame freed dirty reads zero.** Its frame is checked to be that one,
+    /// as every test shares the buddy: a test that took it first sends this one round again.
+    #[test]
+    fn an_object_on_a_frame_freed_dirty_reads_zero() {
+        use crate::mm::frame::Frame;
+        init_global_heap();
+        for _ in 0..64 {
+            let dirty = Frame::alloc().expect("a frame");
+            dirty.view().fill(0, PAGE_SIZE, 0xA5);
+            let at = dirty.phys();
+            drop(dirty);
+            let m = MemoryObject::try_new(PAGE_SIZE).unwrap();
+            if m.frames()[0].phys() != at {
+                continue;
+            }
+            let mut bytes = [1u8; PAGE_SIZE];
+            m.frames()[0].view().read(0, &mut bytes);
+            assert!(bytes.iter().all(|&b| b == 0), "the frame freed dirty, not zeroed");
+            return;
+        }
+        panic!("no object took the frame just freed");
+    }
+
     /// **An object frees each frame it owns once as it drops; one a frame short, those it took.**
     #[test]
     fn an_object_frees_its_frames_once_and_a_short_one_those_it_took() {
