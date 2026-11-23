@@ -221,3 +221,13 @@ fn a_chain_of_records_is_held_to_the_depth() {
     assert_eq!(decode(&buf, TypeTag::Record), Ok(chain(MAX_DEPTH)));
     assert_eq!(write_value(&mut Vec::new(), &chain(MAX_DEPTH + 1)), Err(WireError::TooLarge));
 }
+
+/// **A count is a claim, not an allocation**: a list and a schema claiming four billion items end
+/// at their bytes, where reserving the claim would abort the reader.
+#[test]
+fn a_count_of_four_billion_ends_at_the_bytes() {
+    let claim = 4_000_000_000u32.to_le_bytes();
+    assert_eq!(decode(&claim, TypeTag::List), Err(WireError::UnexpectedEof), "a list");
+    let schema = [&claim[..], &[1, 0, b'x', TypeTag::Int.to_u8(), 0]].concat();
+    assert_eq!(Schema::decode(&mut ByteSource::new(&schema)).map(|_| ()), Err(WireError::UnexpectedEof), "a schema");
+}
