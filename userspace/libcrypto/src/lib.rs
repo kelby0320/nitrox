@@ -48,4 +48,20 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(ct_eq(b"", b""));
     }
+
+    /// **Every bit of every byte counts**: 32-byte values differing by one bit anywhere compare
+    /// unequal, where comparing the last byte alone would accept most of them.
+    #[test]
+    fn values_differing_by_any_one_bit_compare_unequal() {
+        let a: [u8; 32] = core::array::from_fn(|i| i as u8 * 7);
+        for i in 0..32 {
+            for bit in 0..8 {
+                let mut b = a;
+                b[i] ^= 1 << bit;
+                assert!(!ct_eq(&a, &b), "byte {i}, bit {bit}");
+            }
+        }
+        let same = a;
+        assert!(ct_eq(&a, &same));
+    }
 }
