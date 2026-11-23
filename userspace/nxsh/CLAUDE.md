@@ -17,7 +17,8 @@ session namespace with empty syscaps. It replaced the throwaway `usersh`, which 
 
 - **`src/lib.rs` and friends — the language.** `lex`, `parse`, `ast`, `eval`, `value`,
   `ops`, `repl`, `regex`, `complete`, `timing` (`time`'s line, Phase 6 Part H.2), `paths`
-  (resolving and `~`, where a `use` reads, the chain of files loading), `exec` (what a file
+  (resolving and `~`, where a `use` reads, the chain of files loading), `environment` (the record
+  the shell hands every stage, and an assignment to `$env`, judged whole), `exec` (what a file
   named as a program runs as), `search` (Ctrl-R), `editor` (what each byte typed at the prompt
   writes and runs), `pipeline` (every handle and stage a pipeline makes, given back on any
   return, its syscalls behind `pipeline::Sys`), and the tables: `operators` (every operator: how

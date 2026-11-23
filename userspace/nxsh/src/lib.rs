@@ -14,6 +14,7 @@ pub mod ast;
 pub mod builtins;
 pub mod complete;
 pub mod editor;
+mod environment;
 pub mod eval;
 pub mod exec;
 pub mod help;
@@ -32,6 +33,8 @@ pub mod style;
 pub mod timing;
 pub mod value;
 
+#[cfg(test)]
+mod env_tests;
 #[cfg(test)]
 mod exec_tests;
 #[cfg(test)]

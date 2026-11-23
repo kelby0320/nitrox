@@ -1,9 +1,10 @@
 # What the bash left
 
 **Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
-2026-11-23, H.5 folded into it.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
-bug bash triaged **later**, which [`bug-bash.md`](bug-bash.md) records, checked against `main` and
-fixed, each with a test that fails without it.
+2026-11-23, H.5 folded into it; H.6 built 2026-11-23.** Part H of
+[`pre-phase-7.md`](pre-phase-7.md): the findings of the bug bash triaged **later**, which
+[`bug-bash.md`](bug-bash.md) records, checked against `main` and fixed, each with a test that fails
+without it.
 
 ## Why
 
@@ -619,6 +620,25 @@ unchanged, so H.10 tests its bounds as they are.
   with the directory unchanged, and `exit 1 2` is an error, not an exit.
 
 **Gates:** `test-interactive` and `check-terminal`.
+
+**Built 2026-11-23**, a commit a finding. Where it departs from the above:
+- **The copy is judged by whether a program can be handed it, not as "a record of strings"**: the
+  login's environment carries `PATH` as a List, so that rule would have refused every assignment.
+  A value must fit its field's type, as the encoder requires, and is not null; a new field takes
+  its value's type; `HOME`, when there is one, is a String, as `cd` and `~` read it; and `PWD` is as
+  it was.
+- **The whole-record form is `merge`**: the shell has no `update`, so `$env = ($env | merge {…})`
+  is what the tests and the spec use.
+- **`rebind_env` stays in `eval.rs`**, as the binding's slot is private there; `set_env_entry`
+  moved to `environment.rs` with the assignment. `eval.rs` fell from 4,140 lines to 4,126.
+- **Its review (#464) made `$env` one environment, not a binding** (the maintainer's call,
+  2026-11-23): a `def` or a closure writing it left the prompt's `$env` behind, as a `cd` in a
+  `def` already did. `$env` now reads the record wherever it is read, `rebind_env` is gone, and no
+  binding takes its name, refused by the parser. `parse.rs`'s argument-list tests moved to a file
+  of their own to make room.
+- **And held the copy to more**: each name once and none empty, a variable to the type it had
+  whichever form assigns it, a Table refused as itself, and the whole of it encoded as a program's
+  setup message would be, so nothing nested or oversized reaches a stage.
 
 ### H.7 The kernel's guards, held
 

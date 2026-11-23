@@ -1,6 +1,6 @@
 //! The builtins (§3): what acts on the shell itself, as no program can, and `help`.
 
-use crate::ast::{Call, CallKind};
+use crate::ast::{Arg, Call, CallKind, Expr};
 use alloc::format;
 use alloc::string::String;
 
@@ -69,5 +69,20 @@ pub fn not_a_stage(name: &str) -> String {
     match find(name) {
         Some(b) if b.heads => format!("`{name}` is a builtin: nothing is piped into it"),
         _ => format!("`{name}` is a builtin, which acts on the shell: it takes no pipe, and heads none"),
+    }
+}
+
+/// The one positional argument `cd` or `exit` takes, a `what`, or none: a second is refused, and a
+/// flag is named as one.
+pub fn one_or_none<'a>(c: &'a Call, what: &str) -> Result<Option<&'a Expr>, String> {
+    let name = &c.name;
+    match c.args.as_slice() {
+        [] => Ok(None),
+        [Arg::Positional(e)] => Ok(Some(e)),
+        args => Err(match args.iter().find(|a| !matches!(a, Arg::Positional(_))) {
+            Some(Arg::Flag(f, _)) => format!("`{name}` takes no flags, and `--{f}` is one"),
+            Some(Arg::ShortFlags(f)) => format!("`{name}` takes no flags, and `-{f}` is one"),
+            _ => format!("`{name}` takes one {what}, or none, and was given {}", args.len()),
+        }),
     }
 }

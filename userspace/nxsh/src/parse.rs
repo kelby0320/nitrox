@@ -33,6 +33,8 @@ use crate::exec::is_path_head;
 use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 use crate::operators::{self, Takes};
 
+mod names;
+
 /// How the operator called `name` reads its arguments, if it is one.
 fn takes(name: &str) -> Option<Takes> {
     operators::find(name).map(|o| o.takes)
@@ -186,15 +188,6 @@ impl<'a> Parser<'a> {
         self.depth -= 1;
     }
 
-    fn ident(&mut self, message: &'static str) -> Result<String> {
-        match self.bump()? {
-            Tok::Ident(s) => Ok(s),
-            // Keywords that are also ordinary field/parameter names in practice.
-            Tok::Match => Ok(String::from("match")),
-            _ => self.fail(message),
-        }
-    }
-
     pub fn script(&mut self) -> Result<Script> {
         let mut stmts = Vec::new();
         loop {
@@ -260,7 +253,7 @@ impl<'a> Parser<'a> {
             }
             Tok::For => {
                 self.bump()?;
-                let binding = self.ident("expected a loop variable")?;
+                let binding = self.binder("expected a loop variable")?;
                 self.expect(&Tok::In, "expected `in`")?;
                 // §9b restricts the iterable so a bare `|` cannot appear at its top level, else `{
                 // … }` is ambiguous between the loop body and a trailing closure. It names
@@ -351,7 +344,7 @@ impl<'a> Parser<'a> {
 
     fn binding(&mut self, kind: BindKind, public: bool) -> Result<Stmt> {
         self.bump()?; // let / mut / const
-        let name = self.ident("expected a binding name")?;
+        let name = self.binder("expected a binding name")?;
         let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
         self.expect(&Tok::Eq, "expected `=` in a binding")?;
         let value = self.expr()?;
@@ -365,7 +358,7 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         self.expect(&Tok::Catch, "expected `catch` after a `try` block")?;
         let catch_binding = if self.eat(&Tok::LParen)? {
-            let n = self.ident("expected an error binding")?;
+            let n = self.binder("expected an error binding")?;
             self.expect(&Tok::RParen, "expected `)`")?;
             Some(n)
         } else {
@@ -377,7 +370,7 @@ impl<'a> Parser<'a> {
 
     fn def_stmt(&mut self, public: bool) -> Result<Stmt> {
         self.bump()?; // def
-        let name = self.ident("expected a function name")?;
+        let name = self.binder("expected a function name")?;
         self.expect(&Tok::LParen, "expected `(` after a function name")?;
         let params = self.param_list()?;
         let ret = if self.eat(&Tok::Arrow)? { Some(self.type_expr()?) } else { None };
@@ -392,7 +385,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             let variadic = self.eat(&Tok::Ellipsis)?;
-            let name = self.ident("expected a parameter name")?;
+            let name = self.binder("expected a parameter name")?;
             let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
             let default = if self.eat(&Tok::Eq)? { Some(self.expr()?) } else { None };
             params.push(Param { name, ty, default, variadic });
@@ -417,7 +410,7 @@ impl<'a> Parser<'a> {
             _ => return self.fail("`use` takes a quoted path"),
         };
         if self.eat(&Tok::As)? {
-            let alias = self.ident("expected a module alias")?;
+            let alias = self.binder("expected a module alias")?;
             return Ok(Stmt::Use { path, names: None, alias: Some(alias), base: self.base.clone() });
         }
         if self.eat(&Tok::LBrace)? {
@@ -427,7 +420,7 @@ impl<'a> Parser<'a> {
                 if self.eat(&Tok::RBrace)? {
                     break;
                 }
-                names.push(self.ident("expected an imported name")?);
+                names.push(self.binder("expected an imported name")?);
                 self.skip_newlines()?;
                 if self.eat(&Tok::Comma)? {
                     continue;
@@ -793,7 +786,7 @@ impl<'a> Parser<'a> {
                     if self.eat(&Tok::Pipe)? {
                         break;
                     }
-                    let name = self.ident("expected a closure parameter")?;
+                    let name = self.binder("expected a closure parameter")?;
                     let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
                     ps.push(Param { name, ty, default: None, variadic: false });
                     if self.eat(&Tok::Comma)? {
@@ -1152,7 +1145,7 @@ impl<'a> Parser<'a> {
                     }
                     let name = self.ident("expected a field name in a record pattern")?;
                     let sub = if self.eat(&Tok::Colon)? { Some(self.pattern_single()?) } else { None };
-                    fields.push((name, sub));
+                    fields.push((if sub.is_none() { self.not_env(name)? } else { name }, sub));
                     if self.eat(&Tok::Comma)? {
                         continue;
                     }
@@ -1185,9 +1178,9 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat(&Tok::At)? {
                     let inner = self.pattern_single()?;
-                    return Ok(Pattern::Capture(name, Box::new(inner)));
+                    return Ok(Pattern::Capture(self.not_env(name)?, Box::new(inner)));
                 }
-                Ok(Pattern::Bind(name))
+                Ok(Pattern::Bind(self.not_env(name)?))
             }
             Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Minus | Tok::True | Tok::False | Tok::Null => {
                 let lit = self.pattern_literal()?;
@@ -1758,79 +1751,4 @@ for line in open ./log.txt {
 }
 
 #[cfg(test)]
-mod argument_list_tests {
-    use super::*;
-
-    fn script(src: &str) -> Script {
-        match parse_script(src) {
-            Ok(s) => s,
-            Err(e) => panic!("`{src}` failed at line {}: {}", e.line, e.message),
-        }
-    }
-
-    /// The argument of a call is an **expression**, however it begins: `age_plus_n(my_age(), 3)`
-    /// once failed with "expected `,` or `)`".
-    #[test]
-    fn a_call_can_be_an_argument() {
-        for src in [
-            "def my_age() { 41 }\ndef age_plus_n(a, n) { a + n }\nlet x = age_plus_n(my_age(), 3)",
-            "def add(a, b) { a + b }\nformat(\"add={}\", add(2, 3))",
-            "format(\"n={}\", count([1, 2, 3]))",
-            // A qualified name — §9h's `use … as` — which failed for a *different* reason.
-            "format(\"x={}\", utils.helper(1))",
-            "def f(a) { a }\nf(f(f(1)))",
-            "def g(a, b) { a }\ndef h() { 1 }\ng(h(), b: h())",
-            // The workaround this replaces, which must keep working.
-            "def add(a, b) { a + b }\nlet sum = add(2, 3)\nformat(\"add={}\", sum)",
-            "format(\"len={}\", (\"hello\" | count))",
-        ] {
-            script(src);
-        }
-    }
-
-    /// An argument starting with an identifier binds like any other: `format("{}", a + b * c)` once
-    /// folded flat into `(a + b) * c` through a hand-rolled copy of the tiers.
-    #[test]
-    fn an_argument_starting_with_a_name_binds_like_any_other() {
-        let by_name = one_arg("format(\"{}\", a + b * c)");
-        let by_literal = one_arg("format(\"{}\", 1 + 2 * 3)");
-        assert!(
-            matches!(by_name, Expr::Binary(BinOp::Add, _, _)),
-            "`a + b * c` as an argument parsed as {by_name:?}, not an addition"
-        );
-        assert!(
-            matches!(by_literal, Expr::Binary(BinOp::Add, _, _)),
-            "the literal control changed shape: {by_literal:?}"
-        );
-    }
-
-    /// Every tier below the top one, exercised from argument position.
-    #[test]
-    fn an_argument_reaches_every_tier() {
-        for (src, want) in [
-            ("format(\"{}\", a ?? b)", BinOp::Coalesce),
-            ("format(\"{}\", a || b && c)", BinOp::Or),
-            ("format(\"{}\", a == b)", BinOp::Eq),
-            ("format(\"{}\", a ++ b)", BinOp::Concat),
-            ("format(\"{}\", a - b)", BinOp::Sub),
-        ] {
-            match one_arg(src) {
-                Expr::Binary(op, _, _) => assert_eq!(op, want, "{src}"),
-                other => panic!("{src} parsed as {other:?}"),
-            }
-        }
-        // Postfix still binds tighter than any of them.
-        assert!(matches!(one_arg("format(\"{}\", a.b + c)"), Expr::Binary(BinOp::Add, _, _)));
-        assert!(matches!(one_arg("format(\"{}\", a[0] + c)"), Expr::Binary(BinOp::Add, _, _)));
-    }
-
-    /// The second positional argument of the one call in `src`.
-    fn one_arg(src: &str) -> Expr {
-        let s = script(src);
-        let Stmt::Expr(Expr::Call(c)) = &s.stmts[0] else { panic!("{src}: not a call") };
-        match &c.args[1] {
-            Arg::Positional(e) => e.clone(),
-            other => panic!("{src}: argument 1 is {other:?}"),
-        }
-    }
-}
+mod argument_list_tests;

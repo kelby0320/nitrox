@@ -140,8 +140,8 @@ pub struct Interp {
     scopes: Vec<Vec<(String, Slot)>>,
     /// The environment: a TSM1 `Record`, handed to every stage this shell spawns.
     ///
-    /// Also bound as `$env`, so it is an ordinary value: `$env.PWD` and `env.EDITOR = "vi"` need
-    /// nothing beyond field access (§6).
+    /// **`$env` reads it, wherever a name is read**, a `def` and a closure included: one
+    /// environment, never a binding to keep in step with it.
     pub(crate) env: Record,
     /// Hoisted `def` bindings, visible from inside any call.
     ///
@@ -200,7 +200,6 @@ impl Interp {
     /// Install the environment this shell was started with, and bind `$env`.
     pub fn set_env(&mut self, env: Record) {
         self.env = env;
-        self.rebind_env();
     }
 
     /// The working directory, from the environment's conventional `PWD` entry.
@@ -217,29 +216,6 @@ impl Interp {
     /// arguments are passed through as written; see [`Host::run`].
     pub(crate) fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
         crate::paths::resolve(self.cwd(), path).map_err(EvalError::new)
-    }
-
-    /// Re-publish `$env` after a change, so the binding and the record never disagree.
-    fn rebind_env(&mut self) {
-        let v = Val::Data(Value::Record(Arc::new(self.env.clone())));
-        if let Some(slot) = self.lookup_mut("$env") {
-            slot.val = v;
-            return;
-        }
-        let _ = self.bind("$env", v, true, false);
-    }
-
-    /// Set a conventional environment entry, replacing it if present.
-    fn set_env_entry(&mut self, name: &str, value: Value) {
-        match self.env.schema.fields.iter().position(|f| f.name == name) {
-            Some(i) => self.env.values[i] = value,
-            None => {
-                let tag = value.type_tag().unwrap_or(libstream::wire::TypeTag::Null);
-                self.env.schema = self.env.schema.clone().field(name, tag, TypeModifiers::NONE);
-                self.env.values.push(value);
-            }
-        }
-        self.rebind_env();
     }
 
     /// What a Tab press at the end of `line` should offer (§11c).
@@ -367,6 +343,9 @@ impl Interp {
 
     /// A binding, or failing that a hoisted function.
     pub(crate) fn lookup_any(&self, name: &str) -> Option<Val> {
+        if name == "$env" {
+            return Some(Val::Data(Value::Record(Arc::new(self.env.clone()))));
+        }
         if let Some(s) = self.lookup(name) {
             return Some(s.val.clone());
         }
@@ -636,6 +615,9 @@ impl Interp {
                 LValueStep::Field(f) => Step::Field(f.clone()),
                 LValueStep::Index(e) => Step::Index(self.index_of(e)?),
             });
+        }
+        if target.root == "$env" {
+            return self.assign_env(&steps, value);
         }
         let root = target.root.clone();
         let slot = self.lookup_mut(&root).ok_or_else(|| EvalError::new(alloc::format!("`{root}` is not bound")))?;
@@ -1277,8 +1259,8 @@ impl Interp {
     fn apply_builtin(&mut self, c: &Call) -> Result<Val> {
         match c.name.as_str() {
             "cd" => {
-                let target = match c.args.first() {
-                    Some(Arg::Positional(e)) => match e {
+                let target = match crate::builtins::one_or_none(c, "path").map_err(EvalError::new)? {
+                    Some(e) => match e {
                         Expr::Word(w) => self.expand_tilde(w)?.into_owned(),
                         Expr::Str(w) | Expr::Ident(w) => w.clone(),
                         other => self.eval(other)?.render(),
@@ -1290,7 +1272,6 @@ impl Interp {
                             return Err(EvalError::new("`cd` with no argument goes to HOME, and HOME is not set"));
                         }
                     },
-                    Some(_) => return Err(EvalError::new("`cd` takes one path")),
                 };
                 let resolved = self.resolve_path(&target)?;
                 // **Resolve first, set second.** The invariant is "PWD named something real when
@@ -1306,9 +1287,9 @@ impl Interp {
             // for (`exit 1` once missed that comparison). It travels the error channel because that
             // already crosses a `def`, a closure and a loop; `catch` re-raises it (see `exec_try`).
             "exit" => {
-                let status = match c.args.first() {
+                let status = match crate::builtins::one_or_none(c, "status").map_err(EvalError::new)? {
                     None => 0,
-                    Some(Arg::Positional(e)) => {
+                    Some(e) => {
                         // A builtin's argument is a **bareword**, so `exit 3` arrives as the text
                         // `"3"`; the `parse` scanner keeps one definition of what a number looks
                         // like.
@@ -1328,9 +1309,6 @@ impl Interp {
                                 )));
                             }
                         }
-                    }
-                    Some(_) => {
-                        return Err(EvalError::new("`exit` takes a single status argument"));
                     }
                 };
                 Err(EvalError::exiting(status))
@@ -1799,7 +1777,7 @@ impl Interp {
             if matches!(self.lookup_any(name), Some(Val::Func(_))) {
                 return Ok(None);
             }
-            if at_head && self.lookup(name).is_some() {
+            if at_head && self.lookup_any(name).is_some() {
                 return Ok(None);
             }
             return Ok(Some(StageSpec { program: name.clone(), argv: alloc::vec![name.clone()] }));
@@ -2002,12 +1980,12 @@ const UNDERSCORE: &str = "_";
 /// Guard against a runaway `while` or an absurd range; a backstop, not a resource policy.
 const MAX_ITERATIONS: u64 = 10_000_000;
 
-enum Step {
+pub(crate) enum Step {
     Field(String),
     Index(IndexKey),
 }
 
-enum IndexKey {
+pub(crate) enum IndexKey {
     Pos(i64),
     Name(String),
 }
@@ -2016,7 +1994,7 @@ enum IndexKey {
 ///
 /// Rebuilds rather than mutating in place: `Value`'s collections are `Arc`-shared, so another
 /// binding holding the same list must not see the write. `Arc::make_mut` copies when needed.
-fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
+pub(crate) fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
     let Some((first, rest)) = steps.split_first() else {
         *data = value;
         return Ok(());
