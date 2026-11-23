@@ -213,6 +213,27 @@ fn an_eager_resolve_replies_a_read_only_copy_of_the_file() {
     assert_eq!(mock::mappings(), 0, "the server's own view is gone");
 }
 
+/// **A walk that fails is the resolve's answer**, not read again as a file's, where a directory
+/// is `NotFound`; one that finds no directory goes on to the file.
+#[test]
+fn a_resolve_whose_walk_fails_is_answered_with_the_failure() {
+    let mut vol = Spy::default();
+    vol.file = true;
+    let (serve_end, kernel) = pair();
+    let dev = own::<Resource, ReadWrite>(mock::device());
+    let mut s = state(serve_end, dev.as_ref(), None);
+    for (walk, code) in [(FsError::Io, KError::IoError), (FsError::Corrupt, kerror(FsError::Corrupt))] {
+        vol.walk = Some(walk);
+        s.forwarded(&vol, &resolve(6, 0));
+        let (msg, brought) = take(&kernel);
+        assert_eq!(error_of(&msg), (6, OP_NS_RESOLVE, code.as_i32()), "{walk:?}");
+        assert!(brought.is_empty());
+    }
+    vol.walk = Some(FsError::NotFound);
+    s.forwarded(&vol, &resolve(7, 0));
+    assert!(!decode(take(&kernel).0.payload()).unwrap().is_error(), "the file, served");
+}
+
 /// A resolve whose object cannot be made is answered with why, and carries nothing.
 #[test]
 fn an_eager_resolve_whose_object_cannot_be_made_is_answered_out_of_memory() {
