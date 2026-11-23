@@ -37,17 +37,21 @@ account write a person asks it for; the root namespace can reach it too, the bou
 - **`src/lib.rs` — the credential logic (host-tested).** Pure, `#![no_std]`,
   no-`alloc`: verify `(username, password)` against a stored PBKDF2 verifier
   (`authenticate` / `serve_authenticate`), and decide what an administrator's request does
-  to the database (`serve_admin`: a reply, a new file to install, or a refusal). No
-  syscalls — the bin supplies the DB bytes, the buffers and a fresh salt. Host-tested
+  to the database (`serve_admin`: a reply, a new file to install, or a refusal). These make
+  no syscalls — the bin supplies the DB bytes, the buffers and a fresh salt. Host-tested
   against a DB built with the real KDF (`cargo xtask test` runs `-p auth-service --lib`).
+- **`src/install.rs` — writing the file, the library's one way to the kernel.** `install`
+  replaces `/system/users` atomically — `users.new`, created at its size, synced, renamed over
+  — through `libos`, so it is host-tested against `libos`'s model of the kernel, its `mock`
+  feature a dev-dependency.
 - **The file's format is `libusers`'**, not this crate's: parse, write a record, the name
   rules, the edits and the 4 KiB bound. The build's seeder and `account` write through it
   too, so none of the three can write a line the others read differently.
 - **`src/main.rs` — the server `[[bin]]`.** Bare-target `_start` + `libos` plumbing
   only: read `/system/users` into a fixed buffer, create a client channel, send
   `Meta::Ready` handing the supervisor the client endpoint, then serve; and for an
-  admin request, draw a salt from the kernel's generator and **install** a new file
-  atomically — `users.new`, synced, renamed over — before its copy in memory changes.
+  admin request, draw a salt from the kernel's generator and **install** the new file
+  before its copy in memory changes.
   **Alloc-free** — fixed buffers in `_start`'s frame, no `static mut` and no `#[global_allocator]`.
 
 ## Rules

@@ -23,30 +23,26 @@
 #![no_std]
 #![no_main]
 
+use auth_service::install::{PAGE, USERS, install};
 use auth_service::{Admin, serve_admin, serve_authenticate};
 use libkern::{CTRL_OP_SHUTDOWN, KError, MAX_WAIT_HANDLES, Rights, scrub};
 use libos::boot::Start;
 use libos::control::{self, Control};
 use libos::log::{self, Line};
 use libos::{
-    Carried, Channel, Deadline, File, Handle, MapRead, MapReadWrite, Msg, Namespace, NsReadOnly, Only, WaitSet,
-    block_on, entropy, fs, time,
+    Carried, Channel, Deadline, File, Handle, MapRead, Msg, Namespace, NsReadOnly, Only, WaitSet, block_on, entropy,
+    time,
 };
 use librsproto::auth::{
     OP_AUTH_ADD, OP_AUTH_LIST, OP_AUTH_REMOVE, OP_AUTH_SET_PASSWORD, build_denied_reply, parse_account_request,
 };
-use librsproto::namespace::{RENAME_REPLACE, parse_resolve_request};
+use librsproto::namespace::parse_resolve_request;
 use librsproto::{OP_AUTHENTICATE, OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, RS_MAX_BODY, decode, server};
 
-/// One page; the map granularity for reading the user DB.
-const PAGE: usize = 4096;
 /// Largest user database we hold: one page, and `libusers`' bound, so no writer of the file can
 /// make one this server will not load.
 const DB_MAX: usize = libusers::MAX_FILE;
 const _: () = assert!(DB_MAX <= PAGE);
-/// The file, and the name a new copy is written under before it is renamed over it.
-const USERS: &str = "/system/users";
-const USERS_NEW: &str = "/system/users.new";
 
 /// How many clients may hold an auth session at once.
 ///
@@ -368,38 +364,6 @@ fn refuse_admin(ch: &Endpoint, op: u16, request_id: u64, name: &[u8], err: KErro
 fn fresh_salt(root: &Handle<Namespace, NsReadOnly>) -> Option<[u8; libusers::SALT_LEN]> {
     let mut salt = [0u8; libusers::SALT_LEN];
     entropy::fill(root, &mut salt).ok().map(|()| salt)
-}
-
-/// **Replace `/system/users` with `bytes`, atomically.** A leftover `users.new`, from a write that
-/// died, is cut to nothing; the new copy is created at its size, written through a mapping,
-/// unmapped, synced, and then renamed over the file. A crash before the rename leaves the old file
-/// as it was, and the rename is the filesystem's one operation. `Err` names the step that failed.
-fn install(ns: &Handle<Namespace, NsReadOnly>, bytes: &[u8]) -> Result<(), &'static [u8]> {
-    let rights = Rights::MAP_READ | Rights::MAP_WRITE;
-    // A leftover, cut to nothing. Absent is the usual case, and not an error.
-    let _: libos::Result<Handle<File, MapReadWrite>> = block_on(fs::truncate(ns, USERS_NEW, 0, rights));
-    let made: libos::Result<Handle<File, MapReadWrite>> =
-        block_on(fs::create(ns, USERS_NEW, bytes.len() as u64, rights));
-    let Ok(file) = made else {
-        return Err(b"users.new could not be created");
-    };
-    if !bytes.is_empty() {
-        let Ok(mut mapping) = file.map(PAGE) else {
-            return Err(b"users.new could not be mapped");
-        };
-        // The file is at most a page (DB_MAX <= PAGE). Unmapped before the sync, as `libfs` does: a
-        // write-back that begins with a writable mapping cannot call the file clean.
-        if mapping.write_from(0, bytes).is_err() {
-            return Err(b"users.new could not be mapped");
-        }
-    }
-    let synced = block_on(fs::flush(&file));
-    drop(file);
-    if synced.is_err() {
-        return Err(b"users.new could not be written back");
-    }
-    block_on(fs::rename(ns, USERS_NEW, USERS, RENAME_REPLACE))
-        .map_err(|_| &b"users.new could not be renamed over users"[..])
 }
 
 /// Bootstrap registers: `rdi` = notification channel (unused), `rsi` = the inherited
