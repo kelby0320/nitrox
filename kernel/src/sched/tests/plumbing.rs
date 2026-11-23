@@ -445,7 +445,7 @@ fn the_reap_closes_the_handles_of_an_ended_process_only() {
     use crate::libkern::Rights;
     use crate::object::Timer;
     const ENDED: u32 = 4490;
-    const LIVE: u32 = 4491;
+    const LIVE: u32 = 4493;
     init_global_heap();
     global::init_for_tests();
     let install = |pid| global::get().install(pid, Timer::try_new().unwrap().erase(), Rights::empty()).ok().unwrap();
