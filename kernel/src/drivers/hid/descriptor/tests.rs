@@ -324,8 +324,7 @@ fn a_corrupt_item_after_a_mouse_gives_no_layout() {
     assert!(mouse_layout(&mouse_then(&four)).is_some(), "four pushes and four pops");
 }
 
-/// **The first mouse collection is the layout's**: a second's fields are not read, even one the
-/// first lacks.
+/// **The first mouse collection is the layout's**: a second's is not read, even a field it lacks.
 #[test]
 fn a_second_mouse_collection_is_not_read() {
     let mut no_wheel = QEMU_MOUSE;
@@ -350,8 +349,7 @@ fn a_second_key_array_refuses_the_keyboard() {
     assert_eq!(keyboard_layout(&two), None);
 }
 
-/// **Sixteen report IDs are tracked, and an input in a seventeenth ends the walk**: one past would
-/// index past the slots.
+/// **Sixteen report IDs are read, and an input in a seventeenth ends the walk.**
 #[test]
 fn sixteen_report_ids_and_a_seventeenth() {
     #[rustfmt::skip]

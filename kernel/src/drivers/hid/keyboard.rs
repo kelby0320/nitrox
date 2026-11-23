@@ -512,9 +512,8 @@ mod tests {
         assert_eq!(run_all(&layout, &mut held, &[0, 0, 2, 0]), Some(vec![release(30), press(48), SYN]));
     }
 
-    /// **Below its minimum, or below the first key, a slot holds nothing**: with the first usage at
-    /// 0x05 an empty slot's 0 would be `a`, and usages 3 and 2 are no keys though a slot names them.
-    /// Read as `Held`, since a usage that maps no key shows in no event.
+    /// **Below its minimum, or the first key, a slot holds nothing**: from 0x05 an empty slot's 0
+    /// would be `a`. Read as `Held`, since a usage that maps no key shows in no event.
     #[test]
     fn a_slot_below_its_minimum_or_the_first_key_holds_nothing() {
         let array = |first, logical_min| Layout {

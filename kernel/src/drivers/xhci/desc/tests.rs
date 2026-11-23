@@ -417,7 +417,7 @@ fn a_descriptor_shorter_than_its_kind_is_passed_over() {
     assert_eq!(storage_interface(&config(&[&STORAGE_IF, &BULK_IN, &[2, 0x30]])), None, "a companion for storage");
 }
 
-/// **A descriptor of no length, or one byte, ends the walk**: read as one, its kind is past its end.
+/// **A descriptor of no length, or one byte, ends the walk**: as one, its kind is past its end.
 #[test]
 fn a_descriptor_of_no_length_or_one_byte_ends_the_walk() {
     for len in [0u8, 1] {
