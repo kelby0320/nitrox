@@ -1,11 +1,11 @@
-# Nitrox: Shell Design Notes (v1.4)
+# Nitrox: Shell Design Notes (v1.5)
 
 ## Status
 
 **Implemented through Milestone 4** (2026-08-04) — `userspace/nxsh`; `time` since Phase 6 Part H.2
 (2026-10-08), §3; v1.3's paths, `~`, running a file by its path and `$args` since pre-Phase-7
 Part C.1 (2026-10-19), and its line editing (§11c-1) since Part C.2 (2026-10-19); v1.4's `help`
-since Part G.4 (2026-11-18). This is the language reference: grammar, operators and semantics. Sections
+since Part G.4 (2026-11-18); v1.5's `$env` assignment since Part H.6 (2026-11-23). This is the language reference: grammar, operators and semantics. Sections
 describing `form` and the display integration are **not built** and are tracked in
 [`display-arm-plan.md`](../planning/display-arm-plan.md).
 
@@ -18,6 +18,15 @@ Companion document: `docs/architecture/ui-composition-model.md` (windows/widgets
 window-to-window composition) — graduated to `docs/architecture/` with Milestone 8, upstream of
 this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
+
+### Changes in v1.5 (2026-11-23, `$env` written through)
+
+- **§9d — an assignment to `$env` writes the environment**: what each program gets, and what `cd`
+  and `~` read. A field the environment lacks is a new variable. `PWD` stays `cd`'s to change.
+  Until v1.5 `$env` could not be assigned, which the shell did not hold: an assignment changed the
+  binding alone, and the next `cd` put it back.
+- **§3 — `cd` and `exit` take one argument, or none**: a second is refused, and a flag is named as
+  one. Each read its first and ignored the rest.
 
 ### Changes in v1.4 (2026-11-18, the operators' table and `help`)
 
@@ -340,7 +349,7 @@ for scripts that want it.
   empty script, and does nothing. `use` (§9h) is how a file is loaded into this shell instead.
 - **A script's arguments are `$args`** (v1.3), a `List<String>`. `nxsh SCRIPT ARG…` and `nxsh -c
   SOURCE ARG…` bind what follows the script or the source; at the prompt it is empty. It is bound
-  by the shell, like `$env`, and cannot be assigned.
+  by the shell and cannot be assigned; `$env`, the environment, can (§9d).
 
 ## 4. I/O: `save` / `open` replace redirection
 
@@ -972,6 +981,16 @@ sugar, `row` and anything else sharing its underlying `Arc<Table>` are unaffecte
 through a *different* `mut` binding, since nothing is actually mutated — only `mut`-declared
 bindings, never `let`, ever get repointed. `lvalue` mutation only legal when the *root* identifier
 was declared `mut`; index out-of-range is a fail-loud error, consistent with everywhere else.
+
+**`$env` is the environment, and an assignment to it writes the environment** (v1.5). One rooted
+at `$env`, a field (`$env.EDITOR = "nxedit"`), a name index or the whole record
+(`$env = ($env | merge {LANG: "C"})`), is applied to a copy. The copy replaces the environment
+whole, or is refused whole: every program a pipeline starts after it gets it, and `cd` and `~`
+read it. A field the environment lacks is a new variable. It is refused when the copy:
+- is not a Record;
+- moves or removes `PWD`, which is `cd`'s to change, as `cd` goes only to a directory that exists;
+- holds a value its field's type does not fit (`PATH` is a `List`), or a null;
+- holds a `HOME` that is not a String, as `cd` and `~` read it as a path.
 
 Nice validation this surfaces rather than a new decision: it's *why* capture-by-value closures
 (§5a) are cheap and not just correct — "by value" is an `Arc` clone (O(1) refcount bump), not a

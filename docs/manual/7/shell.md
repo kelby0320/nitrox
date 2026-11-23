@@ -205,7 +205,8 @@ nxsh: `LIMIT` is a const and cannot be rebound in the same scope
 ```
 
 The environment is a record, `$env`: `$env.PWD` is the working directory, and `$env.HOME` your
-home. `cd` changes `$env.PWD`, and only to somewhere that exists. At the prompt, `$last` is the
+home. `cd` changes `$env.PWD`, and only to somewhere that exists. An assignment changes the rest,
+for every program run after it: `$env.EDITOR = "nxedit"` adds a variable. At the prompt, `$last` is the
 last line that succeeded: `$last.value` what it computed, and `$last.status` how the stages of its
 pipelines ended, null when it ran none. A failed line's stages are `e.stages`, in a `catch`.
 

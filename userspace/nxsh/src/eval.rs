@@ -220,26 +220,13 @@ impl Interp {
     }
 
     /// Re-publish `$env` after a change, so the binding and the record never disagree.
-    fn rebind_env(&mut self) {
+    pub(crate) fn rebind_env(&mut self) {
         let v = Val::Data(Value::Record(Arc::new(self.env.clone())));
         if let Some(slot) = self.lookup_mut("$env") {
             slot.val = v;
             return;
         }
         let _ = self.bind("$env", v, true, false);
-    }
-
-    /// Set a conventional environment entry, replacing it if present.
-    fn set_env_entry(&mut self, name: &str, value: Value) {
-        match self.env.schema.fields.iter().position(|f| f.name == name) {
-            Some(i) => self.env.values[i] = value,
-            None => {
-                let tag = value.type_tag().unwrap_or(libstream::wire::TypeTag::Null);
-                self.env.schema = self.env.schema.clone().field(name, tag, TypeModifiers::NONE);
-                self.env.values.push(value);
-            }
-        }
-        self.rebind_env();
     }
 
     /// What a Tab press at the end of `line` should offer (§11c).
@@ -636,6 +623,9 @@ impl Interp {
                 LValueStep::Field(f) => Step::Field(f.clone()),
                 LValueStep::Index(e) => Step::Index(self.index_of(e)?),
             });
+        }
+        if target.root == "$env" {
+            return self.assign_env(&steps, value);
         }
         let root = target.root.clone();
         let slot = self.lookup_mut(&root).ok_or_else(|| EvalError::new(alloc::format!("`{root}` is not bound")))?;
@@ -1998,12 +1988,12 @@ const UNDERSCORE: &str = "_";
 /// Guard against a runaway `while` or an absurd range; a backstop, not a resource policy.
 const MAX_ITERATIONS: u64 = 10_000_000;
 
-enum Step {
+pub(crate) enum Step {
     Field(String),
     Index(IndexKey),
 }
 
-enum IndexKey {
+pub(crate) enum IndexKey {
     Pos(i64),
     Name(String),
 }
@@ -2012,7 +2002,7 @@ enum IndexKey {
 ///
 /// Rebuilds rather than mutating in place: `Value`'s collections are `Arc`-shared, so another
 /// binding holding the same list must not see the write. `Arc::make_mut` copies when needed.
-fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
+pub(crate) fn set_path(data: &mut Value, steps: &[Step], value: Value) -> Result<()> {
     let Some((first, rest)) = steps.split_first() else {
         *data = value;
         return Ok(());

@@ -14,6 +14,7 @@ pub mod ast;
 pub mod builtins;
 pub mod complete;
 pub mod editor;
+mod environment;
 pub mod eval;
 pub mod exec;
 pub mod help;
