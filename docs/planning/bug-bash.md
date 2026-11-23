@@ -306,7 +306,7 @@ Found 24, refuted by a boot 0, reported 13.
   Moved to Part I on 2026-10-27 with the safety survey's kobj-d4, which repeats it.
   Fixed in `39e2a5c9`, as kobj-d4: the parent's handle is allocated before the child runs.
   Structural; the gates pass.
-- [ ] **kobj-12** `kernel/src/handle/table.rs:588` — No test hands `duplicate()` a `new_rights`
+- [x] **kobj-12** `kernel/src/handle/table.rs:588` — No test hands `duplicate()` a `new_rights`
   with bits the source lacks, so replacing `info.rights & new_rights` with `new_rights` passes
   the whole kernel host suite. This is a test gap, not a defect in code that works, and it is
   listed because the break would be rights amplification on `sys_handle_duplicate` (a holder of
@@ -314,7 +314,7 @@ Found 24, refuted by a boot 0, reported 13.
   within a type). Demonstrated: the one-line break left 986 passed, 0 failed. The restrict twin
   is caught by `restrict_on_cannot_amplify`. tests. The reviewer rated it high; as a test gap,
   low. **Later.**
-- [ ] **kobj-13** `kernel/src/syscall/table.rs:1163` — Several syscall-level guards have no host
+- [x] **kobj-13** `kernel/src/syscall/table.rs:1163` — Several syscall-level guards have no host
   coverage; these are test gaps, not defects. Removing `require_syscap(BIND_NAMESPACE)` in
   `sys_ns_bind`, `direct_bindable(rights)?`, `Rights::LOOKUP` on `sys_ns_derive`, the
   direct-bind `!base.is_empty()` rejection, or `requested & binding_rights` in `install_for`
@@ -324,6 +324,11 @@ Found 24, refuted by a boot 0, reported 13.
   re-run, and no per-break boot controls were run. A boot probe for bind-needs-TRANSFER exists
   and passes. Boot runs with each break would show which guards the QEMU probes catch. tests.
   Low. **Later.**
+  Fixed in `cd97561a`: a duplicate asked for a right its source lacks does not get it; fails without
+  it: `duplicate_cannot_amplify`.
+  Fixed in `1bfdbd2c`: each guard held where its syscall calls it, run as a user process with
+  chosen syscaps (`syscall/table/tests/authority.rs`'s `as_user`); fails without it: each of the
+  eleven taken out in turn fails its test there.
 
 What held up: Deleting the owner-pid, generation or rights-subset check in handle lookup fails
 several tests. Close and restrict owner and generation checks fail named tests, and so do
@@ -523,7 +528,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   `a_segment_is_writable_or_executable_only_as_its_flags_say`, four of its five mutations. The
   fifth, the loader's bound loosened by a page, fails nothing: the address-space layer refuses the
   same segment with the same error, and is now the bound.
-- [ ] **kmem-14** `kernel/src/object/memory_object.rs:71` — Nothing tests that fresh MemoryObject
+- [x] **kmem-14** `kernel/src/object/memory_object.rs:71` — Nothing tests that fresh MemoryObject
   or DmaBuffer frames are zeroed. A regression removing the zeroing in `sys_memory_create` would
   hand userspace stale kernel or other-process pages, a cross-process information leak. The host
   test heap probably hands out already-zero memory, so the zeroing is never observable.
@@ -555,7 +560,7 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   trust-boundary. Low. **Fix.**
   Fixed in `655de0b6`; fails without it:
   `a_page_that_would_lie_past_the_top_of_the_device_ends_a_run`, each sum unchecked in turn.
-- [ ] **kmem-17** `kernel/src/mm/vmm.rs:413` — `find_free_range`'s upper bound (`MMAP_MAX`, which
+- [x] **kmem-17** `kernel/src/mm/vmm.rs:413` — `find_free_range`'s upper bound (`MMAP_MAX`, which
   keeps hint=0 mappings out of the stack guard gap) and its exact-fit boundary have no test. If
   the bound regressed, `sys_memory_map(hint=0)` could return ranges in the guard gap and a stack
   overrun would land in mapped memory. An off-by-one in the exact-fit comparison would skip a gap
@@ -586,6 +591,12 @@ Found 29, refuted by a boot 0, reported 19 (duplicates merged).
   unreachable!`, so removing the reservation fails five `file_object` tests and one of
   `syscall::table`'s, found so in Part H's detail pass. A refused reservation stays untested:
   nothing on the host makes one fail.
+  Fixed in `255b9a01`: an object made on a frame freed dirty, held to that frame by its address,
+  reads zero; fails without it: `an_object_on_a_frame_freed_dirty_reads_zero`. The rollback and the
+  DMA buffer's order are `Frame`'s and `FrameBlock`'s drops since Part J.
+  Fixed in `d4798586`: the whole window taken, a page more refused, an exact-fit hole found; fails
+  without it: `find_free_range_holds_its_window_and_takes_an_exact_hole`. The in-loop bound forced
+  false is equivalent: the check after the loop refuses the same requests.
 
 What held up: user copies (`validate_user_range` with `checked_add` against `USER_VIRT_END`,
 zero-size and empty-slice cases, `lookup_recovery` matching only the two registered PCs, `clac` and
@@ -1368,7 +1379,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   removed. tests. Low. **Later.**
   Moved to Part I on 2026-10-27 with the safety survey's proto-d4, which repeats it.
   Fixed in `10bcbb11`, as the survey's proto-d4.
-- [ ] **proto-16** `kernel/src/rsproto.rs:408` — Several kernel codec guards are untested:
+- [x] **proto-16** `kernel/src/rsproto.rs:408` — Several kernel codec guards are untested:
   `forget_request`'s magic check, the u16::MAX suffix limit in `build_resolve_request`,
   `build_read_range_request` and `build_resolve_request_rename`, and the error-body minimum
   length in `parse_reply` and `parse_read_range_reply`. Without the suffix limit a suffix over
@@ -1395,6 +1406,9 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Low. **Fix.**
   Fixed in `20d88936`, with `sys_channel_send`'s mode likewise; fails without it:
   `a_file_size_or_rename_flags_past_what_the_wire_carries_are_refused`.
+  Fixed in `ec156e91`: error bodies of 0, 3 and 11 bytes `Malformed`, a forget without the magic
+  none, every builder at `u16::MAX` and one past; fails without it: each of the nine guards taken
+  out fails a test in `rsproto::tests`.
 
 What held up: all eight kernel `rsproto.rs` parsers (`parse_reply`, `parse_read_range_reply`,
 `reply_body`, `subnamespace_reply`, `file_blocks_reply_header`, `file_blocks_run`,
@@ -1822,7 +1836,7 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   Fixed in `fcc06ce8`; fails without it:
   `removing_an_entry_whose_replacement_is_smaller_than_its_parent_keeps_the_heap_ordered`.
 
-- [ ] **sched-10** `kernel/src/sched/timers.rs:50` — Test gap: nothing on the host exercises
+- [x] **sched-10** `kernel/src/sched/timers.rs:50` — Test gap: nothing on the host exercises
   `fire_expired_deadlines`, `fire_timer`, `timer_arm` or `wait_on`, and sched-1 and sched-7 sit in
   exactly this code. Six mutations each passed the 986 host tests: `wrapping_add` instead of
   `saturating_add` for the periodic next deadline; treating a deadline as expired early;
@@ -1837,6 +1851,9 @@ Found 17, refuted by a boot 0, reported 10 (17 raw findings; 7 merged as duplica
   On `main` at `3c6919a4` that mutation aborts the kernel's suite, by accident: J.15's `armed` test
   polls, and the poll falls through to a deadline with no slot promised. Part H's H.7 tests the
   poll itself.
+  Fixed in `f6db6b36`: a poll answers `TimedOut` at once and registers nothing, an object nothing
+  can wait on in its list making the poll path's absence a failed test, not an abort; fails without
+  it: `a_poll_answers_at_once_and_registers_nothing`.
 
 What held up: `sys_wait` registration and blocking share one SCHED hold, so no lost wakeup, and a
 partial registration is fully unwound. The `wait_try_wake` CAS plus `make_runnable`'s not-in-blocked

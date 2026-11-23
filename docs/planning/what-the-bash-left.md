@@ -1,7 +1,7 @@
 # What the bash left
 
 **Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
-2026-11-23, H.5 folded into it; H.6 built 2026-11-23.** Part H of
+2026-11-23, H.5 folded into it; H.6 and H.7 built 2026-11-23.** Part H of
 [`pre-phase-7.md`](pre-phase-7.md): the findings of the bug bash triaged **later**, which
 [`bug-bash.md`](bug-bash.md) records, checked against `main` and fixed, each with a test that fails
 without it.
@@ -677,6 +677,20 @@ Tests only, but one helper, in new test files, since `syscall/table.rs` and
   abort.
 - **The PID 4491 flake:** one of the two tests is renumbered, and a test that the kernel tests'
   PIDs are distinct holds the class.
+
+**Built 2026-11-23**, a commit a finding, every mutation each names failing a test. Where it
+departs from the above:
+- **kobj-12's duplicate does not refuse**: it intersects, so the test holds that the copy gets
+  none of the rights its source lacks.
+- **The spawn's syscaps are read from a test-only record**, `process::MADE_WITH`, the syscaps each
+  user process was made with: a host test cannot start the child, so the parent's handle to it is
+  refused and the child read as it was made. That is a second test-only helper beside `as_user`.
+- **sched-10's poll lists an object nothing can wait on**, beside a channel not ready: without the
+  poll path its registration fails and the poll answers `OutOfMemory`, a failed test, where a list
+  of waitable objects would block or abort.
+- **kmem-17's in-loop bound is an equivalent mutation**, as the pass found.
+- **The pid check scans the kernel's sources** for the form each test names its pid in, a `u32`
+  constant in the 4000s; plumbing's `LIVE` took 4493.
 
 ### H.8 The drivers' guards, held
 
