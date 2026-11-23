@@ -83,6 +83,21 @@ fn a_record_whose_hex_is_broken_verifies_nothing() {
     assert!(short.verifier().is_none(), "a verifier must be exactly 32 bytes");
 }
 
+/// **A field that does not fit its type is no field**: an odd count of salt digits is no salt, and
+/// a record with an iteration count past a `u32`, or with no home, is no record.
+#[test]
+fn a_field_that_does_not_fit_its_type_is_refused() {
+    let mut salt = [0u8; SALT_MAX];
+    assert_eq!(Record::parse(b"alice:010:2:00:/home/alice").unwrap().salt(&mut salt), None, "three digits");
+    assert_eq!(Record::parse(b"alice:0102:2:00:/home/alice").unwrap().salt(&mut salt), Some(2));
+    let iterations = |n: &str| Record::parse(format!("alice:0102:{n}:00:/home/alice").as_bytes()).map(|r| r.iterations);
+    assert_eq!(iterations("4294967295"), Some(u32::MAX));
+    assert_eq!(iterations("4294967296"), None);
+    assert_eq!(iterations("4294967297"), None, "not 1, a cost of one");
+    assert_eq!(iterations("4294967300"), None, "past it at the multiply");
+    assert!(Record::parse(b"alice:0102:2:00:").is_none(), "no home");
+}
+
 // --- the rules ---------------------------------------------------------------------------------
 
 #[test]
