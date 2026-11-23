@@ -337,7 +337,7 @@ impl Service {
     }
 
     /// Answer with a media session, which only ejects, so a session endpoint answers it.
-    /// `WouldBlock` with every one taken: each is held for a request, so a retry finds one.
+    /// `WouldBlock` with every one taken: each closes once its request is answered.
     fn open_media_session(&mut self, reply_to: &Chan, request_id: u64) {
         if self.media_sessions.len() >= MAX_MEDIA_SESSIONS {
             return fail(reply_to, OP_NS_RESOLVE, request_id, KError::WouldBlock);

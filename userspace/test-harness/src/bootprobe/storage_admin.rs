@@ -16,8 +16,8 @@ use libos::{Op, fs};
 ///    device, an unknown label. A session endpoint reaches no admin endpoint.
 /// 5. **A watch and a media session, opened through a session endpoint**: the watch is pinged by
 ///    the unmount and the remount, not by the refused unmount; the media session's `Eject` of the
-///    scratch disk (a RAM disk, not removable) is `NoAccess`, and the session then closes; a
-///    second's `Eject` of an unmounted name is `NotFound`; both leave the mount as it was.
+///    scratch disk (a RAM disk, not removable) is `NoAccess`, of an unmounted name `NotFound`,
+///    both leaving the mount as it was; and a session closes once it has answered, each refusal.
 /// 6. **`Reread`'s refusals**: the mounted scratch disk and the disk holding `init`'s root,
 ///    `WouldBlock`; an unmounted partition of the disk the machine started from, `NoAccess`; an
 ///    unknown name, `NotFound`. None pings the watch.
@@ -283,26 +283,30 @@ pub(super) fn storage_admin_test(root: Root<'_>) -> bool {
     }
 
     // 9. **A session's eject** of the scratch disk, a RAM disk: refused `NoAccess`, since an
-    //    internal disk is the `storage` grant's; a name nothing is mounted under, `NotFound`.
-    //    **A media session carries one request**: closed once answered, so the second has its own.
-    let eject = |media: &Handle<Channel, Only>, id: u64, name: &[u8]| {
-        if !rs_send(media, OP_STORAGE_EJECT, id, name, Carried::new()) {
-            return None;
+    //    internal disk is the `storage` grant's; a name nothing is mounted under, `NotFound`; a
+    //    request that is not `Eject`, `Unsupported`; a name not UTF-8, `InvalidArgument`. **A
+    //    media session carries one request**: closed once answered, whatever the answer.
+    let ask_on = |media: Handle<Channel, Only>, op: u16, id: u64, body: &[u8]| {
+        let m = rs_send(&media, op, id, body, Carried::new()).then(|| receive(&media, clock_ns() + 30_000_000_000));
+        (m.flatten(), exits::peer_gone_by(&media, clock_ns() + 5_000_000_000))
+    };
+    let asked: [(&[u8], u16, &[u8], KError); 4] = [
+        (b"an eject of the scratch disk", OP_STORAGE_EJECT, b"nitrox-scratch", KError::NoAccess),
+        (b"an eject of an unknown name", OP_STORAGE_EJECT, b"no-such-label", KError::NotFound),
+        (b"an InUse", OP_STORAGE_IN_USE, b"", KError::Unsupported),
+        (b"an eject of a name not UTF-8", OP_STORAGE_EJECT, b"\xff", KError::InvalidArgument),
+    ];
+    // The first on the session endpoint's media session, each after on one of its own.
+    let mut first = Some(media);
+    for (k, (what, op, body, err)) in asked.into_iter().enumerate() {
+        let Some(media) = first.take().or_else(|| lookup(root, "/svc/storage/info/media", chan).ok()) else {
+            return fail(b"no media session");
+        };
+        let (answer, closed) = ask_on(media, op, k as u64 + 1, body);
+        if !refused(&answer, err) || !closed {
+            Line::new().s(b"boot-probe: storage admin: on a media session, ").s(what).end();
+            return fail(b"a media session's request was not refused as it should be, or its session stayed open");
         }
-        let m = receive(media, clock_ns() + 30_000_000_000)?;
-        Some(m)
-    };
-    if !refused(&eject(&media, 1, b"nitrox-scratch"), KError::NoAccess) {
-        return fail(b"a session's eject of the scratch disk was not refused NoAccess");
-    }
-    if !exits::peer_gone_by(&media, clock_ns() + 5_000_000_000) {
-        return fail(b"a media session stayed open after its answer");
-    }
-    let Ok(media) = lookup::<Channel, Only, _>(root, "/svc/storage/info/media", chan) else {
-        return fail(b"no second media session");
-    };
-    if !refused(&eject(&media, 2, b"no-such-label"), KError::NotFound) {
-        return fail(b"a session's eject of an unknown name was not refused NotFound");
     }
     if !answered(&ask(OP_STORAGE_IN_USE, &[])) || pinged(0) {
         return fail(b"an eject refused pinged the watch");

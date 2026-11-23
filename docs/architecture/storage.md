@@ -331,7 +331,9 @@ counts. A real holder is still holding milliseconds later; that moment has passe
 session endpoint every session already holds, with no grant. Neither channel mounts anything.
 
 **A media session**, `/dev/storage/media` (`info/media`), carries one request: the service closes
-it once it has answered (pre-Phase-7 Part H.4), so a client that keeps its end holds no slot.
+it once it has answered (pre-Phase-7 Part H.4), so a client that keeps its end holds no slot past
+its answer. One resolved and never asked holds its slot until its client closes it
+(`TODO(server-fanout)`).
 It carries **`Eject`**, naming a mount by **the name it is mounted under** — the table's `mounted`
 column after `/storage/`, never its `label`, which two sticks can share and one can lack
 ([`rsproto-storage-ops.md`](../spec/rsproto-storage-ops.md)). **The drive goes whole** (PR #367
