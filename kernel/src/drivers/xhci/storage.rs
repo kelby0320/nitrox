@@ -457,6 +457,7 @@ impl Dev {
     /// after the last, which is why it never meets this.
     /// [`Dev::launch`] puts it in flight, given the endpoint returned here, whose event ends it.
     fn issue(&mut self, lun: u8, cdb: &[u8], len: u32, input: bool, frags: &[PhysFrag]) -> u8 {
+        debug_assert!(frags.len() <= MAX_FRAGS as usize, "the wrapper asks for more than the ring moves");
         self.tag = self.tag.wrapping_add(1);
         self.wrap.copy_in(0, &cbw(self.tag, len, input, lun, cdb));
         // A stale status must not read as this command's.
@@ -532,7 +533,7 @@ impl Dev {
     }
 
     fn command_for(&self, irp: InFlight, lun: u8) -> Result<IrpCmd, (InFlight, KError)> {
-        // **Refused, not clamped**: a command of its first 64 would complete as the whole request.
+        // **Refused, not clamped**: its wrapper would ask for more than a ring of 64 can move.
         if irp.frags().len() > MAX_FRAGS as usize {
             return Err((irp, KError::InvalidArgument));
         }

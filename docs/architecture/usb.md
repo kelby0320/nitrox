@@ -417,7 +417,8 @@ wrapper's event, when its signature, tag and status read and its residue is zero
 next. **A read whose data stage came up short fails, whatever its residue says**: a stick that sent
 less and answered that nothing was missing would leave the pages it did not fill to be read as the
 file, holding what they held before; the bulk-only residue is the stick's word, the short packet
-the controller's. One command moves at most 64 fragments, 256 KiB, the most any client submits.
+the controller's. One command moves at most 64 fragments, 256 KiB, the most any client submits;
+a request past them is refused `InvalidArgument` before anything goes on the rings.
 
 **Everything off that path is the hub thread's**, following bulk-only §6.7: status 1 read through
 `REQUEST SENSE` (an illegal request to `SYNCHRONIZE CACHE` is no cache to flush, and the flush
