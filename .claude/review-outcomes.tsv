@@ -983,3 +983,13 @@ date	pr	head	finding	lens	severity	verdict	outcome	commit	note
 2026-11-23	463	39dea473	9	rules-and-docs	optional	unverified	fixed	d1586dbd	every Entry field has a doc comment
 2026-11-23	463	39dea473	10	rules-and-docs+architecture	optional	demonstrated	fixed	59d7a02e	the reflowed paragraph wrapped at 100
 2026-11-23	463	39dea473	11	architecture	optional	demonstrated	fixed	59d7a02e	the spec's status line records the close, 2026-11-23, and OP_STORAGE_EJECT's doc says a media session carries one
+2026-11-23	464	b4939ea3	1	logic+error-paths+architecture	blocking	demonstrated	fixed	d1f5d779	maintainer's call: one environment; $env reads the record wherever a name is read, the binding and rebind_env gone, the parser refuses binding $env at every site; a_def_and_a_closure_write_the_one_environment fails with a binding-scoped read, no_binding_takes_the_environments_name with each site
+2026-11-23	464	b4939ea3	2	logic+error-paths+architecture	blocking	demonstrated	fixed	d1f5d779	judged encodes a SetupPayload with no argv: a 5,000-byte variable, a nested value retyped and a Table in a List refused; their rows and a_value_retyped_inside_a_variable_is_refused fail with the encode check gone
+2026-11-23	464	b4939ea3	3	logic+error-paths	worth-fixing	demonstrated	fixed	d1f5d779	a variable keeps the type it had, whichever form assigns it; the merge and literal PATH rows fail with the candidate's own type
+2026-11-23	464	b4939ea3	4	logic+architecture	optional	demonstrated	fixed	d1f5d779	a Table is refused as a Table; the row fails with the arm gone
+2026-11-23	464	b4939ea3	5	logic	optional	demonstrated	fixed	d1f5d779	a variable named twice is refused; the duplicate-PWD row fails with the check gone
+2026-11-23	464	b4939ea3	6	tests	optional	demonstrated	fixed	d1f5d779	an empty name refused, the row failing without it; a name with a space or = pinned as taken (the environment is a record, not key=value)
+2026-11-23	464	b4939ea3	7	tests	optional	demonstrated	declined		a List variable takes a List of anything, and nothing reads PATH's items (§9h refuses PATH search); pinned by any_name_but_an_empty_one_and_any_list_are_taken
+2026-11-23	464	b4939ea3	8	tests	optional	unverified	refuted		the refusal table already had $env.HOME.x = 1, set_path's refusal; writing the copy before judging it and swallowing set_path's refusal each fail the refusal test
+2026-11-23	464	b4939ea3	9	rules-and-docs	optional	demonstrated	fixed	aaea00e3	nxsh's CLAUDE.md names the environment module
+2026-11-23	464	b4939ea3	10	rules-and-docs	optional	demonstrated	fixed	aaea00e3	bug-bash.md's nxsh-1 note names its five tests and the review's
