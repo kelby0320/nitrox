@@ -72,7 +72,8 @@ A profile server is a **userspace resource server** (like the fs-server):
 
 ### The index
 
-Resolve and readdir are served from **one** merged view, built lazily on first use and kept.
+Resolve and readdir are served from **one** merged view, built lazily on first use and kept
+**once every package has read whole**.
 
 Caching it is sound *by construction*, not by invalidation: a store path is
 content-addressed, so `/store/<hash>-coreutils-0.1.0/bin/` cannot change contents — different
@@ -87,7 +88,12 @@ original probe, which cost one `sys_ns_lookup` per package per program spawn —
 two packages, fifty round trips at fifty.
 
 A package whose `bin/` cannot be read is skipped rather than fatal: a profile naming one
-broken package should lose that package, not all of `/bin`.
+broken package should lose that package, not all of `/bin`. **The view is then not kept**, and
+the next lookup or listing builds it again: a refusal may pass, as one does while the root
+filesystem's table of directory sessions is full, and a view kept without the package would leave
+its programs unlisted and unresolved until a restart. A package with no such directory at all
+(`NotFound`, as most have no `applications/`) is read whole, with nothing in it
+(pre-Phase-7 Part H.4, `profile_server::index`).
 
 ### How a lookup resolves — resolve-by-probe
 
