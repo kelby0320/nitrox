@@ -1279,7 +1279,7 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Fixed in `662163e6`: the parsers read through a bounded `Reader`, and
   `parsers_survive_truncation_and_corruption` feeds each every prefix and corruption, found so in
   Part H's detail pass; each named check, rewritten for today's code, fails it.
-- [ ] **proto-6** `userspace/libgpt/src/table.rs:261` — The guards in `read()` on the header_size
+- [x] **proto-6** `userspace/libgpt/src/table.rs:261` — The guards in `read()` on the header_size
   range, entry_len == 128, count in 1..=1024 and `front.len() < end` are all untested. A disk
   with a valid-CRC header whose array_lba or count points past the buffer storage-service reads
   (FRONT_BYTES, about 17 KiB) would panic that critical service in `front[start..end]` if the
@@ -1288,6 +1288,10 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   end` changed to `if false`, and the header_size range, entry_len check, `count == 0` and
   `count > 1024` mutated one by one. All 19 libgpt tests passed each time. Restored. tests.
   High. **Later.**
+  Fixed in `ba1459d0`: a header resealed with each field out of bounds is refused — 91 and 513
+  bytes, entries of 8, 127 and 129, none, an array past the buffer, a start or an end that wraps,
+  1025 entries — and 92, 512 and 1024 are read; fails without it: each guard here taken out, and
+  the two checked operations made wrapping.
 - [x] **proto-7** `userspace/libstream/src/wire.rs:532` — `read_value` and `read_list` recurse
   with no depth limit, and so does a Record through `Schema::decode` and `read_row_values`. A
   List level costs 5 bytes and a Record level 8, and dropping or displaying a decoded value
@@ -1350,14 +1354,17 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Fixed in `286484f2`: every receive in the service returns a `Received`, which closes what came
   as it drops. Fails without it: `log_closes_what_it_was_sent_test` (boot-probe), an append sent
   with a channel's end, whose peer must see it closed.
-- [ ] **proto-11** `userspace/libstream/src/wire.rs:573` — The `SCHEMA_FIELD_HINT_CAP` caps on
+- [x] **proto-11** `userspace/libstream/src/wire.rs:573` — The `SCHEMA_FIELD_HINT_CAP` caps on
   `Vec::with_capacity` in `read_list`, `read_row_values` and `Schema::decode`, the allocation
   defence against hostile counts, have no test. A peer sending a u32 count of 4,000,000,000
   followed by a few bytes would make a consumer abort on a gigabyte reservation if a cap were
   removed. Test gap; the code is correct today. Demonstrated: `.min(SCHEMA_FIELD_HINT_CAP)`
   removed at each of the three sites in turn, and every libstream host test still passed.
   Restored. tests. Medium. **Later.**
-- [ ] **proto-12** `userspace/librsproto/src/file.rs:333` — `DirEntryIter`'s truncated-entry
+  Fixed in `a437bbf2`: a list and a schema claiming four billion items end `UnexpectedEof`; fails
+  without it: the list's cap and the schema's, each aborting the run on a 128 GB reservation. The
+  row's cap counts fields already decoded, so its removal is an equivalent mutation.
+- [x] **proto-12** `userspace/librsproto/src/file.rs:333` — `DirEntryIter`'s truncated-entry
   guard (`body.len() < end`) and its `remaining == 0` stop, plus the name-length limits (u8::MAX
   in the dir-entry writer, u16::MAX in the name and rename encoders), are untested. A Readdir
   body whose last entry's name_len runs past the body would make the iterator slice out of range
@@ -1365,6 +1372,10 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   u16 length, so the wire length disagrees with the bytes written. Test gap; the code is correct
   today. Demonstrated: each guard removed or loosened individually, and every librsproto test
   still passed. tests. Medium. **Later.**
+  Fixed in `ac228366`: every length cap in `librsproto` held at its width and one past, the name
+  and rename encoders, the resolve suffix and the subnamespace base among them, and a listing read
+  to its count; fails without it: each cap loosened by one, the count stop taken out, and the log
+  reply's three checks dropped. The truncated entry was already held.
 - [x] **proto-13** `kernel/src/syscall/table.rs:2589` — `block_map` calls
   `runs.try_reserve(header.run_count as usize)` before the body is checked to hold that many
   runs. `run_count` is a server-chosen u32, but a reply body carries at most (3980-32)/24 = 164
@@ -1411,13 +1422,16 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   parses a different path than the kernel meant. Without the forget magic check any message with
   op 0x0607 is a Forget. Test gap; the code is correct today. Demonstrated: each guard removed
   individually, and the rsproto tests all survived. Restored. tests. Low. **Later.**
-- [ ] **proto-17** `userspace/libstream/src/setup.rs:93` — The unknown-bit rejection in
+- [x] **proto-17** `userspace/libstream/src/setup.rs:93` — The unknown-bit rejection in
   `Streams::from_bitmap`, and the wrong-op and BadRecordTag handling in `Table::decode`, are
   untested. A setup bitmap with unknown bits and a matching handle count would have its extra
   bits ignored and the handles misassigned or leaked. An unknown record tag in `Table::decode`
   would be accepted as end of table instead of BadRecordTag. Test gap; the code is correct
   today. Demonstrated: `bitmap & !STREAM_MASK != 0` changed to `if false` and the BadRecordTag
   arm replaced with a `break`; all libstream tests passed. Restored. tests. Low. **Later.**
+  Fixed in `66a4cac9`: an unknown stream bit beside stdin, with stdin's handle, is refused, and a
+  table ended by an error record or by tag `0x7F` is `BadRecordTag` through `Table::decode` and
+  the reader; fails without it: the unknown-bit check, and each decoder's arm.
 - [x] **proto-18** `kernel/src/syscall/table.rs:263` — `sys_file_truncate`, `sys_file_grow` and
   `sys_file_create` narrow the u64 size register with `a4 as u32` before it reaches the wire
   (`ResolveOp::Size(a4 as u32, ...)`, table.rs:251, 253, 263). A size of 4 GiB or more is taken
@@ -1588,7 +1602,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   Fails without it: `auth_closes_what_it_was_sent_test` (boot-probe), a message sent on
   `/svc/auth` with a channel's end, whose peer must see it closed.
 
-- [ ] **sec-7** `userspace/libcrypto/src/lib.rs:36` — No test fails if `ct_eq` compares only the
+- [x] **sec-7** `userspace/libcrypto/src/lib.rs:36` — No test fails if `ct_eq` compares only the
   last byte. `ct_eq_basic` is the only test, and every unequal pair in it differs in the last
   byte or in length. Scenario: changing `diff |= a[i] ^ b[i]` to `diff = a[i] ^ b[i]` leaves
   `cargo test -p libcrypto --lib` at 17 passed, 0 failed. With that break, `password::verify`
@@ -1596,16 +1610,20 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   about 1 guess in 256. The libusers and auth-service tests use real PBKDF2 and also pass,
   since a random wrong password differs in the last byte 255 times in 256. Demonstrated by
   mutation, restored. tests. Medium. **Later.**
+  Fixed in `86a048e1`: 32-byte values differing by any one bit compare unequal; fails without it:
+  `values_differing_by_any_one_bit_compare_unequal`, the last-byte compare among three mutations.
 
-- [ ] **sec-8** `userspace/auth-service/src/lib.rs:50` — No test fails if `authenticate` accepts an
+- [x] **sec-8** `userspace/auth-service/src/lib.rs:50` — No test fails if `authenticate` accepts an
   empty password. Nothing logs in through `authenticate` or `serve_authenticate` with a wrong
   or empty password against a user that exists, and `wrong_password_denied` sends only
   `b"wrong"`. Scenario: changing the guard to `Some(rec) if rec.verifies(password) ||
   password.is_empty()` leaves auth-service's 10 tests passing, and every existing account then
   logs in with an empty password. libusers asserts `!r.verifies(b"")`, but that checks the
   record, not the service's decision. Demonstrated by mutation, restored. tests. Medium. **Later.**
+  Fixed in `2f89c746`: an empty password is denied through `authenticate` and
+  `serve_authenticate`; fails without it: `an_empty_password_is_denied`.
 
-- [ ] **sec-9** `userspace/libcrypto/src/sha256.rs:98` — The padding boundary at 55 and 56 buffered
+- [x] **sec-9** `userspace/libcrypto/src/sha256.rs:98` — The padding boundary at 55 and 56 buffered
   bytes is untested, and so is the HMAC key-length boundary. The vectors are the empty string,
   `abc`, a 56-byte message and 1000 `a`s. The 56-byte message leaves `buf_len` 0 after the
   first block, so it never reaches the `rem <= 56` branch. `PASSWORD_MAX` lets passwords of 65
@@ -1615,6 +1633,9 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   the verifier of a 65-byte password, would then be wrong, locking out or colliding every
   account with such a password. Demonstrated by mutation, restored. The reviewers' hand check
   of the 55/56/63-byte tails found the code correct as it stands. tests. Medium. **Later.**
+  Fixed in `2e03a599`: tails of 55, 56, 63 and 64 bytes against OpenSSL's answers, and a 65-byte
+  key MACing as its digest where a 64-byte key does not; fails without it: the padding's bound and
+  the key's, each moved by one either way.
 
 - [x] **sec-10** `userspace/view-broker/src/main.rs:1322` — Each endpoint grant's bind treats any
   non-zero `SYS_NS_BIND` result as "not there to grant". The view is a copy of the caller's
@@ -1662,7 +1683,7 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   Moved to Part I on 2026-10-27 with the safety survey's sec-d1, which repeats it.
   Fixed with sec-d1 in `fa31e763`: the terminal is closed once, after the session, on every path.
 
-- [ ] **sec-13** `userspace/auth-service/src/main.rs:580` — `install()` discards the status of the
+- [x] **sec-13** `userspace/auth-service/src/main.rs:580` — `install()` discards the status of the
   `SYS_FILE_TRUNCATE` that clears a leftover `/system/users.new`, then creates the file with
   `SYS_FILE_CREATE`, which only grows. If the leftover is longer than the new database and the
   truncate failed, its tail survives and is renamed into `/system/users`. `libfs::write_file`
@@ -1675,8 +1696,11 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   but the next boot's `load_db` reads the whole file and the stale records, such as the removed
   account, come back. Unverified: it needs a fault injected into `SYS_FILE_TRUNCATE` after a
   failed install, then a boot-time reload. error-paths. Low. **Later.**
+  Fixed in `6420f365`, once `install` moved into the library (`56a779aa`): a created `users.new`
+  that is not the new database's size, a leftover's tail kept, fails the install and leaves the
+  file as it was; fails without it: `a_leftover_the_truncate_did_not_cut_fails_the_install`.
 
-- [ ] **sec-14** `userspace/libusers/src/lib.rs:374` — Three parser bounds on user-database input
+- [x] **sec-14** `userspace/libusers/src/lib.rs:374` — Three parser bounds on user-database input
   have no test: odd-length hex, u32 overflow in the iterations field, and an empty home field.
   Scenario: (a) removing the odd-length check in `hex_decode` leaves 18 passed, so a salt field
   with an odd digit count decodes with its last nibble dropped, and a corrupt record
@@ -1686,8 +1710,11 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   home.is_empty()` from `Record::parse` leaves 18 passed, so a record with no home is accepted
   and the empty home is returned to the caller. Demonstrated by three mutations, each restored.
   tests. Low. **Later.**
+  Fixed in `fa186fa9`: an odd salt, an iteration count past a `u32` at the add and at the
+  multiply, and an empty home are refused; fails without it:
+  `a_field_that_does_not_fit_its_type_is_refused`, each of the four guards taken out.
 
-- [ ] **sec-15** `userspace/libprompt/src/lib.rs:119` — No test would notice if the password
+- [x] **sec-15** `userspace/libprompt/src/lib.rs:119` — No test would notice if the password
   scrubbing in `confirm` or `ask_password_then` were removed. `confirm` consumes its Vecs, so a
   host test cannot observe them afterwards. Scenario: removing `scrub(&mut second);` in
   `confirm` leaves `cargo test -p libprompt --lib` at 1 passed, and the second typed copy of a
@@ -1696,6 +1723,8 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   which touch only syscalls. Demonstrated by mutation, restored. The impact is unverified; a
   test that hands `confirm` a buffer it can still inspect, such as one read through a test
   allocator after the drop, would settle it. tests. Low. **Later.**
+  Fixed in `9d1208ff`: the four scrubs, seen through a test allocator that counts byte buffers
+  freed with a marker password in them; fails without it: each scrub taken out. It runs under Miri.
 
 What held up: authentication cost does not reveal which names exist, since an unknown user runs
 a dummy PBKDF2 at `DEFAULT_ITERATIONS`, which equals `libusers::ITERATIONS`, and the verifier is

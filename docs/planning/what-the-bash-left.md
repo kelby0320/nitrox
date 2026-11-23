@@ -1,7 +1,7 @@
 # What the bash left
 
 **Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
-2026-11-23, H.5 folded into it; H.6, H.7 and H.8 built 2026-11-23.** Part H of
+2026-11-23, H.5 folded into it; H.6 to H.9 built 2026-11-23.** Part H of
 [`pre-phase-7.md`](pre-phase-7.md): the findings of the bug bash triaged **later**, which
 [`bug-bash.md`](bug-bash.md) records, checked against `main` and fixed, each with a test that fails
 without it.
@@ -782,6 +782,24 @@ Where it departs from the above:
     and leaves `/system/users` as it was. An ordinary install writes exactly the new bytes.
 
 **Gates:** `check-login`, `check-recovery` and `test-interactive` (`with`, `account`).
+
+**Built 2026-11-23**, a commit a finding, every mutation each names failing a test but one, which
+cannot. Where it departs from the above:
+- **proto-12 holds the whole class**: every length cap in `librsproto`, the storage, auth, meta
+  and log encoders' too, and a listing read to its count. The log append's `u32` message cap is
+  not tested, its boundary a 4 GiB message.
+- **proto-17 holds the stream bitmap as well**, as the bash named it: its old case's handle count
+  decided it.
+- **proto-6 holds the array's checked start and end**, and **sec-14 the iteration count's
+  multiply** beside its add.
+- **proto-11's row cap is an equivalent mutation**: it counts fields already decoded, each at
+  least four bytes of input.
+- **sec-9's known answers are OpenSSL's**, an implementation independent of this one: NIST's file
+  would be a download.
+- **sec-15 runs under Miri**: the allocator, its blocks zeroed when made, reads only byte buffers.
+  Read whole, a block holding a struct's padding is uninitialised, as Miri found.
+- **sec-13's install asks `INSPECT`**, and a write-back that fails is held to leave the file as it
+  was. The model cannot fail a file's create or a rename.
 
 ### H.10 The filesystems' guards, held
 

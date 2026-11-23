@@ -39034,3 +39034,21 @@ H.7 merged, #465. H.8 on `pre-phase-7/h8-driver-guards`, as
 - **The #466 review** found a long HID item running past its descriptor accepted, where a short
   one is refused: it is refused too. A GPT declaring more than 128 entries still reads its first
   128, as the plan has it.
+
+## 2026-11-23 — Before Phase 7: H.9, the parsers and the credential path held
+
+H.8 merged, #466. H.9 on `pre-phase-7/h9-parser-guards`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.9 plans it: tests, and one fix.
+
+- **A leftover `users.new` that a truncate did not cut fails the install** (sec-13), where its
+  tail was renamed into `/system/users` and came back at the next boot. `install` moved into
+  auth-service's library to be tested on libos's model, and the library's rule changed with it: it
+  makes no syscalls but `install`'s.
+- **Each parser's guard is held by an input only it decides** (proto-6, proto-11, proto-12,
+  proto-17): a GPT header resealed with a field out of bounds, a count of four billion in four
+  bytes, every `librsproto` length cap at its width and one past, a stream's unknown bit and
+  record tag.
+- **So is each guard on the credential path** (sec-7 to sec-9, sec-14, sec-15): a compare's every
+  bit, an empty password, SHA-256's padding and HMAC's key boundaries, the user database's fields,
+  and a password's four scrubs, seen through a test allocator that counts what is freed holding one.
+
