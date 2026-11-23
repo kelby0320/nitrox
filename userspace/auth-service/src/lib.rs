@@ -247,6 +247,19 @@ mod tests {
         assert_eq!(r.result, AUTH_RESULT_DENIED);
     }
 
+    /// **An empty password is a wrong one** for an account that exists, as the check decides and
+    /// as a client's request is answered.
+    #[test]
+    fn an_empty_password_is_denied() {
+        use librsproto::auth::{AUTH_RESULT_DENIED, build_authenticate_request, parse_authenticate_reply};
+        let db = db_line("alice", "hunter2", b"\x10\x20\x30\x40", "/home/alice");
+        assert_eq!(authenticate(db.as_bytes(), b"alice", b""), AuthOutcome::Denied);
+        let (mut req, mut reply) = ([0u8; 128], [0u8; 128]);
+        let rn = build_authenticate_request(&mut req, b"alice", b"").unwrap();
+        let n = serve_authenticate(&req[..rn], db.as_bytes(), &mut reply).unwrap();
+        assert_eq!(parse_authenticate_reply(&reply[..n]).unwrap().result, AUTH_RESULT_DENIED);
+    }
+
     #[test]
     fn serve_rejects_malformed_request() {
         let db = db_line("alice", "pw", b"salt5678", "/home/alice");
