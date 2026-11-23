@@ -149,8 +149,13 @@ mod tests {
                     scan(&path, pids);
                 } else if path.extension().is_some_and(|e| e == "rs") {
                     for (i, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
-                        let value = line.trim().strip_prefix("const ").and_then(|l| l.split_once(": u32 = "));
-                        let pid = value.and_then(|(_, v)| v.trim_end_matches(';').parse::<u32>().ok());
+                        // However it is written: a visibility, `_`s, a suffix, a comment after.
+                        let decl = line.trim();
+                        let decl = ["pub(crate) ", "pub(super) ", "pub "].iter().find_map(|v| decl.strip_prefix(v));
+                        let value =
+                            decl.unwrap_or(line.trim()).strip_prefix("const ").and_then(|l| l.split_once(": u32 = "));
+                        let digits = value.and_then(|(_, v)| v.split_once(';')).map(|(v, _)| v.replace('_', ""));
+                        let pid = digits.and_then(|v| v.trim().trim_end_matches("u32").parse::<u32>().ok());
                         if let Some(pid) = pid.filter(|p| (4000..5000).contains(p)) {
                             pids.push((pid, std::format!("{}:{}", path.display(), i + 1)));
                         }

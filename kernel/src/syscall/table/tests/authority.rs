@@ -84,6 +84,7 @@ fn a_lookup_gets_only_what_both_its_ask_and_its_grant_allow() {
     assert_eq!(status, 0);
     assert!(global::get().lookup(RawHandle(h), PID, Rights::MAP_READ).is_ok());
     assert!(global::get().lookup(RawHandle(h), PID, Rights::MAP_WRITE).is_err(), "the binding's rights cap it");
+    assert!(global::get().lookup(RawHandle(h), PID, Rights::TRANSFER).is_err(), "and the ask does");
 
     let mut f = forwarded_memobj_lookup_asking(Rights::MAP_READ | Rights::MAP_WRITE);
     assert_eq!(complete_resolve_reply(&f.reg, &f.reply, &mut f.transfers, 36), Ok(0));
@@ -91,6 +92,7 @@ fn a_lookup_gets_only_what_both_its_ask_and_its_grant_allow() {
     assert_eq!(status, 0);
     assert!(global::get().lookup(RawHandle(h), PID, Rights::MAP_READ).is_ok());
     assert!(global::get().lookup(RawHandle(h), PID, Rights::MAP_WRITE).is_err(), "the server's grant caps it");
+    assert!(global::get().lookup(RawHandle(h), PID, Rights::TRANSFER).is_err(), "and the ask does");
     global::close_all_owned_by(PID);
 }
 
@@ -128,7 +130,8 @@ fn a_send_moves_only_what_may_leave_and_arrives_stamped_with_its_sender() {
     global::close_all_owned_by(PID);
 }
 
-/// **A map takes no more than its object holds**: two pages of a one-page object are refused.
+/// **A map takes no more than its object holds, nor more than its handle allows**: two pages of a
+/// one-page object, or a writable or executable map of a handle that reads, are refused.
 #[test]
 fn a_map_takes_no_more_than_its_object_holds() {
     const PID: u32 = 4485;
@@ -140,11 +143,16 @@ fn a_map_takes_no_more_than_its_object_holds() {
     };
     assert_eq!(map(2 * PAGE_SIZE), Err(KError::InvalidArgument));
     assert!(map(PAGE_SIZE).is_ok());
+    for (mapped, as_what) in [(Rights::MAP_WRITE, "writable"), (Rights::MAP_EXEC, "executable")] {
+        let asked = (Rights::MAP_READ | mapped).bits();
+        let map = || sys_memory_map(h.bits(), 0, PAGE_SIZE as u64, asked, 0);
+        assert_eq!(as_user(PID, SysCaps::empty(), map), Err(KError::NoAccess), "{as_what} of a read-only handle");
+    }
     global::close_all_owned_by(PID);
 }
 
 /// **A child gets no syscap its parent lacks**, whatever it asks for: `parent & requested`. Its
-/// parent's handle to it is refused, so it never starts, which a host test cannot let it do.
+/// first install is refused, so it never starts, which a host test cannot let it do.
 #[test]
 fn a_child_gets_none_of_the_syscaps_its_parent_lacks() {
     const PID: u32 = 4486;
@@ -157,13 +165,41 @@ fn a_child_gets_none_of_the_syscaps_its_parent_lacks() {
     args.syscaps = (SysCaps::BIND_NAMESPACE | SysCaps::REAL_TIME).bits();
     let parent = SysCaps::BIND_NAMESPACE | SysCaps::AUDIT_CONTROL;
     let spawned = as_user(PID, parent, || {
+        fail_installs_after(Some(0));
+        let r = sys_process_spawn(&raw const args as u64);
+        fail_installs_after(None);
+        r
+    });
+    assert_eq!(spawned, Err(KError::OutOfMemory), "refused at its first install");
+    let child = crate::object::process::MADE_WITH.with(core::cell::Cell::get);
+    assert_eq!(child, SysCaps::BIND_NAMESPACE, "what both hold, and nothing the parent lacks");
+    global::close_all_owned_by(PID);
+}
+
+/// **A child's handle has what its parent held and asked to give it, no more**: `held & asked`,
+/// read from the install the spawn asked for, which is refused so the child never starts.
+#[test]
+fn a_childs_handle_has_only_what_its_parent_held_and_asked_to_give() {
+    use crate::handle::table::last_install_asked;
+    const PID: u32 = 4487;
+    init_global_heap();
+    global::init_for_tests();
+    let image = MemoryObject::try_new_filled(&crate::mm::elf::a_test_image()).unwrap();
+    let mut args = SpawnArgs::zeroed();
+    args.image = install(PID, ObjectRef::new(image), Rights::MAP_READ).unwrap();
+    args.namespace = user_namespace(PID, namespace_rights());
+    args.handle_count = 1;
+    args.handles[0] = user_page(PID, Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE);
+    args.rights[0] = (Rights::MAP_READ | Rights::MAP_WRITE).bits();
+    let spawned = as_user(PID, SysCaps::empty(), || {
         fail_installs_after(Some(2));
         let r = sys_process_spawn(&raw const args as u64);
         fail_installs_after(None);
         r
     });
-    assert_eq!(spawned, Err(KError::OutOfMemory), "refused at the parent's handle to it");
-    let child = crate::object::process::MADE_WITH.with(core::cell::Cell::get);
-    assert_eq!(child, SysCaps::BIND_NAMESPACE, "what both hold, and nothing the parent lacks");
+    assert_eq!(spawned, Err(KError::OutOfMemory), "refused at the handle's install");
+    let (owner, rights) = last_install_asked().unwrap();
+    assert_ne!(owner, PID, "an install into the child's table");
+    assert_eq!(rights, Rights::MAP_READ, "neither what it held alone, nor what was asked");
     global::close_all_owned_by(PID);
 }

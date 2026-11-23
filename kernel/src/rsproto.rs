@@ -864,6 +864,7 @@ mod tests {
         assert_eq!(reply_op(&req), Some(READ_RANGE_OP));
         assert_eq!(reply_op(&[0u8; 4]), None); // too short
     }
+
     /// **An error body under its minimum is `Malformed`**, empty, three bytes and one short of it:
     /// read as an error, the shortest would be read past its end, a panic in the kernel.
     #[test]
