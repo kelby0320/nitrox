@@ -1277,8 +1277,8 @@ impl Interp {
     fn apply_builtin(&mut self, c: &Call) -> Result<Val> {
         match c.name.as_str() {
             "cd" => {
-                let target = match c.args.first() {
-                    Some(Arg::Positional(e)) => match e {
+                let target = match crate::builtins::one_or_none(c, "path").map_err(EvalError::new)? {
+                    Some(e) => match e {
                         Expr::Word(w) => self.expand_tilde(w)?.into_owned(),
                         Expr::Str(w) | Expr::Ident(w) => w.clone(),
                         other => self.eval(other)?.render(),
@@ -1290,7 +1290,6 @@ impl Interp {
                             return Err(EvalError::new("`cd` with no argument goes to HOME, and HOME is not set"));
                         }
                     },
-                    Some(_) => return Err(EvalError::new("`cd` takes one path")),
                 };
                 let resolved = self.resolve_path(&target)?;
                 // **Resolve first, set second.** The invariant is "PWD named something real when
@@ -1306,9 +1305,9 @@ impl Interp {
             // for (`exit 1` once missed that comparison). It travels the error channel because that
             // already crosses a `def`, a closure and a loop; `catch` re-raises it (see `exec_try`).
             "exit" => {
-                let status = match c.args.first() {
+                let status = match crate::builtins::one_or_none(c, "status").map_err(EvalError::new)? {
                     None => 0,
-                    Some(Arg::Positional(e)) => {
+                    Some(e) => {
                         // A builtin's argument is a **bareword**, so `exit 3` arrives as the text
                         // `"3"`; the `parse` scanner keeps one definition of what a number looks
                         // like.
@@ -1328,9 +1327,6 @@ impl Interp {
                                 )));
                             }
                         }
-                    }
-                    Some(_) => {
-                        return Err(EvalError::new("`exit` takes a single status argument"));
                     }
                 };
                 Err(EvalError::exiting(status))

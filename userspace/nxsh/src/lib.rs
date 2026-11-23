@@ -33,6 +33,8 @@ pub mod timing;
 pub mod value;
 
 #[cfg(test)]
+mod env_tests;
+#[cfg(test)]
 mod exec_tests;
 #[cfg(test)]
 mod guide_tests;
