@@ -2,10 +2,9 @@
 //!
 //! Pure, `#![no_std]`, no-`alloc`: verify a `(username, password)` against the user database, and
 //! decide what an administrator's request does to it, answering the `Auth` rsproto category
-//! (`docs/spec/rsproto-auth-ops.md`). These make no syscalls — the bare-target server
-//! (`src/main.rs`) supplies the database's bytes, the buffers, and a salt from the kernel's entropy
-//! source. Writing the file is [`install`]'s, through `libos`. Under `cargo test` it builds as host
-//! `std`.
+//! (`docs/spec/rsproto-auth-ops.md`). No syscalls but [`install`]'s — the server supplies
+//! the database's bytes, the buffers, and a salt from the kernel's entropy source, and does the
+//! writing, through [`install`]. Under `cargo test` it builds as host `std`.
 //!
 //! **The database's format is `libusers`'**: a `passwd`-style line file,
 //! `name:salt_hex:iterations:verifier_hex:home`, whose `verifier` is

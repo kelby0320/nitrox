@@ -12,8 +12,8 @@ pub const USERS: &str = "/system/users";
 pub const USERS_NEW: &str = "/system/users.new";
 
 /// **Replace `/system/users` with `bytes`, atomically.** A leftover `users.new`, from a write that
-/// died, is cut to nothing; the new copy is created at its size, refused unless it is that size,
-/// written through a mapping, unmapped, synced, and then renamed over the file. A crash before the rename leaves the old file
+/// died, is cut to nothing; the new copy is created at its size, written through a mapping,
+/// unmapped, synced, and then renamed over the file. A crash before the rename leaves the old file
 /// as it was, and the rename is the filesystem's one operation. `Err` names the step that failed.
 pub fn install<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, bytes: &[u8]) -> Result<(), &'static [u8]> {
     let ns = ns.into();
@@ -34,7 +34,7 @@ pub fn install<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, byte
         let Ok(mut mapping) = file.map(PAGE) else {
             return Err(b"users.new could not be mapped");
         };
-        // The file is at most a page, `libusers`' bound. Unmapped before the sync, as `libfs` does: a
+        // The file fits the page mapped (MAX_FILE). Unmapped before the sync, as `libfs` does: a
         // write-back that begins with a writable mapping cannot call the file clean.
         if mapping.write_from(0, bytes).is_err() {
             return Err(b"users.new could not be mapped");

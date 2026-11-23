@@ -582,7 +582,7 @@ mod tests {
     #[test]
     fn from_bitmap_rejects_bad_input() {
         assert_eq!(Streams::from_bitmap(STREAM_STDIN | STREAM_STDOUT, &[0x1]), Err(WireError::SchemaMismatch));
-        // An unknown bit beside a known one, the handles counting the known: only the bit refuses it.
+        // An unknown bit beside stdin, with stdin's handle: only the bit's own check refuses it.
         assert_eq!(Streams::from_bitmap(STREAM_STDIN | 1 << 5, &[0x1]), Err(WireError::SchemaMismatch));
         assert!(Streams::from_bitmap(STREAM_STDIN, &[0x1]).is_ok());
     }

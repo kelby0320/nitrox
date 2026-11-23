@@ -334,8 +334,8 @@ mod tests {
         survives_corruption(&b[..n], |x| parse_account_list(x).map(|l| l.iter().count()).is_some());
     }
 
-    /// **Each field is its width long at most**: a `u16` for a request's and a reply's, a byte for a
-    /// listed account's; one past is refused, not wrapped. A list holds `u16::MAX` accounts.
+    /// **Each field is its width at most**: a `u16` in a request and a reply, a byte in a listed
+    /// account; one past is refused, not wrapped. A list holds `u16::MAX` accounts.
     #[test]
     fn a_field_one_past_its_width_is_refused() {
         let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);

@@ -84,9 +84,8 @@ fn terminal(replies: &[(u16, u32, &[u8])]) -> (End, End) {
     (a, b)
 }
 
-/// **A password read and then not given is zeroed**: one a `Ctrl-C` cancelled, and a first copy
-/// whose second was not typed. Each is measured against a read that gives its password, the
-/// terminal's own copies of the line freed in both.
+/// **A password read and not given is zeroed**: one `Ctrl-C` cancelled, and a first copy whose
+/// second was not typed; each beside a read that gives it, the mock's own copies freed in both.
 #[test]
 fn a_password_not_given_is_zeroed() {
     let line = |flags| [(0, 0, &b""[..]), (0, 0, b""), (0, flags, MARK), (0, 0, b""), (0, 0, b"")];

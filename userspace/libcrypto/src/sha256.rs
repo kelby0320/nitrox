@@ -236,9 +236,8 @@ mod tests {
         assert_eq!(hex(&sha256(msg)), "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
     }
 
-    /// **Each side of the padding boundary**: a tail of 55 bytes takes its 0x80 and length in its
-    /// own block, 56 and 63 push them into a second, and 64 starts one. Known answers from
-    /// OpenSSL, an implementation independent of this one.
+    /// **Each side of the padding boundary**: 55 bytes pad within their block, 56 and 63 into a
+    /// second, and 64 start one. Known answers from OpenSSL, independent of this code.
     #[test]
     fn tails_of_55_56_63_and_64_bytes() {
         for (n, digest) in [
