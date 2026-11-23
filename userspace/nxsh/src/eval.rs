@@ -140,8 +140,8 @@ pub struct Interp {
     scopes: Vec<Vec<(String, Slot)>>,
     /// The environment: a TSM1 `Record`, handed to every stage this shell spawns.
     ///
-    /// Also bound as `$env`, so it is an ordinary value: `$env.PWD` and `env.EDITOR = "vi"` need
-    /// nothing beyond field access (§6).
+    /// **`$env` reads it, wherever a name is read**, a `def` and a closure included: one
+    /// environment, never a binding to keep in step with it.
     pub(crate) env: Record,
     /// Hoisted `def` bindings, visible from inside any call.
     ///
@@ -200,7 +200,6 @@ impl Interp {
     /// Install the environment this shell was started with, and bind `$env`.
     pub fn set_env(&mut self, env: Record) {
         self.env = env;
-        self.rebind_env();
     }
 
     /// The working directory, from the environment's conventional `PWD` entry.
@@ -217,16 +216,6 @@ impl Interp {
     /// arguments are passed through as written; see [`Host::run`].
     pub(crate) fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
         crate::paths::resolve(self.cwd(), path).map_err(EvalError::new)
-    }
-
-    /// Re-publish `$env` after a change, so the binding and the record never disagree.
-    pub(crate) fn rebind_env(&mut self) {
-        let v = Val::Data(Value::Record(Arc::new(self.env.clone())));
-        if let Some(slot) = self.lookup_mut("$env") {
-            slot.val = v;
-            return;
-        }
-        let _ = self.bind("$env", v, true, false);
     }
 
     /// What a Tab press at the end of `line` should offer (§11c).
@@ -354,6 +343,9 @@ impl Interp {
 
     /// A binding, or failing that a hoisted function.
     pub(crate) fn lookup_any(&self, name: &str) -> Option<Val> {
+        if name == "$env" {
+            return Some(Val::Data(Value::Record(Arc::new(self.env.clone()))));
+        }
         if let Some(s) = self.lookup(name) {
             return Some(s.val.clone());
         }
@@ -1785,7 +1777,7 @@ impl Interp {
             if matches!(self.lookup_any(name), Some(Val::Func(_))) {
                 return Ok(None);
             }
-            if at_head && self.lookup(name).is_some() {
+            if at_head && self.lookup_any(name).is_some() {
                 return Ok(None);
             }
             return Ok(Some(StageSpec { program: name.clone(), argv: alloc::vec![name.clone()] }));

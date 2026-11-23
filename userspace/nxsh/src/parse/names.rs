@@ -11,4 +11,17 @@ impl Parser<'_> {
             _ => self.fail(message),
         }
     }
+
+    /// A name a binding takes, which is never `$env`: the shell's environment, wherever it is read.
+    pub(super) fn binder(&mut self, message: &'static str) -> Result<String> {
+        let name = self.ident(message)?;
+        self.not_env(name)
+    }
+
+    pub(super) fn not_env(&mut self, name: String) -> Result<String> {
+        if name == "$env" {
+            return self.fail("`$env` is the shell's environment, and no binding takes its name");
+        }
+        Ok(name)
+    }
 }

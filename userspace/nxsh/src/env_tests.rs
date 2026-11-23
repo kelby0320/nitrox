@@ -91,7 +91,8 @@ fn a_whole_record_that_keeps_pwd_is_the_environment() {
 /// handed, is refused whole**: the directory and every variable are as they were.
 #[test]
 fn each_form_that_would_break_the_environment_is_refused_whole() {
-    let refusals: [(&str, &str); 10] = [
+    let big = alloc::format!("$env.BIG = \"{}\"", "x".repeat(5000));
+    let refusals: [(&str, &str); 17] = [
         ("$env.PWD = \"/tmp\"", "`cd`'s"),
         ("$env[\"PWD\"] = \"/tmp\"", "`cd`'s"),
         ("$env = ($env | merge {PWD: \"/tmp\"})", "`cd`'s"),
@@ -102,6 +103,13 @@ fn each_form_that_would_break_the_environment_is_refused_whole() {
         ("$env = ($env | merge {HOME: 5})", "`$env.HOME` is a String"),
         ("$env.FOO = null", "would hold nothing"),
         ("$env.HOME.x = 1", "cannot set field"),
+        ("$env = ($env | merge {PATH: \"/bin\"})", "`$env.PATH` is a List"),
+        ("$env = {HOME: \"/home/a\", PWD: \"/\", PATH: \"/bin\"}", "`$env.PATH` is a List"),
+        ("$env.TT = ([1, 2] | map { |x| {a: x} })", "would hold a Table"),
+        ("$env = {HOME: \"/home/a\", PWD: \"/\", PATH: [\"/bin\"], PWD: \"/tmp\"}", "would be there twice"),
+        ("$env[\"\"] = \"v\"", "has a name"),
+        (&big, "larger than the 4008 bytes"),
+        ("$env.L = [(1..3 | map { |n| {n: n} })]", "a Table inside it"),
     ];
     for (form, says) in refusals {
         let (mut i, log) = shell(MockHost::new());
@@ -138,4 +146,68 @@ fn cd_and_exit_take_one_argument_or_none() {
     let e = i.run_line("exit -n").expect_err("refused");
     assert!(!e.is_exit() && e.message.contains("`-n` is one"), "{}", e.message);
     assert_eq!(i.run_line("exit 3").expect_err("exits").exit, Some(3));
+}
+
+/// **A value inside a variable keeps its type too**: the environment must still encode.
+#[test]
+fn a_value_retyped_inside_a_variable_is_refused() {
+    let (mut i, log) = shell(MockHost::new());
+    line(&mut i, "$env.R = {a: 1}").unwrap();
+    let e = line(&mut i, "$env.R.a = \"s\"").unwrap_err();
+    assert!(e.contains("does not fit its field's type"), "{e}");
+    line(&mut i, "probe").unwrap();
+    assert_eq!(line(&mut i, "$env.R.a").unwrap(), "1");
+    assert!(seen(&log, "R").is_some());
+}
+
+/// A name with a space or an `=` is a variable's like any: the environment is a record, not
+/// `key=value` strings. A List variable takes a List of anything; nothing reads `PATH`'s items.
+#[test]
+fn any_name_but_an_empty_one_and_any_list_are_taken() {
+    let (mut i, log) = shell(MockHost::new());
+    for form in ["$env[\"a b\"] = \"v\"", "$env[\"X=Y\"] = \"v\"", "$env.PATH = [5]"] {
+        line(&mut i, form).unwrap_or_else(|e| panic!("{form}: {e}"));
+    }
+    line(&mut i, "probe").unwrap();
+    assert_eq!((seen(&log, "a b"), seen(&log, "X=Y")), (s("v"), s("v")));
+}
+
+/// **One environment, in a `def` and a closure as at the prompt**: what either writes, the prompt
+/// reads, and a `cd` in a `def` moves the prompt's `PWD`.
+#[test]
+fn a_def_and_a_closure_write_the_one_environment() {
+    let (mut i, log) = shell(MockHost::new());
+    line(&mut i, "def setx() { $env.EDITOR = \"vi\" }").unwrap();
+    line(&mut i, "setx()").unwrap();
+    assert_eq!(line(&mut i, "$env.EDITOR").unwrap(), "vi");
+    line(&mut i, "[1] | each { |x| $env.PAGER = \"less\" }").unwrap();
+    line(&mut i, "$env = ($env | merge {LANG: \"C\"})").unwrap();
+    line(&mut i, "probe").unwrap();
+    assert_eq!((seen(&log, "EDITOR"), seen(&log, "PAGER")), (s("vi"), s("less")));
+    line(&mut i, "def go() { cd /tmp }").unwrap();
+    line(&mut i, "go()").unwrap();
+    assert_eq!(line(&mut i, "$env.PWD").unwrap(), "/tmp");
+    line(&mut i, "def home() { $env.HOME }").unwrap();
+    assert_eq!(line(&mut i, "home()").unwrap(), "/home/a");
+}
+
+/// **No binding takes `$env`'s name**, which would hide the environment where it is read.
+#[test]
+fn no_binding_takes_the_environments_name() {
+    for form in [
+        "let $env = 5",
+        "mut $env = 5",
+        "const $env = 5",
+        "for $env in [1] { 1 }",
+        "def f($env) { 1 }",
+        "def $env() { 1 }",
+        "[1] | each { |$env| 1 }",
+        "try { 1 } catch ($env) { 2 }",
+        "match 1 { $env => 1 }",
+        "match {a: 1} { {$env} => 1 }",
+    ] {
+        let (mut i, _) = shell(MockHost::new());
+        let e = line(&mut i, form).expect_err(form);
+        assert!(e.contains("no binding takes its name"), "{form}: {e}");
+    }
 }

@@ -253,7 +253,7 @@ impl<'a> Parser<'a> {
             }
             Tok::For => {
                 self.bump()?;
-                let binding = self.ident("expected a loop variable")?;
+                let binding = self.binder("expected a loop variable")?;
                 self.expect(&Tok::In, "expected `in`")?;
                 // §9b restricts the iterable so a bare `|` cannot appear at its top level, else `{
                 // … }` is ambiguous between the loop body and a trailing closure. It names
@@ -344,7 +344,7 @@ impl<'a> Parser<'a> {
 
     fn binding(&mut self, kind: BindKind, public: bool) -> Result<Stmt> {
         self.bump()?; // let / mut / const
-        let name = self.ident("expected a binding name")?;
+        let name = self.binder("expected a binding name")?;
         let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
         self.expect(&Tok::Eq, "expected `=` in a binding")?;
         let value = self.expr()?;
@@ -358,7 +358,7 @@ impl<'a> Parser<'a> {
         let body = self.block()?;
         self.expect(&Tok::Catch, "expected `catch` after a `try` block")?;
         let catch_binding = if self.eat(&Tok::LParen)? {
-            let n = self.ident("expected an error binding")?;
+            let n = self.binder("expected an error binding")?;
             self.expect(&Tok::RParen, "expected `)`")?;
             Some(n)
         } else {
@@ -370,7 +370,7 @@ impl<'a> Parser<'a> {
 
     fn def_stmt(&mut self, public: bool) -> Result<Stmt> {
         self.bump()?; // def
-        let name = self.ident("expected a function name")?;
+        let name = self.binder("expected a function name")?;
         self.expect(&Tok::LParen, "expected `(` after a function name")?;
         let params = self.param_list()?;
         let ret = if self.eat(&Tok::Arrow)? { Some(self.type_expr()?) } else { None };
@@ -385,7 +385,7 @@ impl<'a> Parser<'a> {
         }
         loop {
             let variadic = self.eat(&Tok::Ellipsis)?;
-            let name = self.ident("expected a parameter name")?;
+            let name = self.binder("expected a parameter name")?;
             let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
             let default = if self.eat(&Tok::Eq)? { Some(self.expr()?) } else { None };
             params.push(Param { name, ty, default, variadic });
@@ -410,7 +410,7 @@ impl<'a> Parser<'a> {
             _ => return self.fail("`use` takes a quoted path"),
         };
         if self.eat(&Tok::As)? {
-            let alias = self.ident("expected a module alias")?;
+            let alias = self.binder("expected a module alias")?;
             return Ok(Stmt::Use { path, names: None, alias: Some(alias), base: self.base.clone() });
         }
         if self.eat(&Tok::LBrace)? {
@@ -420,7 +420,7 @@ impl<'a> Parser<'a> {
                 if self.eat(&Tok::RBrace)? {
                     break;
                 }
-                names.push(self.ident("expected an imported name")?);
+                names.push(self.binder("expected an imported name")?);
                 self.skip_newlines()?;
                 if self.eat(&Tok::Comma)? {
                     continue;
@@ -786,7 +786,7 @@ impl<'a> Parser<'a> {
                     if self.eat(&Tok::Pipe)? {
                         break;
                     }
-                    let name = self.ident("expected a closure parameter")?;
+                    let name = self.binder("expected a closure parameter")?;
                     let ty = if self.eat(&Tok::Colon)? { Some(self.type_expr()?) } else { None };
                     ps.push(Param { name, ty, default: None, variadic: false });
                     if self.eat(&Tok::Comma)? {
@@ -1145,7 +1145,7 @@ impl<'a> Parser<'a> {
                     }
                     let name = self.ident("expected a field name in a record pattern")?;
                     let sub = if self.eat(&Tok::Colon)? { Some(self.pattern_single()?) } else { None };
-                    fields.push((name, sub));
+                    fields.push((if sub.is_none() { self.not_env(name)? } else { name }, sub));
                     if self.eat(&Tok::Comma)? {
                         continue;
                     }
@@ -1178,9 +1178,9 @@ impl<'a> Parser<'a> {
                 }
                 if self.eat(&Tok::At)? {
                     let inner = self.pattern_single()?;
-                    return Ok(Pattern::Capture(name, Box::new(inner)));
+                    return Ok(Pattern::Capture(self.not_env(name)?, Box::new(inner)));
                 }
-                Ok(Pattern::Bind(name))
+                Ok(Pattern::Bind(self.not_env(name)?))
             }
             Tok::Int(_) | Tok::Float(_) | Tok::Str(_) | Tok::Minus | Tok::True | Tok::False | Tok::Null => {
                 let lit = self.pattern_literal()?;
