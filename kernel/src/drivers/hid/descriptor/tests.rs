@@ -318,13 +318,16 @@ fn a_corrupt_item_after_a_mouse_gives_no_layout() {
     assert!(mouse_layout(&mouse_then(&[])).is_some(), "the mouse alone");
     assert_eq!(mouse_layout(&mouse_then(&[0x26, 0xFF])), None, "a two-byte item with one byte");
     assert_eq!(mouse_layout(&mouse_then(&[0xFE])), None, "a long item with no length");
+    assert_eq!(mouse_layout(&mouse_then(&[0xFE, 0x02, 0xF0, 1])), None, "a long item a byte short");
+    assert!(mouse_layout(&mouse_then(&[0xFE, 0x02, 0xF0, 1, 2])).is_some(), "a whole long item");
     assert_eq!(mouse_layout(&mouse_then(&[0xB4])), None, "a pop with nothing pushed");
     assert_eq!(mouse_layout(&mouse_then(&[0xA4; 5])), None, "five pushes, one past the stack");
     let four = [[0xA4; 4], [0xB4; 4]].concat();
     assert!(mouse_layout(&mouse_then(&four)).is_some(), "four pushes and four pops");
 }
 
-/// **The first mouse collection is the layout's**: a second's is not read, even a field it lacks.
+/// **The first mouse collection is the layout's**: a second's is not read, even a field it lacks,
+/// and one inside it does not end it.
 #[test]
 fn a_second_mouse_collection_is_not_read() {
     let mut no_wheel = QEMU_MOUSE;
@@ -335,6 +338,15 @@ fn a_second_mouse_collection_is_not_read() {
     let mut two = no_wheel.to_vec();
     two.extend_from_slice(&QEMU_MOUSE);
     assert_eq!(mouse_layout(&two), Some(first), "not the second's wheel");
+    #[rustfmt::skip]
+    let nested = [
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x09, 0x02, 0xA1, 0x01, // a mouse inside a mouse
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01, 0xC0, // its buttons, then its end
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06, 0xC0,
+    ];
+    let l = mouse_layout(&nested).expect("the outer mouse's axes, after the inner one");
+    assert_eq!((l.x, l.y), (signed(8, 8), signed(16, 8)));
 }
 
 /// **A second key array refuses the keyboard**, rather than replacing the first.

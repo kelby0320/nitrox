@@ -166,9 +166,9 @@ fn walk(desc: &[u8], mut visit: impl FnMut(Event<'_>)) -> Option<bool> {
     while i < desc.len() {
         let prefix = desc[i];
         if prefix == 0xFE {
-            // A long item: its data size is the next byte. Walked past.
-            let len = *desc.get(i + 1)? as usize;
-            i += 3 + len;
+            // A long item: its data's size, its tag, then its data. Walked past, if it is whole.
+            let data = desc.get(i + 1).and_then(|&n| desc.get(i + 3..i + 3 + n as usize));
+            i += 3 + data?.len();
             continue;
         }
         let size = match prefix & 0x3 {
