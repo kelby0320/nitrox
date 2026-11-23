@@ -690,7 +690,11 @@ departs from the above:
   of waitable objects would block or abort.
 - **kmem-17's in-loop bound is an equivalent mutation**, as the pass found.
 - **The pid check scans the kernel's sources** for the form each test names its pid in, a `u32`
-  constant in the 4000s; plumbing's `LIVE` took 4493.
+  constant in the 4000s, however it is written; plumbing's `LIVE` took 4493.
+- **Its review (#465) held each intersection's other half**, the ask's: a lookup asked less than a
+  binding or a server grants gets no more than it asked. It added the map's rights, and a spawned
+  child's handle rights, `held & asked`, read from a test-only record of the last install asked
+  for, as the spawn rolls the child's handles back.
 
 ### H.8 The drivers' guards, held
 

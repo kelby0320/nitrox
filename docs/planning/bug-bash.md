@@ -328,7 +328,8 @@ Found 24, refuted by a boot 0, reported 13.
   it: `duplicate_cannot_amplify`.
   Fixed in `1bfdbd2c`: each guard held where its syscall calls it, run as a user process with
   chosen syscaps (`syscall/table/tests/authority.rs`'s `as_user`); fails without it: each of the
-  eleven taken out in turn fails its test there.
+  eleven taken out in turn fails its test there. PR #465's review held each intersection's other
+  half too, the ask's, and the map's rights and a spawned child's handle rights: `71d800c9`.
 
 What held up: Deleting the owner-pid, generation or rights-subset check in handle lookup fails
 several tests. Close and restrict owner and generation checks fail named tests, and so do

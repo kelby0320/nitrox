@@ -39010,3 +39010,6 @@ H.6 merged, #464. H.7 on `pre-phase-7/h7-kernel-guards`, as
   guard taken out.
 - **Each test's pid in the global handle table is its own**: the flake that two tests sharing 4491
   made is gone, and a test scanning the sources holds the class.
+- **The #465 review held each intersection from both sides**: a lookup's rights, a server's
+  memory reply's and a spawned child's handle's are each no more than what was asked and what was
+  held, and a map no more writable or executable than its handle.
