@@ -38993,3 +38993,23 @@ H.4 merged, #463. H.6 on `pre-phase-7/h6-shell-env`, as
   inside a call no longer leaves the prompt's `$env` behind. No binding takes its name. The copy
   an assignment makes is also held to the encoding a program is handed, nested values and size
   included, and a variable keeps its type whichever form assigns it.
+
+## 2026-11-23 — Before Phase 7: H.7, the kernel's guards held
+
+H.6 merged, #464. H.7 on `pre-phase-7/h7-kernel-guards`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.7 plans it: tests only.
+
+- **Each syscall's guards are held where it calls them** (kobj-13), run as a user process with the
+  syscaps a case gives it (`as_user`): the bind's syscap and its direct-handle rules, a namespace's
+  copy, a lookup's rights, a send's transfers, payload and sender, a map's window. **The spawn's and
+  the memory reply's intersections** are held there too; the child's syscaps are read from a
+  test-only record of what each user process was made with, as a host test cannot start it.
+- **A duplicate cannot amplify** (kobj-12), **a fresh object reads zero on a frame freed dirty**
+  (kmem-14), **the mapping window and an exact-fit hole** (kmem-17), **the codec's bounds**
+  (proto-16) and **a poll answers at once** (sched-10) are each held by a test that fails with the
+  guard taken out.
+- **Each test's pid in the global handle table is its own**: the flake that two tests sharing 4491
+  made is gone, and a test scanning the sources holds the class.
+- **The #465 review held each intersection from both sides**: a lookup's rights, a server's
+  memory reply's and a spawned child's handle's are each no more than what was asked and what was
+  held, and a map no more writable or executable than its handle.

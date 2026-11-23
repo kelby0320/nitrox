@@ -864,4 +864,45 @@ mod tests {
         assert_eq!(reply_op(&req), Some(READ_RANGE_OP));
         assert_eq!(reply_op(&[0u8; 4]), None); // too short
     }
+
+    /// **An error body under its minimum is `Malformed`**, empty, three bytes and one short of it:
+    /// read as an error, the shortest would be read past its end, a panic in the kernel.
+    #[test]
+    fn an_error_body_under_its_minimum_is_malformed() {
+        for n in [0, 3, ERROR_BODY_LEN - 1] {
+            let buf = make_reply(5, RS_FLAG_REPLY | RS_FLAG_ERROR, &[0xff; ERROR_BODY_LEN][..n]);
+            assert_eq!(parse_reply(&buf[..RS_HEADER_LEN + n]).unwrap().kind, ReplyKind::Malformed, "{n} bytes");
+            let mut range = buf;
+            put_u16(&mut range, 6, OP_FILE_READ_RANGE);
+            let r = parse_read_range_reply(&range[..RS_HEADER_LEN + n]).unwrap();
+            assert_eq!(r.kind, RangeReplyKind::Malformed, "{n} bytes, a read range");
+        }
+    }
+
+    /// **A forget is one only with the protocol's magic**: any message with its op is not one.
+    #[test]
+    fn a_forget_without_the_magic_is_none() {
+        let mut buf = make_reply(0, 0, &77u64.to_le_bytes());
+        put_u16(&mut buf, 6, OP_FILE_FORGET);
+        assert_eq!(forget_request(&buf[..RS_HEADER_LEN + FORGET_LEN]), Some(77));
+        put_u32(&mut buf, 0, RS_MAGIC ^ 1);
+        assert_eq!(forget_request(&buf[..RS_HEADER_LEN + FORGET_LEN]), None);
+    }
+
+    /// **Every request builder takes a suffix of `u16::MAX` bytes and refuses one more**, as its
+    /// length goes in a `u16`: one past it would be cut, and the server would read another path.
+    #[test]
+    fn each_request_builder_refuses_a_suffix_past_a_u16() {
+        let mut out = std::vec![0u8; 3 * 65_536];
+        let (fits, past) = (std::vec![b'a'; 65_535], std::vec![b'a'; 65_536]);
+        assert!(build_resolve_request(&mut out, 0, &fits).is_some());
+        assert!(build_resolve_request(&mut out, 0, &past).is_none());
+        assert!(build_resolve_request_sized(&mut out, 0, &fits, 1, SizeChange::Grow).is_some());
+        assert!(build_resolve_request_sized(&mut out, 0, &past, 1, SizeChange::Grow).is_none());
+        assert!(build_read_range_request(&mut out, 0, 1, &fits).is_some());
+        assert!(build_read_range_request(&mut out, 0, 1, &past).is_none());
+        assert!(build_resolve_request_rename(&mut out, 0, &fits, &fits, 0).is_some());
+        assert!(build_resolve_request_rename(&mut out, 0, &past, b"b", 0).is_none(), "the source");
+        assert!(build_resolve_request_rename(&mut out, 0, b"a", &past, 0).is_none(), "the destination");
+    }
 }

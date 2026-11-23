@@ -7,6 +7,7 @@ use crate::mm::test_support::init_global_heap;
 use crate::object::Process;
 
 mod acting;
+mod authority;
 mod installs;
 mod numbers;
 mod object_casts;
@@ -607,6 +608,11 @@ struct Forwarded {
 }
 
 fn forwarded_memobj_lookup() -> Forwarded {
+    forwarded_memobj_lookup_asking(Rights::MAP_READ)
+}
+
+/// [`forwarded_memobj_lookup`], its lookup asking `requested`.
+fn forwarded_memobj_lookup_asking(requested: Rights) -> Forwarded {
     use crate::object::ipc_channel::StoredMsg;
     use crate::object::userspace_server::Forward;
     use crate::object::{IpcChannel, MemoryObject, PendingOperation, UserspaceServerReg};
@@ -616,8 +622,8 @@ fn forwarded_memobj_lookup() -> Forwarded {
     let reg = UserspaceServerReg::try_new(k).unwrap();
     let po = Ref::new(PendingOperation::try_new().unwrap());
     let mut msg = StoredMsg::zeroed();
-    msg.header.payload_len = build_resolve_request(&mut msg.payload, Rights::MAP_READ.bits(), b"f").unwrap() as u32;
-    let forwarded = crate::sched::us_forward_originate(&reg, &mut msg, &po, Rights::MAP_READ, b"f", Forward::PLAIN);
+    msg.header.payload_len = build_resolve_request(&mut msg.payload, requested.bits(), b"f").unwrap() as u32;
+    let forwarded = crate::sched::us_forward_originate(&reg, &mut msg, &po, requested, b"f", Forward::PLAIN);
     assert_eq!(forwarded, crate::sched::ForwardOutcome::Pending);
     // The request's envelope turned round, as a server's reply: flags REPLY, a MEMOBJ body.
     let mut reply = StoredMsg::zeroed();

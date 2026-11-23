@@ -560,3 +560,22 @@ fn drop_releases_every_owned_box() {
         verify(&tree);
     }
 }
+
+/// **`find_free_range` takes the whole window and refuses one page more**, and finds a hole between
+/// two mappings that fits exactly, a `gap` above the one below and below the one above.
+#[test]
+fn find_free_range_holds_its_window_and_takes_an_exact_hole() {
+    init_global_heap();
+    let (min, max, gap) = (0x10_0000, 0x10_0000 + 4 * PAGE, PAGE);
+    let empty = VmaTree::new();
+    assert_eq!(empty.find_free_range(va(min), va(max), 4 * PAGE, gap), Some(range(min, max)), "the window, whole");
+    assert_eq!(empty.find_free_range(va(min), va(max), 5 * PAGE, gap), None, "a page past it");
+
+    let mut tree = VmaTree::new();
+    let below = range(0x20_0000, 0x20_0000 + PAGE);
+    let hole = below.end().as_u64() + gap;
+    insert_or_panic(&mut tree, below);
+    insert_or_panic(&mut tree, range(hole + 2 * PAGE + gap, hole + 3 * PAGE + gap));
+    let found = tree.find_free_range(va(below.start().as_u64()), va(0x40_0000), 2 * PAGE, gap);
+    assert_eq!(found, Some(range(hole, hole + 2 * PAGE)), "the hole that fits exactly");
+}

@@ -442,6 +442,19 @@ fn duplicate_requires_duplicate_right() {
     close_release(&t, h, 1).unwrap();
 }
 
+/// **A duplicate asked for a right its source lacks does not get it**: a holder of `SIGNAL` and
+/// `DUPLICATE` cannot mint `TERMINATE`, which the type allows a process handle.
+#[test]
+fn duplicate_cannot_amplify() {
+    let t = fresh_table();
+    let original = t.install(1, mk_process(1), Rights::SIGNAL | Rights::DUPLICATE).unwrap();
+    let copy = t.duplicate(original, 1, Rights::SIGNAL | Rights::TERMINATE | Rights::DUPLICATE).unwrap();
+    assert!(t.lookup(copy, 1, Rights::SIGNAL).is_ok());
+    assert_eq!(t.lookup(copy, 1, Rights::TERMINATE).unwrap_err(), HandleError::NoAccess);
+    close_release(&t, copy, 1).unwrap();
+    close_release(&t, original, 1).unwrap();
+}
+
 #[test]
 fn duplicate_yields_independent_handle_with_intersected_rights() {
     let t = fresh_table();

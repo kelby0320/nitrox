@@ -33,6 +33,15 @@ std::thread_local! {
     static INSTALLS_LEFT: core::cell::Cell<Option<usize>> = const { core::cell::Cell::new(None) };
     /// Handles this thread installed less those it closed, in every table.
     static NET_INSTALLED: core::cell::Cell<isize> = const { core::cell::Cell::new(0) };
+    /// The owner and rights of this thread's last install asked for, refused or not.
+    static LAST_ASKED: core::cell::Cell<Option<(u32, Rights)>> = const { core::cell::Cell::new(None) };
+}
+
+/// The owner and rights of this thread's last install asked for: a refused one's too, so a test can
+/// read what a syscall would have installed and then rolled back.
+#[cfg(test)]
+pub(crate) fn last_install_asked() -> Option<(u32, Rights)> {
+    LAST_ASKED.with(core::cell::Cell::get)
 }
 
 /// Let this thread install `n` more handles, failing every one after, or any with `None`.
@@ -318,6 +327,8 @@ impl HandleTable {
         rights: Rights,
     ) -> Result<RawHandle, HandleError> {
         debug_assert!(!object.is_null(), "callers must not store null objects");
+        #[cfg(test)]
+        LAST_ASKED.with(|a| a.set(Some((owner_pid, rights))));
         #[cfg(test)]
         if INSTALLS_LEFT.with(|left| left.replace(left.get().map(|n| n.saturating_sub(1))) == Some(0)) {
             return Err(HandleError::OutOfMemory);

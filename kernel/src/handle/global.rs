@@ -137,4 +137,36 @@ mod tests {
         let cell = GlobalTable { state: AtomicU8::new(UNINIT), slot: UnsafeCell::new(MaybeUninit::uninit()) };
         let _ = cell.table();
     }
+
+    /// **Every test's pid in this table is its own**: each names one as a `u32` constant in the
+    /// 4000s, and one that closes all its pid owns would close another test's handles mid-run.
+    #[test]
+    fn each_tests_pid_is_its_own() {
+        fn scan(dir: &std::path::Path, pids: &mut std::vec::Vec<(u32, std::string::String)>) {
+            for entry in std::fs::read_dir(dir).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    scan(&path, pids);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    for (i, line) in std::fs::read_to_string(&path).unwrap().lines().enumerate() {
+                        // However it is written: a visibility, `_`s, a suffix, a comment after.
+                        let decl = line.trim();
+                        let decl = ["pub(crate) ", "pub(super) ", "pub "].iter().find_map(|v| decl.strip_prefix(v));
+                        let value =
+                            decl.unwrap_or(line.trim()).strip_prefix("const ").and_then(|l| l.split_once(": u32 = "));
+                        let digits = value.and_then(|(_, v)| v.split_once(';')).map(|(v, _)| v.replace('_', ""));
+                        let pid = digits.and_then(|v| v.trim().trim_end_matches("u32").parse::<u32>().ok());
+                        if let Some(pid) = pid.filter(|p| (4000..5000).contains(p)) {
+                            pids.push((pid, std::format!("{}:{}", path.display(), i + 1)));
+                        }
+                    }
+                }
+            }
+        }
+        let mut pids = std::vec::Vec::new();
+        scan(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut pids);
+        pids.sort();
+        let twice: std::vec::Vec<_> = pids.windows(2).filter(|w| w[0].0 == w[1].0).collect();
+        assert!(pids.len() > 20 && twice.is_empty(), "pids taken twice: {twice:?}");
+    }
 }

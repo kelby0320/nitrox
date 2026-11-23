@@ -12,6 +12,13 @@ use crate::object::header::{Header, Ref, Shared, kobject};
 use crate::object::{NotificationChannel, ObjectRef};
 use core::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
+std::thread_local! {
+    /// The syscaps of the last user process this test thread made, so a test can read a spawned
+    /// child's without starting it.
+    pub(crate) static MADE_WITH: core::cell::Cell<SysCaps> = const { core::cell::Cell::new(SysCaps::empty()) };
+}
+
 /// A process kernel object (`#[repr(C)]`, [`KObjectHeader`] first).
 #[repr(C)]
 pub struct Process {
@@ -72,6 +79,8 @@ impl Process {
     /// Allocate a userspace process around an already-populated address space, holding
     /// `syscaps`: init gets [`SysCaps::all`], a spawned child `parent.syscaps & args.syscaps`.
     pub fn try_new_user(pid: u32, address_space: AddressSpace, syscaps: SysCaps) -> Result<KBox<Self>, AllocError> {
+        #[cfg(test)]
+        MADE_WITH.with(|c| c.set(syscaps));
         KBox::try_new(Self {
             header: Header::new(),
             pid,

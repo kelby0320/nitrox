@@ -445,7 +445,7 @@ fn the_reap_closes_the_handles_of_an_ended_process_only() {
     use crate::libkern::Rights;
     use crate::object::Timer;
     const ENDED: u32 = 4490;
-    const LIVE: u32 = 4491;
+    const LIVE: u32 = 4493;
     init_global_heap();
     global::init_for_tests();
     let install = |pid| global::get().install(pid, Timer::try_new().unwrap().erase(), Rights::empty()).ok().unwrap();
@@ -456,4 +456,19 @@ fn the_reap_closes_the_handles_of_an_ended_process_only() {
     assert!(global::get().lookup(ended, ENDED, Rights::empty()).is_err(), "the ended process's handle is closed");
     assert!(global::get().lookup(live, LIVE, Rights::empty()).is_ok(), "a live process's is not");
     assert_eq!(global::close_all_owned_by(LIVE), 1);
+}
+
+/// **A poll answers at once and registers nothing**: `wait_on` with a deadline of 0 on objects
+/// none of which is ready is `TimedOut`, and leaves no waiter. The list holds one object nothing
+/// can wait on, whose registration would fail, so a poll that registered first is told apart.
+#[test]
+fn a_poll_answers_at_once_and_registers_nothing() {
+    use crate::object::{IpcChannel, MemoryObject};
+    init_global_heap();
+    let (end, _peer) = IpcChannel::try_new_pair(2).unwrap();
+    let (end, page) = (end.erase(), ObjectRef::new(MemoryObject::try_new(4096).unwrap()));
+    let polled = with_current(inert_ref(1), || wait_on(&[&end, &page], 0, 0));
+    assert!(matches!(polled, WaitResult::TimedOut), "a poll answers TimedOut");
+    let left = end.downcast_ref::<IpcChannel>().unwrap().take_waiters(&mut SCHED.lock().tok);
+    assert!(left.is_empty(), "and leaves no waiter");
 }
