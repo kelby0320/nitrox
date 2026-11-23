@@ -13,6 +13,19 @@ fn partition_rebase_maps_relative_to_absolute() {
     assert_eq!(partition_rebase(count * ss, ss, start, count, ss), None);
 }
 
+/// **Each of `partition_rebase`'s overflows is refused by itself**: wrapped, each would land back
+/// inside the window and send the request elsewhere on the disk.
+#[test]
+fn each_overflow_partition_rebase_makes_is_refused_by_itself() {
+    let ss = 512;
+    let wraps_to_a_block = (1 << 55) + 1;
+    assert_eq!(partition_rebase(0, ss, 0, wraps_to_a_block, ss), None, "the window's size");
+    assert_eq!(partition_rebase(u64::MAX - 511, 2 * ss, 0, 1 << 40, ss), None, "the request's end");
+    assert_eq!(partition_rebase(0, ss, wraps_to_a_block, 1, ss), None, "the window's start");
+    assert_eq!(partition_rebase(ss, ss, u64::MAX / ss, 2, ss), None, "the start and the offset");
+    assert_eq!(partition_rebase(0, ss, u64::MAX / ss - 1, 2, ss), Some((u64::MAX / ss - 1) * ss), "just short");
+}
+
 /// A window refuses a rescan itself, and once retired refuses everything with
 /// `PeerClosed`.
 #[test]
@@ -85,6 +98,7 @@ fn a_window_node_refuses_a_rescan_and_once_retired_forwards_nothing() {
     let flush = (IrpOp::Flush as u32, 0);
     assert_eq!(seen.0.borrow().last(), Some(&flush), "a flush is the disk's cache: not rebased");
     assert_eq!(submit(IrpOp::Read, 100 * 512), KError::InvalidArgument as i32, "past the window's end");
+    assert_eq!(submit(IrpOp::Read, u64::MAX - 511), KError::InvalidArgument as i32, "an offset that wraps");
 
     assert!(!retire_window(&disk), "a disk's node is no window");
     assert!(retire_window(&part));
