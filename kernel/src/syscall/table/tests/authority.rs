@@ -17,15 +17,15 @@ fn as_user<R>(pid: u32, syscaps: SysCaps, f: impl FnOnce() -> R) -> R {
     crate::sched::with_current(Ref::new(user_thread_no_stack(1, process, 0x40_0000, 0x7fff_f000)), f)
 }
 
-fn page(pid: u32, rights: Rights) -> RawHandle {
+fn user_page(pid: u32, rights: Rights) -> RawHandle {
     install(pid, ObjectRef::new(MemoryObject::try_new(PAGE_SIZE).unwrap()), rights).unwrap()
 }
 
-fn namespace(pid: u32, rights: Rights) -> RawHandle {
+fn user_namespace(pid: u32, rights: Rights) -> RawHandle {
     install(pid, ObjectRef::new(Namespace::try_new().unwrap()), rights).unwrap()
 }
 
-fn without(rights: Rights, gone: Rights) -> Rights {
+fn rights_without(rights: Rights, gone: Rights) -> Rights {
     Rights::from_bits_truncate(rights.bits() & !gone.bits())
 }
 
@@ -36,8 +36,8 @@ fn a_bind_needs_the_syscap_and_a_direct_one_a_handle_that_may_leave() {
     const PID: u32 = 4481;
     init_global_heap();
     global::init_for_tests();
-    let ns = namespace(PID, namespace_rights());
-    let movable = page(PID, Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE);
+    let ns = user_namespace(PID, namespace_rights());
+    let movable = user_page(PID, Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE);
     let bind = |at: &[u8], h: RawHandle, base: &[u8]| {
         sys_ns_bind(ns.bits(), at.as_ptr() as u64, at.len(), h.bits(), base.as_ptr() as u64, base.len())
     };
@@ -45,7 +45,7 @@ fn a_bind_needs_the_syscap_and_a_direct_one_a_handle_that_may_leave() {
     assert_eq!(as_user(PID, SysCaps::empty(), || bind(b"/a", movable, b"")), Err(KError::NoAccess));
     assert_eq!(as_user(PID, binder, || bind(b"/a", movable, b"")), Ok(0));
     for kept in [Rights::TRANSFER, Rights::DUPLICATE] {
-        let h = page(PID, without(Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE, kept));
+        let h = user_page(PID, rights_without(Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE, kept));
         assert_eq!(as_user(PID, binder, || bind(b"/b", h, b"")), Err(KError::NoAccess), "without {kept:?}");
     }
     assert_eq!(as_user(PID, binder, || bind(b"/c", movable, b"/base")), Err(KError::InvalidArgument), "a base");
@@ -58,8 +58,8 @@ fn a_copy_of_a_namespace_needs_lookup_on_it() {
     const PID: u32 = 4482;
     init_global_heap();
     global::init_for_tests();
-    let blind = namespace(PID, without(namespace_rights(), Rights::LOOKUP));
-    let seeing = namespace(PID, namespace_rights());
+    let blind = user_namespace(PID, rights_without(namespace_rights(), Rights::LOOKUP));
+    let seeing = user_namespace(PID, namespace_rights());
     assert_eq!(as_user(PID, SysCaps::empty(), || sys_ns_create(blind.bits())), Err(KError::NoAccess));
     assert!(as_user(PID, SysCaps::empty(), || sys_ns_create(seeing.bits())).is_ok());
     global::close_all_owned_by(PID);
@@ -72,8 +72,8 @@ fn a_lookup_gets_only_what_both_its_ask_and_its_grant_allow() {
     const PID: u32 = 4483;
     init_global_heap();
     global::init_for_tests();
-    let ns = namespace(PID, namespace_rights());
-    let read_only = page(PID, Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE);
+    let ns = user_namespace(PID, namespace_rights());
+    let read_only = user_page(PID, Rights::MAP_READ | Rights::TRANSFER | Rights::DUPLICATE);
     let at = b"/m";
     let bind = || sys_ns_bind(ns.bits(), at.as_ptr() as u64, at.len(), read_only.bits(), 0, 0);
     assert_eq!(as_user(PID, SysCaps::BIND_NAMESPACE, bind), Ok(0));
@@ -113,13 +113,13 @@ fn a_send_moves_only_what_may_leave_and_arrives_stamped_with_its_sender() {
             sys_channel_send(a.bits(), m, hs, moved.len() as u64, SendMode::NoBlock as u64, 0)
         })
     };
-    let kept = page(PID, Rights::MAP_READ);
+    let kept = user_page(PID, Rights::MAP_READ);
     assert_eq!(send(&msg, &[kept]), Err(KError::NoAccess), "a handle without TRANSFER");
     msg.header.payload_len = IPC_PAYLOAD_SIZE as u32 + 1;
     assert_eq!(send(&msg, &[]), Err(KError::InvalidArgument), "a payload past its end");
     msg.header.payload_len = IPC_PAYLOAD_SIZE as u32;
     msg.header.sender_pid = PID + 1;
-    assert_eq!(send(&msg, &[page(PID, Rights::MAP_READ | Rights::TRANSFER)]), Ok(0));
+    assert_eq!(send(&msg, &[user_page(PID, Rights::MAP_READ | Rights::TRANSFER)]), Ok(0));
     let mut out = KBox::<StoredMsg>::try_new_zeroed().unwrap();
     let (mut handles, mut count) = ([0u64; IPC_HANDLE_MAX], IPC_HANDLE_MAX);
     let (o, hs, c) = (&raw mut *out as u64, handles.as_mut_ptr() as u64, &raw mut count as u64);
@@ -134,7 +134,7 @@ fn a_map_takes_no_more_than_its_object_holds() {
     const PID: u32 = 4485;
     init_global_heap();
     global::init_for_tests();
-    let h = page(PID, Rights::MAP_READ);
+    let h = user_page(PID, Rights::MAP_READ);
     let map = |size: usize| {
         as_user(PID, SysCaps::empty(), || sys_memory_map(h.bits(), 0, size as u64, Rights::MAP_READ.bits(), 0))
     };
@@ -153,7 +153,7 @@ fn a_child_gets_none_of_the_syscaps_its_parent_lacks() {
     let image = MemoryObject::try_new_filled(&crate::mm::elf::a_test_image()).unwrap();
     let mut args = SpawnArgs::zeroed();
     args.image = install(PID, ObjectRef::new(image), Rights::MAP_READ).unwrap();
-    args.namespace = namespace(PID, namespace_rights());
+    args.namespace = user_namespace(PID, namespace_rights());
     args.syscaps = (SysCaps::BIND_NAMESPACE | SysCaps::REAL_TIME).bits();
     let parent = SysCaps::BIND_NAMESPACE | SysCaps::AUDIT_CONTROL;
     let spawned = as_user(PID, parent, || {
