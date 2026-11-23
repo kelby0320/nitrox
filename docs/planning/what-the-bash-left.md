@@ -741,6 +741,10 @@ Where it departs from the above:
 - **The PCI fixtures answer a sizing read with their type bits**, the 64-bit one too, so each
   mask's control fails; a 32-bit prefetchable BAR holds the 32-bit memory mask.
 - **drv-15's `FIRST_KEY` bound is held as well**, by slots naming usages 3 and 2.
+- **Its review (#466) held the cap where it falls**, the 128th entry read and the 129th not, and
+  the window node's wrapping end by its own guard. A long HID item past its bytes is refused as a
+  short one is, a mouse collection inside the first does not end it, and `issue` asserts the
+  fragments `command_for` refuses.
 
 ### H.9 The parsers and the credential path, held
 

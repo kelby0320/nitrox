@@ -39020,8 +39020,9 @@ H.7 merged, #465. H.8 on `pre-phase-7/h8-driver-guards`, as
 [`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.8 plans it: tests, and one fix.
 
 - **USB storage refuses a request past the 64 fragments a command carries** (drv-12), as AHCI's
-  backstop does. It issued the first 64 and completed the request whole: a short transfer read as
-  a full one. `dispatch_block_irp`'s own check, before either driver, is held beside it.
+  backstop does. It issued the first 64 under a command wrapper asking for them all, so the device
+  and the host disagreed on the data stage. `dispatch_block_irp`'s own check, before either
+  driver, is held beside it.
 - **Each guard on a device's or a disk's bytes is held by an input only it decides** (drv-9 to
   drv-11, drv-13 to drv-15): a GPT's entry size and the entries it declares, each of a partition
   window's four overflows, a USB descriptor shorter than its kind at each reader, a HID item cut
@@ -39030,4 +39031,6 @@ H.7 merged, #465. H.8 on `pre-phase-7/h8-driver-guards`, as
   gave the same answer on the inputs the tests had.
 - **The tests of `pci`, the HID descriptor and the xHCI descriptors are files of their own**, and
   `pci/mod.rs` leaves the size baseline.
-
+- **The #466 review** found a long HID item running past its descriptor accepted, where a short
+  one is refused: it is refused too. A GPT declaring more than 128 entries still reads its first
+  128, as the plan has it.
