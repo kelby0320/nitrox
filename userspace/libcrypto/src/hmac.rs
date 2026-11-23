@@ -109,6 +109,16 @@ mod tests {
         );
     }
 
+    /// **A key past a block is its digest, and a key of a block is itself**: the hashed-down path
+    /// starts at 65 bytes, as a password of 65 to 128 bytes takes it.
+    #[test]
+    fn a_key_past_a_block_is_hashed_and_a_key_of_a_block_is_not() {
+        let key = [0x4Bu8; 65];
+        let hashed = |k: &[u8]| hmac_sha256(&crate::sha256::sha256(k), b"m");
+        assert_eq!(hmac_sha256(&key, b"m"), hashed(&key), "65 bytes");
+        assert_ne!(hmac_sha256(&key[..64], b"m"), hashed(&key[..64]), "64 bytes");
+    }
+
     /// Dropped, a MAC holds nothing of its key: neither `opad` nor the inner hash keyed by it.
     #[test]
     fn a_dropped_mac_is_zeroed() {
