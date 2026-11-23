@@ -488,12 +488,14 @@ impl State<'_> {
         if try_touch(vol, req) || self.try_resolve_rename(vol, req) {
             return;
         }
-        if let Some((request_id, dir)) = directory_open(vol, req) {
-            return self.open_dir_session(request_id, dir);
-        }
+        let walked = match directory_open(vol, req) {
+            Some((request_id, Ok(dir))) => return self.open_dir_session(request_id, dir),
+            Some((_, Err(e))) => Err(e),
+            None => Ok(()),
+        };
         let (request_id, op) = librsproto::decode(req).map_or((0, 0), |m| (m.request_id, m.op));
         // A grow comes first so the map covers the new size; its failure is the reply.
-        let served = match self.maybe_grow(vol, req) {
+        let served = match walked.and_then(|()| self.maybe_grow(vol, req)) {
             Err(e) => Served::Error {
                 reply_len: encode_error(self.out.payload(), request_id, kerror(e).as_i32(), OP_NS_RESOLVE, reason(e)),
             },

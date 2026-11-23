@@ -18,7 +18,8 @@ J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6
 2026-11-16, #444 merged; Part F detailed 2026-11-16, and F.1 to F.5 built the same day; Part F done
 2026-11-17, #450 merged and its Miri run clean; Part G detailed 2026-11-17, G.1 to G.3 built the
 same day, G.4 to G.6 2026-11-18, and G.7 2026-11-19, and Miri at its end the same day; Part G done
-2026-11-19; Part H detailed 2026-11-19, and H.1 to H.3 built 2026-11-20.** Each later part gets its detail pass when it is next. Ten
+2026-11-19; Part H detailed 2026-11-19, H.1 to H.3 built 2026-11-20, and H.4 rescoped and built
+2026-11-23.** Each later part gets its detail pass when it is next. Ten
 parts, A–J, in the order below: Part I between D and E, and **Part J between Part E's two halves**
 (the maintainer's call, 2026-11-02). Part E is the syscall-surface consolidation, planned separately
 in [`syscall-surface.md`](syscall-surface.md).
@@ -1090,13 +1091,15 @@ E will have moved much of the code they name, then reproduced and fixed with a t
 without it, as Part D's are. **Detailed 2026-11-19**, in
 [`what-the-bash-left.md`](what-the-bash-left.md): ten sub-parts, a PR each, measured on `main` at
 #458's merge. Of fifty-one open, four were fixed by later work, and fifteen defects and thirty-two
-test gaps remain. The ext4 defects first; then service-mgr; storage-service and the broker; every
-server the sessions share, held to a share a session (the maintainer's call); and the shell's
-`$env`, written through. Then the test gaps, by subsystem. The kernel's per-process quotas stay
-deferred, the maintainer's call.
+test gaps remain. The ext4 defects first; then service-mgr; storage-service and the broker; the
+profile server's index and an eject's session; and the shell's `$env`, written through. Then the
+test gaps, by subsystem. The kernel's per-process quotas stay deferred, the maintainer's call, and
+so, since 2026-11-23, does a share a session of the servers the sessions share
+(`TODO(server-fanout)`).
 
 - **Supervisors, sessions and parsers**: one app holding every client slot of the view broker or
-  the storage service (sec-4, sup-6), `service-mgr`'s backoff, and the rest of the class.
+  the storage service (sec-4, sup-6, deferred 2026-11-23), `service-mgr`'s backoff, and the rest
+  of the class.
 - **Test gaps on a security boundary** that Part D's fixes do not write: the crypto comparison and
   padding, `authenticate`, the GPT and partition guards, the USB descriptors, the kernel's codec,
   a handle's rights and a fresh frame's zeroes.

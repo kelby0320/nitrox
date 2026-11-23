@@ -35,7 +35,8 @@ pub const OP_STORAGE_IN_USE: u16 = 0x1002;
 /// Answered once it is safe to pull; **the drive goes whole**: every filesystem mounted on the
 /// same disk is unmounted, or none is. Refused `NotFound`, `NoAccess` (an internal disk) or
 /// `WouldBlock` (a file held). Reply body: their mount names, one per line ([`ejected_names`])
-/// (`rsproto-storage-ops.md` § `Eject`).
+/// (`rsproto-storage-ops.md` § `Eject`). **A media session carries one**: the service closes it
+/// once it has answered, whatever the answer.
 pub const OP_STORAGE_EJECT: u16 = 0x1003;
 /// Service → client, on a **watch**: **the set of mounts changed, or the set of devices** (a
 /// partition a rescan published holding nothing changes no mount, and `disk --partition` waits

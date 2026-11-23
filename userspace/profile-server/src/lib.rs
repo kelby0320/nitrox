@@ -8,6 +8,7 @@
 
 extern crate alloc;
 
+pub mod index;
 pub mod manifest;
 
 /// Which package directory a resolve suffix names, and what inside it.

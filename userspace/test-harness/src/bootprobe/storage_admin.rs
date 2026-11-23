@@ -17,7 +17,7 @@ use libos::{Op, fs};
 /// 5. **A watch and a media session, opened through a session endpoint**: the watch is pinged by
 ///    the unmount and the remount, not by the refused unmount; the media session's `Eject` of the
 ///    scratch disk (a RAM disk, not removable) is `NoAccess`, of an unmounted name `NotFound`,
-///    both leaving the mount as it was.
+///    both leaving the mount as it was; and a session closes once it has answered, each refusal.
 /// 6. **`Reread`'s refusals**: the mounted scratch disk and the disk holding `init`'s root,
 ///    `WouldBlock`; an unmounted partition of the disk the machine started from, `NoAccess`; an
 ///    unknown name, `NotFound`. None pings the watch.
@@ -283,19 +283,29 @@ pub(super) fn storage_admin_test(root: Root<'_>) -> bool {
     }
 
     // 9. **A session's eject** of the scratch disk, a RAM disk: refused `NoAccess`, since an
-    //    internal disk is the `storage` grant's; a name nothing is mounted under, `NotFound`.
-    let eject = |id: u64, name: &[u8]| {
-        if !rs_send(&media, OP_STORAGE_EJECT, id, name, Carried::new()) {
-            return None;
-        }
-        let m = receive(&media, clock_ns() + 30_000_000_000)?;
-        Some(m)
+    //    internal disk is the `storage` grant's; a name nothing is mounted under, `NotFound`; a
+    //    request that is not `Eject`, `Unsupported`; a name not UTF-8, `InvalidArgument`. **A
+    //    media session carries one request**: closed once answered, whatever the answer.
+    let ask_on = |media: Handle<Channel, Only>, op: u16, id: u64, body: &[u8]| {
+        let m = rs_send(&media, op, id, body, Carried::new()).then(|| receive(&media, clock_ns() + 30_000_000_000));
+        (m.flatten(), exits::peer_gone_by(&media, clock_ns() + 5_000_000_000))
     };
-    if !refused(&eject(1, b"nitrox-scratch"), KError::NoAccess) {
-        return fail(b"a session's eject of the scratch disk was not refused NoAccess");
-    }
-    if !refused(&eject(2, b"no-such-label"), KError::NotFound) {
-        return fail(b"a session's eject of an unknown name was not refused NotFound");
+    let asked: [(&[u8], u16, &[u8], KError); 4] = [
+        (b"an eject of the scratch disk", OP_STORAGE_EJECT, b"nitrox-scratch", KError::NoAccess),
+        (b"an eject of an unknown name", OP_STORAGE_EJECT, b"no-such-label", KError::NotFound),
+        (b"an InUse", OP_STORAGE_IN_USE, b"", KError::Unsupported),
+        (b"an eject of a name not UTF-8", OP_STORAGE_EJECT, b"\xff", KError::InvalidArgument),
+    ];
+    let mut first = Some(media);
+    for (k, (what, op, body, err)) in asked.into_iter().enumerate() {
+        let Some(media) = first.take().or_else(|| lookup(root, "/svc/storage/info/media", chan).ok()) else {
+            return fail(b"no media session");
+        };
+        let (answer, closed) = ask_on(media, op, k as u64 + 1, body);
+        if !refused(&answer, err) || !closed {
+            Line::new().s(b"boot-probe: storage admin: on a media session, ").s(what).end();
+            return fail(b"a media session's request was not refused as it should be, or its session stayed open");
+        }
     }
     if !answered(&ask(OP_STORAGE_IN_USE, &[])) || pinged(0) {
         return fail(b"an eject refused pinged the watch");
@@ -421,7 +431,7 @@ pub(super) fn storage_admin_test(root: Root<'_>) -> bool {
         }
         None => log::write(b"boot-probe: storage admin: no USB disk holding a partition and nothing mounted here; test-qemu attaches one\n"),
     }
-    log::write(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session, a watch pinged by the unmount and the remount and not by a refusal, a session's eject of a RAM disk refused NoAccess, each Reread refusal its own ok\n");
+    log::write(b"boot-probe: storage admin: InUse the mounts and their disks, an unmount refused while a file was held, a file written and never synced on the device after the unmount, left clean, mounted again by name, each refusal its own, no admin reached from a session, a watch pinged by the unmount and the remount and not by a refusal, a session's eject of a RAM disk refused NoAccess and its media session closed, each Reread refusal its own ok\n");
     true
 }
 

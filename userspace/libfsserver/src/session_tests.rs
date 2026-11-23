@@ -21,6 +21,8 @@ pub(crate) struct Spy {
     pub(crate) file: bool,
     /// Whether a rename by path succeeds, rather than finding nothing.
     pub(crate) renames: bool,
+    /// What a walk to a directory fails with, whatever the path.
+    pub(crate) walk: Option<FsError>,
 }
 
 pub(crate) struct Never;
@@ -91,7 +93,11 @@ impl Volume for Spy {
         Err(FsError::NotFound)
     }
     fn resolve_dir(&self, _: &[u8]) -> Result<u64, FsError> {
-        if self.file { Err(FsError::NotFound) } else { Ok(7) }
+        match self.walk {
+            Some(e) => Err(e),
+            None if self.file => Err(FsError::NotFound),
+            None => Ok(7),
+        }
     }
     fn read_dir(&self, _: u64, _: u64, mut emit: impl FnMut(&DirEntry) -> bool) -> Result<u64, FsError> {
         let name = [b'n'; 200];

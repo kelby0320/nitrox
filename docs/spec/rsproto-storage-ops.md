@@ -2,7 +2,8 @@
 
 **Status: normative for what is built (2026-09-25; `InUse` and the boot medium 2026-10-06; the media
 session, `Eject`, the watch and `Changed` 2026-10-07; `Reread`, and `Changed` for the devices too,
-2026-10-07; an ejected stick stopped, and refused a mount or a reread, 2026-10-19).** `Mount`,
+2026-10-07; an ejected stick stopped, and refused a mount or a reread, 2026-10-19; a media session
+closed once it has answered its request, 2026-11-23).** `Mount`,
 `Unmount` and `InUse` are implemented in `userspace/storage-service/` and encoded by
 `userspace/librsproto/src/storage.rs` (administration Part C.5c). The view broker's `storage` grant
 binds the admin endpoint into a view (C.6), and `disk --mount` and `disk --unmount` speak these
@@ -40,9 +41,10 @@ Past either, the resolve is `WouldBlock`.
 **A session ejects, and follows the mounts, without one** (Phase 6 Part F). A session endpoint
 answers `info/media` with a media session and `info/watch` with a watch, as it answers the tables;
 neither mounts anything, and neither suffix is listed in `info`. Two media sessions can be open at
-once, each held for a request; past that the resolve is `WouldBlock`, and `disk --eject` says to try
-again. Thirty-two watches can be held, the machine's; with all held, a resolve pings every watcher,
-lets go of the ones whose clients have gone, and is refused `WouldBlock` if none had.
+once, **each carrying one request**: the service closes it once it has answered. Past two the
+resolve is `WouldBlock`, and `disk --eject` says to try again. Thirty-two watches can be held, the
+machine's; with all held, a resolve pings every watcher, lets go of the ones whose clients have
+gone, and is refused `WouldBlock` if none had.
 
 The filesystems and the table of what is on each disk are ordinary `Namespace` and `File`
 operations under `/svc/storage/fs` and `/svc/storage/info`

@@ -61,7 +61,9 @@ servers speak one protocol and a fix to it is a fix to both:
   the id comes from: an unlink's last name, a replaced rename target, or a truncate that ends an id
   (FAT's, to zero).
 - **A rename is resolved before the directory-session path**, which infers "directory open" from
-  the suffix naming a directory; renaming a directory names one too.
+  the suffix naming a directory; renaming a directory names one too. **Only a walk that found no
+  directory falls through to the file path**: any other failure is the answer, as a directory read
+  as a file is `NotFound` (`serve::directory_open`).
 - **A removed directory's sessions end** (`Sessions::end_on`, which `Volume::rmdir_at` is handed
   and calls before it changes anything, so a removal that then fails ends them too): a session
   holds a bare id, and each filesystem gives a freed one to the next directory made. Checking the

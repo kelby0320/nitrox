@@ -1,6 +1,7 @@
 # What the bash left
 
-**Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
+**Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
+2026-11-23, H.5 folded into it.** Part H of [`pre-phase-7.md`](pre-phase-7.md): the findings of the
 bug bash triaged **later**, which [`bug-bash.md`](bug-bash.md) records, checked against `main` and
 fixed, each with a test that fails without it.
 
@@ -126,6 +127,9 @@ What they found is below.
      server then caches an empty index, so `/applications` and `/system/manual` stay empty until
      it restarts. **Only the view broker can tell sessions apart**, by its `/s/<id>` base: a
      forwarded resolve reaches a server zeroed, with no sender.
+
+     **Deferred 2026-11-23**, with sec-4 and sup-6 (the maintainer's call below), all but the
+     profile server's cached index, which H.4 fixes.
 6. **What the bash found beside its findings**, each fixed in the sub-part it rides with:
    - **The spawn path's syscap intersection is untested.** With `pp.syscaps() & requested` made
      `requested` (`kernel/src/syscall/table/spawn.rs`), every kernel test passes, and a child could
@@ -188,11 +192,11 @@ What they found is below.
 
 ### The maintainer's calls (2026-11-19)
 
-- **Every shared server, by one mechanism.** Each server any session reaches learns the session
-  from its binding, as `/dev/views` already does. It then keeps a per-session share of its slots
-  and reclaims an idle one when full. That covers the view broker, storage-service, device-mgr,
-  the root filesystem and every FAT stick through `libfsserver`, tty-server, the clipboard and the
-  profile server, over two sub-parts.
+- **Every shared server, by one mechanism.** *Reversed 2026-11-23, below.* Each server any
+  session reaches learns the session from its binding, as `/dev/views` already does. It then
+  keeps a per-session share of its slots and reclaims an idle one when full. That covers the view
+  broker, storage-service, device-mgr, the root filesystem and every FAT stick through
+  `libfsserver`, tty-server, the clipboard and the profile server, over two sub-parts.
 - **The kernel's per-process quotas stay deferred.** The 512-thread cap and the deadline heap's
   slots are system-wide, and one process can take them all. The 2026-10-22 entry called this Part
   H's quota question. It is not a bash finding, and it needs per-process accounting in the kernel.
@@ -209,17 +213,34 @@ What they found is below.
 
   The spec, which says `$env` cannot be assigned, changes with it.
 
+### The maintainer's call (2026-11-23)
+
+- **The shared servers' slots stay the machine's.** H.4's detail found what a share a session
+  would take:
+  - an id in every session's bindings;
+  - a pool in seven servers;
+  - an eviction notice that librsproto's `Dir` resumes from;
+  - for the filesystems, a session marker no path can begin with. Only a NUL byte, or a session
+    endpoint of each server's own, could give one.
+
+  The harm is a program the user ran holding every slot of a server until it exits, and the
+  kernel's per-process quotas, which one process can exhaust too, stay deferred. So sec-4, sup-6
+  and the slot class are deferred to `TODO(server-fanout)`. A server's limit is the `sys_wait`
+  width, and the readiness mechanism that entry describes would make it the machine's memory
+  instead. Its trigger stands, and the entry now carries the bash's evidence.
+- **What is wrong at any load stays, in H.4:** the profile server's index kept with a package
+  missing, and a media session held past its answer.
+
 ### The order
 
 1. **The defects first, worst first.** ext4's two (H.1) are a crafted stick destroying a
-   filesystem. Then service-mgr (H.2), storage-service and the broker (H.3), the shared servers'
-   slots (H.4, H.5) and the shell (H.6).
+   filesystem. Then service-mgr (H.2), storage-service and the broker (H.3), the profile server's
+   index and an eject's session (H.4), and the shell (H.6).
 2. **Then the test gaps, by subsystem:** the kernel's guards (H.7), the drivers' (H.8), the
    parsers' and the credential path's (H.9), and the filesystems' (H.10).
 
-Each sub-part needs only those before it that touch the same files. H.3 moves code out of
-storage-service's `main.rs` that H.4 then builds on, and H.5 changes `libfsserver`'s admission
-before H.10 tests its other bounds.
+Each sub-part needs only those before it that touch the same files: H.4 follows H.3 into
+storage-service's `main.rs`.
 
 ### How each is held
 
@@ -529,69 +550,43 @@ services.
   unmount's answer is `mounts::unmount_recorded`, in the library.
 - **The probe tests were the implementer's**, each mutation run again by the author.
 
-### H.4 Every shared server, part one: the mechanism, the broker, storage-service and device-mgr
+### H.4 The profile server's index, and an eject's session
 
-**The mechanism.**
-- **A session is named in its binding.** Its supervisor binds each shared server at a base that
-  carries the session's id, as `/dev/views` is bound at `/s/<id>` today. The kernel prepends a
-  base to every resolve, so a program in the session cannot leave it off, and only a holder of
-  `BIND_NAMESPACE` can choose it.
-- **Each server reads the session before the rest of the suffix**, and keeps a per-session share
-  of its slots in one library type, a pool:
-  - it admits a session's new client only within that session's share;
-  - when the pool is full, it reclaims the oldest idle slot that can be reclaimed;
-  - it frees every slot of a session that has ended.
-- **What H.4's own detail settles first:**
-  - which id the servers share, the broker's or the supervisor's, and how an ended session
-    reaches each server;
-  - a session marker no path can begin with, for the filesystems' suffixes in H.5;
-  - the share's size per pool;
-  - **what counts as idle, and what an evicted client sees.** Today a full table answers the
-    newcomer `WouldBlock`, which clients retry. An evicted client's next operation would get
-    `PeerClosed`, which none retries, and a `libfsserver` directory session also carries mkdir,
-    unlink, rmdir, touch and rename. So only a session with nothing in flight is reclaimed, and
-    what its client is told lets librsproto's `Dir` resolve again and resume at its cursor.
+*Rescoped 2026-11-23*, by the maintainer's call above: what of the shared servers' slots is wrong
+at any load.
 
-**The servers in H.4:**
-- **The view broker (sec-4).** It already has the identity.
-  - Admission is held to a per-session share, decided in a new library module, since both its
-    files are at their entries.
-  - `end_session` drops the idle and done clients of the session that ended, which it leaves in
-    place today.
-- **storage-service (sup-6).** `/storage` and `/dev/storage` are bound with the session's base.
-  - Directory sessions are held per session. One idle between pages is reclaimed when the pool is
-    full, as it keeps nothing between them.
-  - A media session closes after its eject, as its comment says it should.
-  - Admission moves out of `main.rs`, which is at its entry.
-- **device-mgr.** `/dev/devices`' directory sessions, as storage-service's.
+- **The profile server keeps a projection's index only once every package read whole.**
+  - A package whose directory was refused, or whose listing was cut short, is skipped as before.
+    The view is then not kept, and the next lookup or listing builds it again.
+  - A package with no such directory, `NotFound`, is read whole: most have no `applications/`.
+  - The merge and the keep move into `profile_server::index`.
+  - Test: one package refused and another served, then both once the refusal clears, and the
+    view kept after.
+- **A media session closes once it has answered its request**, as its comment and the spec say it
+  is held for one. The eject moves out of storage-service's `main.rs`, into `media.rs`.
+  - Test: `boot-probe`'s storage admin test, its first eject's session closed after the answer.
 
-**Tests:** the pool's decisions in the library, and each server's admission over the mock, which
-storage-service and device-mgr take as a dev-dependency. Whether a boot can show it is H.4's to
-settle: boot-probe is a service, not a session.
+**Gates:** `test-qemu`, every gate that logs in (the profile server's `/applications`),
+`check-storage` and `check-media`.
 
-**Gates:** every gate that logs in, and `check-storage` and `check-media`.
+**Built 2026-11-23**, in two commits. Where it departs from the above:
+- **The profile index is held on the host, not over the mock.** The binary opens each package's
+  directory and says whether it read whole. The merge, the keep and which failure is "no such
+  directory" are `profile_server::index`'s. The release gates' boots show the last:
+  `/applications` and `/manual` are each built once, every package without one counted read.
+- **`boot-probe`'s storage admin test opens a second media session** for its second eject.
+- **Its review (#463) narrowed when a view not kept is built again**: at a listing's first page and
+  for a name it lacks, which is `WouldBlock` while a package that may hold it has not read. Each
+  later page reads the view its listing began with. The package's read moved into the library.
+- **And found libfsserver answering `NotFound` for a directory whose walk lost a read**: it fell
+  through to the file path, where a directory is `NotFound`, which the profile server takes for
+  "no such directory". Only a walk that finds no directory falls through now; any other failure is
+  the answer.
 
-### H.5 Every shared server, part two: filesystems, terminals, the clipboard, the profile server
+### H.5 Folded into H.4
 
-H.4's mechanism, carried to the rest:
-- **The root filesystem and every FAT stick, through `libfsserver`.** Its sessions take a
-  session's share, and an idle directory session is reclaimed when the table is full. The base's
-  session marker is read and stripped before the path. `libfsserver`'s server tests already drive
-  a full table.
-- **tty-server.** A terminal is not idle while its session lives, so it is held to a share and
-  never reclaimed.
-- **The clipboard and the profile server.** They are held to a share. The profile server caches
-  an index only when every package was read: a package whose directory was refused, or whose
-  listing failed, leaves the index uncached, so the next ask builds it again. Today a full table
-  leaves an index empty or partial until a restart, and programs of a skipped package go
-  unresolved, as programs are resolved from the same index. Test over the mock, after the
-  admission move: one package's resolve refused and another's served, then both served once the
-  refusal clears.
-
-tty-server, the clipboard and the profile server admit clients in their binaries, with no mock.
-Their admission moves into their libraries, with `libos`'s mock as a dev-dependency.
-
-**Gates:** every gate that logs in, `check-terminal`, `check-storage` and `check-media`.
+The rest of the shared servers' slots is deferred, 2026-11-23. `libfsserver`'s admission is
+unchanged, so H.10 tests its bounds as they are.
 
 ### H.6 The shell's environment, and two commands that ignore an argument
 
@@ -776,6 +771,8 @@ to the job. The test allocator of H.9 carries its reason under Miri.
 
 - **The kernel's per-process quotas**: threads and deadline slots, the maintainer's call.
   `TODO(deadline-slot-quota)` stays.
+- **A share a session of the shared servers' slots** (sec-4, sup-6 and their class), the
+  maintainer's call of 2026-11-23. `TODO(server-fanout)` carries them.
 - **An extent over another file's blocks** (fs-11's last clause): only a filesystem check's scan
   can find it, and Linux does not check it either.
 - **The starvation of sup-4 shown in a boot.** The bound is held by host tests, and the flood that

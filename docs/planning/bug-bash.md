@@ -1499,6 +1499,8 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   asserts that 14 clients fill `MAX_WAIT_HANDLES` = 32 (FIXED 3 + 2 each). An idle client counts
   as two slots in `load()` (1601-1613). `end_session` (598-646) touches only Running, Password
   and Changing clients. The exhaustion itself was not booted. trust-boundary. Medium. **Later.**
+  **Deferred** to `TODO(server-fanout)`, the maintainer's call (2026-11-23): the shared servers'
+  slots stay the machine's, as [`what-the-bash-left.md`](what-the-bash-left.md) says.
 
 - [x] **sec-5** `userspace/session-mgr/src/main.rs:376` — `tty_request` takes the first message on
   the login terminal if its op matches, and never steps over tty-server's unsolicited
@@ -1934,6 +1936,9 @@ Found 21, refuted by a boot 0, reported 16.
   the same shape for `/dev/devices` directory sessions (main.rs:55, 389). Unverified: a
   boot-probe client that holds two media sessions should get WouldBlock on a third resolve.
   Lens: trust-boundary. Medium. **Later.**
+  **Deferred** to `TODO(server-fanout)`, the maintainer's call (2026-11-23), as sec-4. A media
+  session now closes once answered (`0120b625`), which holds no slot past an eject; one resolved
+  and never asked still does.
 
 - [x] **sup-7** `userspace/storage-service/src/main.rs:483` — storage-service reads `init.toml`
   differently from init. It stops at the first NUL and maps the object's whole size. Init

@@ -212,7 +212,9 @@ the owning server mints and transfers, returned from an ordinary `sys_ns_lookup`
 **The server chooses object-or-session, from what the path denotes** — not the kernel, and
 not the requested rights. The fs-server runs `ext4::resolve_dir` on the suffix first: a
 suffix naming a directory inode gets a session (`OBJECT_KIND_CHANNEL`, the channel in
-`handles[0]`); anything else falls through to the file path and gets a `FileObject`.
+`handles[0]`); one naming no directory (`NotFound`) falls through to the file path and gets a
+`FileObject`. **Any other failure of the walk is the answer** (pre-Phase-7 Part H.4): a directory
+read as a file is `NotFound`, so an `Io` on the way would have said it was not there.
 
 The client's requested rights are a *separate* axis. `DIR_SESSION_RIGHTS`
 (`SEND | RECV | WAIT`) are the rights appropriate to a channel, and the returned handle is

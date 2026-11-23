@@ -256,6 +256,37 @@ mod tests {
         assert_eq!(e.kerror, KError::TooLarge as i32);
     }
 
+    /// **A read that fails on the walk to a directory is the resolve's `Io`**, at every read.
+    #[test]
+    fn a_failed_read_on_the_walk_to_a_directory_is_its_io() {
+        use libfsserver::serve::directory_open;
+        struct FailsOnce(Vec<u8>, std::cell::Cell<u64>, u64);
+        impl BlockReader for FailsOnce {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+                let n = self.1.replace(self.1.get() + 1);
+                let at = offset as usize;
+                let src = self.0.get(at..at + buf.len()).filter(|_| n != self.2).ok_or(FsError::Io)?;
+                buf.copy_from_slice(src);
+                Ok(())
+            }
+        }
+        impl BlockWriter for FailsOnce {
+            fn write_at(&self, _: u64, _: &[u8]) -> Result<(), FsError> {
+                Err(FsError::Io)
+            }
+        }
+        let img = fixture(1024, b"nitrox-gen-0001\n");
+        let (req, n) = make_request(9, b"system");
+        let whole = FailsOnce(img.clone(), 0.into(), u64::MAX);
+        assert!(matches!(directory_open(&Ext4::new(&whole), &req[..n]), Some((9, Ok(_)))));
+        let reads = whole.1.get();
+        assert!(reads > 0);
+        for k in 0..reads {
+            let dev = FailsOnce(img.clone(), 0.into(), k);
+            assert_eq!(directory_open(&Ext4::new(&dev), &req[..n]), Some((9, Err(FsError::Io))), "read {k} failed");
+        }
+    }
+
     #[test]
     fn resolves_a_file_to_a_memobj_reply() {
         let r = ImageReader(fixture(1024, b"nitrox-gen-0001\n"));

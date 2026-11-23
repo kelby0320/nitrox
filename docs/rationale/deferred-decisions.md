@@ -1474,6 +1474,25 @@ that genuinely needs more than ~31 concurrent clients, or the first time a stall
 starving others is observed rather than theorised — most likely the desktop, where a
 compositor holds a channel per window rather than per short-lived listing.
 
+**The bug bash found the class** (2026-10-20: sec-4, sup-6, and the rest in pre-Phase-7 Part H's
+detail). Every server a session reaches is one pool for the machine:
+- the view broker's 14 clients;
+- the storage service's 9 directory sessions and 2 media sessions;
+- device-mgr's 25;
+- the root filesystem's and each stick's 30;
+- tty-server's 14 terminals;
+- the clipboard's 30 and the profile server's 31.
+
+One program holding its channels open takes every slot until it exits: no `with` and no Restart,
+no eject, no listing on the machine. Neither finding was run. **A share for each session was
+planned and declined** (2026-11-23, the maintainer's call). The servers cannot tell sessions
+apart, so it needed an id in every session's bindings, a pool and an eviction protocol in seven
+servers, and a session marker for the filesystems. That is a lot of architecture against a
+program the user ran, while one process can still take the kernel's threads
+(`TODO(deadline-slot-quota)`). The answer is this entry's: limits the machine's resources set.
+Two defects were wrong at any load, and are fixed: the profile server keeps an index only once
+every package has read, and a media session closes once answered.
+
 **Per-page dirty tracking — `TODO(page-dirty-tracking)`.** `FileObject::writeback` flushes
 every *resident* page, not every *modified* one — the kernel keeps no per-page dirty bit,
 so it cannot tell the difference. Two consequences, both currently benign. Writeback does
@@ -2592,9 +2611,9 @@ slot and an IPC endpoint four (2026-10-25), and the heap grows to cover them, to
 about 131,000 slots. A process creating some 32,000 endpoints or 131,000 timers takes them all,
 and every other process's `sys_timer_create` and `sys_channel_create` then fail `OutOfMemory`. It
 is the quota question the 512-thread cap left (2026-10-22): one process can take every thread
-too. Part H of the work before Phase 7 left it here (the maintainer's call, 2026-11-19): it holds
-the servers' slots to a share a session, not the kernel's to a share a process. Trigger: per-process
-accounting (the rlimits item above), or a report of the refusal.
+too. Part H of the work before Phase 7 left it here (the maintainer's call, 2026-11-19), and on
+2026-11-23 the servers' slots with it: no share a session there either (`TODO(server-fanout)`).
+Trigger: per-process accounting (the rlimits item above), or a report of the refusal.
 
 **Removing a deadline is a scan of the heap — `TODO(deadline-heap-scan)`.** `deadline::remove` finds an
 entry by its target, linearly, under `SCHED` with interrupts masked, and a debug build's

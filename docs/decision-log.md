@@ -38940,3 +38940,35 @@ H.2 merged, #461. H.3 on `pre-phase-7/h3-storage-broker`, as
   as `init`'s is. **No code moved out of its `main.rs`**, which the H.2 entry above expected: each
   fix fitted, and the file fell from 1,160 lines to 1,149.
 - **The probe's test gaps are held** (sup-12, sup-13, T1-24).
+
+## 2026-11-23 — Before Phase 7: H.4, the shared servers' slots stay the machine's
+
+H.3 merged, #462. H.4 on `pre-phase-7/h4-index-and-eject`.
+
+- **The maintainer reversed the call of 2026-11-19** that every server a session reaches keep a
+  share of its slots for each session and reclaim an idle one when full. H.4's detail found what it
+  would take:
+  - an id in every session's bindings, as only the view broker can tell sessions apart today;
+  - a pool in seven servers;
+  - an eviction notice that librsproto's `Dir` resumes from;
+  - for the filesystems, a session marker no path can begin with: the kernel refuses only empty,
+    `.` and `..` components, so only a NUL byte or a session endpoint of each server's own could
+    give one.
+
+  The harm is a program the user ran holding a server's every slot until it exits, and one process
+  can take the kernel's threads too, which stay deferred. **sec-4, sup-6 and the slot class are
+  deferred to `TODO(server-fanout)`**: a server's limit is the `sys_wait` width, and that entry's
+  readiness mechanism would make it the machine's memory instead. The entry now carries the bash's
+  evidence. H.5 is folded into H.4.
+- **What was wrong at any load is fixed.**
+  - **The profile server keeps a projection's index only once every package read whole.** A
+    package refused while the root filesystem's table was full had its programs unlisted and
+    unresolved until a restart. A package with no such directory is read whole. One not kept is
+    built again at a listing's first page and for a name it lacks, which is `WouldBlock` while a
+    package that may hold it has not read; a listing's later pages read the view it began with
+    (the #463 review).
+  - **A filesystem server answers a failed walk with the failure** (the #463 review): one that lost
+    a read fell through to the file path, where a directory is `NotFound`.
+  - **A media session closes once it has answered its request**, as its comment and the spec said
+    it was held for one. The eject moved out of storage-service's `main.rs`, which fell to 1,107
+    lines.
