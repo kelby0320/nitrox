@@ -386,8 +386,7 @@ impl Service {
         (names, self.devices.iter().map(|d| d.record.id).collect())
     }
 
-    /// The one request media session `i` carries, answered, and then the session closed: each is
-    /// held for a request, so a client that keeps its end holds no slot past its answer.
+    /// The one request media session `i` carries, answered; then the session is closed.
     fn serve_media(&mut self, i: usize) {
         let shared = Rc::clone(&self.media_sessions[i]);
         match recv_request(&shared) {

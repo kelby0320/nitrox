@@ -50,11 +50,8 @@ pub const MAX_RUNS: usize = 64;
 
 /// The `(request_id, directory)` of a resolve whose suffix names a directory, which opens a session.
 /// **A suffix over [`MAX_SUFFIX`] opens none**, and [`serve`] refuses it `TooLarge`, rather than
-/// opening what its first [`MAX_SUFFIX`] bytes name, an ancestor or a sibling cut short.
-///
-/// **Only a walk that found no directory goes on as a file's resolve.** Any other failure is the
-/// answer: a directory read as a file is `NotFound`, so an `Io` on the way would say it is not
-/// there.
+/// opening what its first [`MAX_SUFFIX`] bytes name, an ancestor or a sibling cut short. **Only a
+/// walk finding no directory goes on as a file's**: a directory read as a file is `NotFound`.
 pub fn directory_open<V: Volume>(vol: &V, request: &[u8]) -> Option<(u64, Result<u64, FsError>)> {
     let m = decode(request).ok().filter(|m| m.op == OP_NS_RESOLVE)?;
     let r = parse_resolve_request(m.body).filter(|r| r.suffix.len() <= MAX_SUFFIX)?;

@@ -31,14 +31,12 @@ pub struct Entry {
 /// A projection's merged view.
 pub type View = Rc<[Entry]>;
 
-/// Whether opening a package's directory failed only because it has none: such a package is
-/// read whole, with nothing in it. Any other failure may pass, so the view is not kept.
+/// Whether a package's directory failed to open only for want of one: it then reads whole.
 pub fn has_none(e: DirError) -> bool {
     e == DirError::Transport(KError::NotFound.as_i32())
 }
 
-/// Package `pkg`'s entries, from `opened`, its directory's open, listed by `list`; and whether it
-/// read whole, listed to its end or holding no such directory.
+/// Package `pkg`'s entries from its directory's open and listing, and whether it read whole.
 pub fn read_package<D>(
     pkg: usize,
     opened: Result<D, DirError>,
@@ -79,9 +77,8 @@ pub fn merge(count: usize, mut read: impl FnMut(usize) -> (Vec<Entry>, bool)) ->
 }
 
 /// Each projection's view, **kept once every package read whole**: one refused while the root
-/// filesystem's table was full would otherwise stay unlisted and unresolved until a restart. One
-/// not whole is built again only where that could change an answer, a listing's first page or a
-/// name it lacks, and never under a listing begun.
+/// filesystem's table was full would otherwise stay missing until a restart. One not kept is built
+/// again only for a listing's first page or a name it lacks.
 ///
 /// Caching needs no invalidation: a store path is content-addressed, so its contents
 /// cannot change, and the manifest (the profile's membership) is read once at startup.
@@ -92,8 +89,7 @@ pub struct Indexes {
 }
 
 impl Indexes {
-    /// Projection `dir`'s view and whether it is whole: the one held, or what `build` makes when
-    /// none is held, or when it is not whole and `fresh`.
+    /// Projection `dir`'s view and whether it is whole, built when none is held or when `fresh`.
     fn view(&mut self, dir: &str, fresh: bool, build: impl FnOnce() -> (Vec<Entry>, bool)) -> (View, bool) {
         let found = self.views.iter().position(|(d, _, _)| d == dir);
         if let Some(at) = found
@@ -130,8 +126,7 @@ impl Indexes {
         Err(KError::WouldBlock)
     }
 
-    /// The view a listing's page at `cursor` reads: from its first page on, the one it began
-    /// with, `held`, so no listing reads two.
+    /// The view a listing's page reads: the one its first page took, so no listing reads two.
     pub fn listing(
         &mut self,
         dir: &str,

@@ -19,7 +19,6 @@ fn listed(name: &[u8]) -> DirEntry<'_> {
     DirEntry { inode: 4, kind: 1, mode: 0o755, size: 9, mtime: 7, name }
 }
 
-/// Two packages, the first refused until `refused` clears, counting each build in `builds`.
 fn two<'a>(refused: &'a Cell<bool>, builds: &'a Cell<u32>) -> impl FnMut() -> (Vec<Entry>, bool) + 'a {
     move || {
         builds.set(builds.get() + 1);
@@ -31,15 +30,14 @@ fn two<'a>(refused: &'a Cell<bool>, builds: &'a Cell<u32>) -> impl FnMut() -> (V
     }
 }
 
-/// **A package's directory refused, or its listing cut short, reads short**; one it does not
-/// have reads whole, with nothing in it. `.`, `..` and a name that is not UTF-8 are no program.
+/// **A refused open or a cut listing reads short**; a package with no such directory reads whole.
 #[test]
 fn a_package_reads_whole_only_when_listed_to_its_end_or_holding_none() {
     let no_list = |_: &mut (), _: &mut dyn FnMut(&DirEntry<'_>) -> bool| -> Result<bool, DirError> { unreachable!() };
     let refused = |k: KError| read_package(3, Err::<(), _>(DirError::Transport(k.as_i32())), no_list);
-    assert_eq!(refused(KError::NotFound).1, true);
+    assert!(refused(KError::NotFound).1);
     for k in [KError::WouldBlock, KError::IoError] {
-        assert_eq!(refused(k).1, false, "{k:?}");
+        assert!(!refused(k).1, "{k:?}");
     }
     let (got, whole) = read_package(3, Ok(()), |_, f| {
         for name in [&b"."[..], b"..", b"list", b"\xff"] {
@@ -57,8 +55,7 @@ fn a_package_reads_whole_only_when_listed_to_its_end_or_holding_none() {
     assert_eq!((names(&got), whole), (vec![("list", 3)], false), "what was read, short");
 }
 
-/// **A name an unkept view lacks builds it again**: found once the refusal clears, `WouldBlock`
-/// while it has not, as the package refused may hold it. A name it holds builds nothing.
+/// **A name an unkept view lacks builds it again**, `WouldBlock` until the refusal clears.
 #[test]
 fn a_view_with_a_package_refused_is_built_again_for_a_name_it_lacks() {
     let (refused, builds) = (Cell::new(true), Cell::new(0));
@@ -74,8 +71,7 @@ fn a_view_with_a_package_refused_is_built_again_for_a_name_it_lacks() {
     assert_eq!(builds.get(), 3, "a whole view is kept");
 }
 
-/// **A listing reads the view it began with**: a page after the refusal clears does not read the
-/// view built since, which would skip names and repeat others; the next listing reads that one.
+/// **A listing reads the view it began with**, not one built between its pages.
 #[test]
 fn a_listings_pages_read_one_view() {
     let (refused, builds) = (Cell::new(true), Cell::new(0));
@@ -91,7 +87,6 @@ fn a_listings_pages_read_one_view() {
     assert_eq!(builds.get(), 2, "the whole view kept, and not built for the next listing");
 }
 
-/// A listing's first page builds an unkept view again; a whole one is never built again.
 #[test]
 fn a_listing_builds_an_unkept_view_again_and_keeps_a_whole_one() {
     let (refused, builds) = (Cell::new(true), Cell::new(0));
@@ -107,8 +102,7 @@ fn a_listing_builds_an_unkept_view_again_and_keeps_a_whole_one() {
     assert_eq!(builds.get(), 3);
 }
 
-/// **A package with no such directory is read whole**: most packages have no `applications/` or
-/// `manual/`, and a view that counted them as refused would be built on every listing.
+/// **A package with no such directory reads whole**: most have no `applications/`.
 #[test]
 fn a_package_with_no_such_directory_is_read_whole() {
     assert!(has_none(DirError::Transport(KError::NotFound.as_i32())));
@@ -119,8 +113,6 @@ fn a_package_with_no_such_directory_is_read_whole() {
     assert!(!has_none(DirError::Protocol));
 }
 
-/// The first package in manifest order to provide a name wins, as a resolve finds it; each
-/// projection is its own view.
 #[test]
 fn the_first_provider_of_a_name_wins_and_each_projection_is_its_own() {
     let (view, whole) = merge(3, |i| match i {

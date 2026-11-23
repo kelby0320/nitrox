@@ -296,7 +296,6 @@ pub(super) fn storage_admin_test(root: Root<'_>) -> bool {
         (b"an InUse", OP_STORAGE_IN_USE, b"", KError::Unsupported),
         (b"an eject of a name not UTF-8", OP_STORAGE_EJECT, b"\xff", KError::InvalidArgument),
     ];
-    // The first on the session endpoint's media session, each after on one of its own.
     let mut first = Some(media);
     for (k, (what, op, body, err)) in asked.into_iter().enumerate() {
         let Some(media) = first.take().or_else(|| lookup(root, "/svc/storage/info/media", chan).ok()) else {

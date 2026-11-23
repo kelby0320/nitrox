@@ -213,8 +213,7 @@ fn an_eager_resolve_replies_a_read_only_copy_of_the_file() {
     assert_eq!(mock::mappings(), 0, "the server's own view is gone");
 }
 
-/// **A walk that fails is the resolve's answer**, not read again as a file's, where a directory
-/// is `NotFound`; one that finds no directory goes on to the file.
+/// **A failed walk is the resolve's answer**; one finding no directory goes on to the file.
 #[test]
 fn a_resolve_whose_walk_fails_is_answered_with_the_failure() {
     let mut vol = Spy::default();

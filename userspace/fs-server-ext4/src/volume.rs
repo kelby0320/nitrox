@@ -256,8 +256,7 @@ mod tests {
         assert_eq!(e.kerror, KError::TooLarge as i32);
     }
 
-    /// **A read that fails on the walk to a directory is the resolve's `Io`**, at every read it
-    /// takes: had it gone on as a file's resolve, the directory, read again, would be `NotFound`.
+    /// **A read that fails on the walk to a directory is the resolve's `Io`**, at every read.
     #[test]
     fn a_failed_read_on_the_walk_to_a_directory_is_its_io() {
         use libfsserver::serve::directory_open;
