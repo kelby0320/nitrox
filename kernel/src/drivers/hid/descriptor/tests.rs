@@ -303,3 +303,70 @@ fn keys_outside_the_keyboard_collection_are_not_its() {
     assert_eq!(l.report_id, Some(1));
     assert_eq!(l.bits[1], Some(Bits { offset: 8, first: 0, count: 152 }));
 }
+
+/// QEMU's mouse with `tail` after it.
+fn mouse_then(tail: &[u8]) -> Vec<u8> {
+    let mut d = QEMU_MOUSE.to_vec();
+    d.extend_from_slice(tail);
+    d
+}
+
+/// **A corrupt item after a valid mouse gives no layout**: passed over, it would leave the mouse
+/// read. Alone, a refusal and a pass both look like "no mouse".
+#[test]
+fn a_corrupt_item_after_a_mouse_gives_no_layout() {
+    assert!(mouse_layout(&mouse_then(&[])).is_some(), "the mouse alone");
+    assert_eq!(mouse_layout(&mouse_then(&[0x26, 0xFF])), None, "a two-byte item with one byte");
+    assert_eq!(mouse_layout(&mouse_then(&[0xFE])), None, "a long item with no length");
+    assert_eq!(mouse_layout(&mouse_then(&[0xB4])), None, "a pop with nothing pushed");
+    assert_eq!(mouse_layout(&mouse_then(&[0xA4; 5])), None, "five pushes, one past the stack");
+    let four = [[0xA4; 4], [0xB4; 4]].concat();
+    assert!(mouse_layout(&mouse_then(&four)).is_some(), "four pushes and four pops");
+}
+
+/// **The first mouse collection is the layout's**: a second's fields are not read, even one the
+/// first lacks.
+#[test]
+fn a_second_mouse_collection_is_not_read() {
+    let mut no_wheel = QEMU_MOUSE;
+    let at = QEMU_MOUSE.windows(2).position(|w| w == [0x09, 0x38]).expect("the wheel's usage");
+    no_wheel[at + 1] = 0x33; // Rx, which a mouse layout does not read
+    let first = mouse_layout(&no_wheel).expect("a mouse without a wheel");
+    assert_eq!(first.wheel, None);
+    let mut two = no_wheel.to_vec();
+    two.extend_from_slice(&QEMU_MOUSE);
+    assert_eq!(mouse_layout(&two), Some(first), "not the second's wheel");
+}
+
+/// **A second key array refuses the keyboard**, rather than replacing the first.
+#[test]
+fn a_second_key_array_refuses_the_keyboard() {
+    let array = &QEMU_KEYBOARD[46..62];
+    assert_eq!(array, [0x95, 0x06, 0x75, 0x08, 0x15, 0x00, 0x25, 0xFF, 0x05, 0x07, 0x19, 0x00, 0x29, 0xFF, 0x81, 0x00]);
+    let mut two = QEMU_KEYBOARD[..62].to_vec();
+    two.extend_from_slice(array);
+    two.push(0xC0);
+    assert!(keyboard_layout(&QEMU_KEYBOARD).is_some());
+    assert_eq!(keyboard_layout(&two), None);
+}
+
+/// **Sixteen report IDs are tracked, and an input in a seventeenth ends the walk**: one past would
+/// index past the slots.
+#[test]
+fn sixteen_report_ids_and_a_seventeenth() {
+    #[rustfmt::skip]
+    let numbered = [
+        0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, 0x02, 0x09, 0x01, 0xA1, 0x00,
+        0x05, 0x09, 0x19, 0x01, 0x29, 0x03, 0x15, 0x00, 0x25, 0x01, 0x95, 0x03, 0x75, 0x01, 0x81, 0x02,
+        0x95, 0x01, 0x75, 0x05, 0x81, 0x01,
+        0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x02, 0x81, 0x06,
+        0xC0, 0xC0,
+    ];
+    let with = |ids: core::ops::RangeInclusive<u8>| {
+        let mut d = numbered.to_vec();
+        ids.for_each(|id| d.extend_from_slice(&[0x85, id, 0x75, 0x08, 0x95, 0x01, 0x81, 0x01]));
+        mouse_layout(&d)
+    };
+    assert_eq!(with(3..=17).map(|l| l.report_id), Some(Some(2)), "the mouse's and fifteen more");
+    assert_eq!(with(3..=18), None, "a seventeenth");
+}
