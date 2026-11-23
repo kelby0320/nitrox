@@ -12,7 +12,6 @@
 extern crate alloc;
 
 use alloc::format;
-use alloc::string::String;
 use alloc::vec::Vec;
 
 use libkern::{KError, MAX_WAIT_HANDLES, RIGHT_MAP_WRITE, RIGHT_TRANSFER, RIGHT_WRITE, Rights};
@@ -23,7 +22,7 @@ use librsproto::namespace::{OBJECT_KIND_MEMOBJ, RESOLVE_REPLY_LEN, parse_resolve
 use librsproto::server;
 use librsproto::session::Dir;
 use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, RS_FLAG_REPLY, RS_MAX_BODY, decode};
-use profile_server::index::{Entry, Indexes, has_none, merge};
+use profile_server::index::{Entry, Indexes, View, merge, read_package};
 use profile_server::manifest::{self, Package};
 use profile_server::projection::split_suffix;
 
@@ -35,10 +34,12 @@ type Endpoint = Handle<Channel, Only>;
 /// The most open directory sessions at once; one `sys_wait` slot is the forwarding endpoint.
 const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 1;
 
-/// An open directory session: the kept (server) endpoint, and the projection it is listing.
+/// An open directory session: the kept (server) endpoint, the projection it is listing, and the
+/// view its listing began with.
 struct Session {
     ch: Endpoint,
     dir: &'static str,
+    listed: Option<View>,
 }
 
 /// What a wait's index names.
@@ -54,7 +55,7 @@ enum Resolved {
     Dir(&'static str),
     /// A program in the store.
     File(Handle<File, MapRead>),
-    Refused,
+    Refused(KError),
 }
 
 struct Server {
@@ -109,25 +110,11 @@ fn build_index(root: Option<&Handle<Namespace, NsReadOnly>>, packages: &[Package
     let (built, whole) = merge(packages.len(), |i| {
         let path = format!("{}/{dir}", packages[i].path);
         let mut msg = Msg::new();
-        let mut listing = match Dir::resolve(root, &path, &mut msg) {
-            Ok(d) => d,
-            Err(e) if has_none(e) => return (Vec::new(), true),
-            Err(_) => {
-                log::write(b"profile-server: package subdirectory unreadable (skipped)\n");
-                return (Vec::new(), false);
-            }
-        };
-        let mut out = Vec::new();
-        let read = listing.read_dir(|e| {
-            // A non-UTF-8 program name is not addressable.
-            if let (false, Ok(name)) = (e.name == b"." || e.name == b"..", core::str::from_utf8(e.name)) {
-                let (inode, kind, mode, size, mtime) = (e.inode, e.kind, e.mode, e.size, e.mtime);
-                out.push(Entry { name: String::from(name), pkg: i, inode, kind, mode, size, mtime });
-            }
-            true
-        });
-        listing.close();
-        (out, read.is_ok())
+        let read = read_package(i, Dir::resolve(root, &path, &mut msg), |d, each| d.read_dir(each));
+        if !read.1 {
+            log::write(b"profile-server: package subdirectory unreadable (skipped)\n");
+        }
+        read
     });
     let mut line = Line::new();
     line.s(b"profile-server: /").s(dir.as_bytes()).s(b" index built, ").u(built.len() as u64).s(b" entr(ies)");
@@ -166,22 +153,21 @@ fn pack_read_dir(body: &mut [u8], entries: &[Entry], cursor: u64) -> Option<usiz
 
 impl Server {
     /// Resolve `suffix` (e.g. `bin/heartbeat`) to its store `FileObject` handle, with the requested
-    /// rights less [`WRITE_RIGHTS`], plus `TRANSFER` so it can be re-exported. `None` if the profile
-    /// provides no such program, or the suffix names a projection's root.
+    /// rights less [`WRITE_RIGHTS`], plus `TRANSFER` so it can be re-exported. `NotFound` if the
+    /// profile provides no such program, or the suffix names a projection's root.
     ///
     /// Served from the same index as the listing so the two cannot disagree.
-    fn resolve_in_store(&mut self, suffix: &[u8], rights: u64) -> Option<Handle<File, MapRead>> {
-        let raw = core::str::from_utf8(suffix).ok()?;
-        let (dir, name) = split_suffix(raw)?;
-        if name.is_empty() {
-            return None;
-        }
+    fn resolve_in_store(&mut self, suffix: &[u8], rights: u64) -> Result<Handle<File, MapRead>, KError> {
+        let (dir, name) = core::str::from_utf8(suffix)
+            .ok()
+            .and_then(split_suffix)
+            .filter(|(_, name)| !name.is_empty())
+            .ok_or(KError::NotFound)?;
         let (root, packages) = (self.root.as_ref(), &self.packages);
-        let view = self.indexes.of(dir, || build_index(root, packages, dir));
-        let e = view.iter().find(|e| e.name == name)?;
-        let path = format!("{}/{dir}/{name}", self.packages[e.pkg].path);
+        let pkg = self.indexes.resolve(dir, name, || build_index(root, packages, dir))?;
+        let path = format!("{}/{dir}/{name}", self.packages[pkg].path);
         let rights = Rights::from_bits((rights & !WRITE_RIGHTS) | RIGHT_TRANSFER);
-        block_on(self.root.as_ref()?.lookup(&path, rights)).ok()
+        block_on(self.root.as_ref().ok_or(KError::NotFound)?.lookup(&path, rights)).map_err(|_| KError::NotFound)
     }
 
     /// Open a directory session over projection `dir`: mint a channel, keep the server end in a
@@ -199,7 +185,7 @@ impl Server {
         };
         // Bind the slot *before* replying, so a fast client's first request cannot arrive
         // before the slot is live.
-        self.sessions[slot] = Some(Session { ch: session_end, dir });
+        self.sessions[slot] = Some(Session { ch: session_end, dir, listed: None });
         if !server::reply_channel(serve_end, request_id, client_end) {
             self.sessions[slot] = None;
         }
@@ -235,10 +221,10 @@ impl Server {
                 continue;
             };
             let (root, packages) = (self.root.as_ref(), &self.packages);
-            let view = self.indexes.of(dir, || build_index(root, packages, dir));
-            let Some(session) = &self.sessions[slot] else { return };
+            let Some(session) = &mut self.sessions[slot] else { return };
+            let view = self.indexes.listing(dir, cursor, &mut session.listed, || build_index(root, packages, dir));
             let mut body = [0u8; RS_MAX_BODY];
-            let Some(blen) = pack_read_dir(&mut body, view, cursor) else {
+            let Some(blen) = pack_read_dir(&mut body, &view, cursor) else {
                 server::reply_error(&session.ch, op, request_id, KError::KernelError, b"");
                 continue;
             };
@@ -273,14 +259,14 @@ impl Server {
                 Some(r) => match core::str::from_utf8(r.suffix).ok().and_then(split_suffix) {
                     Some((dir, "")) => (m.op, m.request_id, Resolved::Dir(dir)),
                     _ => match self.resolve_in_store(r.suffix, r.requested_rights) {
-                        Some(h) => (m.op, m.request_id, Resolved::File(h)),
-                        None => (m.op, m.request_id, Resolved::Refused),
+                        Ok(h) => (m.op, m.request_id, Resolved::File(h)),
+                        Err(e) => (m.op, m.request_id, Resolved::Refused(e)),
                     },
                 },
-                None => (m.op, m.request_id, Resolved::Refused),
+                None => (m.op, m.request_id, Resolved::Refused(KError::NotFound)),
             },
-            Ok(m) => (m.op, m.request_id, Resolved::Refused),
-            Err(_) => (0, 0, Resolved::Refused),
+            Ok(m) => (m.op, m.request_id, Resolved::Refused(KError::Unsupported)),
+            Err(_) => (0, 0, Resolved::Refused(KError::Unsupported)),
         };
         match resolved {
             Resolved::File(handle) => {
@@ -289,11 +275,8 @@ impl Server {
                 server::reply_handle(&self.serve_end, request_id, &body, handle);
             }
             Resolved::Dir(dir) => self.open_dir_session(request_id, dir),
-            Resolved::Refused if op == OP_NS_RESOLVE => {
-                server::reply_error(&self.serve_end, op, request_id, KError::NotFound, b"");
-            }
-            Resolved::Refused => {
-                server::reply_error(&self.serve_end, op, request_id, KError::Unsupported, b"");
+            Resolved::Refused(e) => {
+                server::reply_error(&self.serve_end, op, request_id, e, b"");
             }
         }
     }
