@@ -40,8 +40,8 @@ Past either, the resolve is `WouldBlock`.
 **A session ejects, and follows the mounts, without one** (Phase 6 Part F). A session endpoint
 answers `info/media` with a media session and `info/watch` with a watch, as it answers the tables;
 neither mounts anything, and neither suffix is listed in `info`. Two media sessions can be open at
-once, each held for a request; past that the resolve is `WouldBlock`, and `disk --eject` says to try
-again. Thirty-two watches can be held, the machine's; with all held, a resolve pings every watcher,
+once, **each carrying one request**: the service closes it once it has answered. Past two the
+resolve is `WouldBlock`, and `disk --eject` says to try again. Thirty-two watches can be held, the machine's; with all held, a resolve pings every watcher,
 lets go of the ones whose clients have gone, and is refused `WouldBlock` if none had.
 
 The filesystems and the table of what is on each disk are ordinary `Namespace` and `File`
