@@ -25,9 +25,12 @@ pub fn install<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, byte
     let Ok(file) = made else {
         return Err(b"users.new could not be created");
     };
+    let Ok(info) = file.stat() else {
+        return Err(b"users.new's size could not be read");
+    };
     // **A create only grows**: a leftover the truncate did not cut keeps its tail, which the rename
     // would make the file's, and the next boot would read.
-    if file.stat().ok().map(|info| info.size) != Some(bytes.len() as u64) {
+    if info.size != bytes.len() as u64 {
         return Err(b"users.new kept a leftover's tail");
     }
     if !bytes.is_empty() {
@@ -37,7 +40,7 @@ pub fn install<'a, M: CanLookup + 'a>(ns: impl Into<Ref<'a, Namespace, M>>, byte
         // The file fits the page mapped (MAX_FILE). Unmapped before the sync, as `libfs` does: a
         // write-back that begins with a writable mapping cannot call the file clean.
         if mapping.write_from(0, bytes).is_err() {
-            return Err(b"users.new could not be mapped");
+            return Err(b"the new database is larger than a page");
         }
     }
     let synced = block_on(fs::flush(&file));
@@ -70,7 +73,9 @@ mod tests {
     fn an_install_writes_exactly_the_new_bytes() {
         let ns = fresh();
         install(&ns, b"the database as it was, longer\n").unwrap();
+        let held = (mock::open_handles(), mock::mappings());
         install(&ns, b"the new one\n").unwrap();
+        assert_eq!((mock::open_handles(), mock::mappings()), held, "nothing left open or mapped");
         assert_eq!(read(&ns, USERS), b"the new one\n");
     }
 
@@ -87,6 +92,46 @@ mod tests {
         mock::ignore_next_truncate();
         assert_eq!(install(&ns, b"shorter\n"), Err(&b"users.new kept a leftover's tail"[..]));
         assert_eq!(read(&ns, USERS), b"the database as it was\n");
+    }
+
+    /// **The next install cuts what a write that died left**: a shorter database installs after a
+    /// longer one's write-back failed.
+    #[test]
+    fn an_install_after_a_longer_one_died_cuts_its_leftover() {
+        let ns = fresh();
+        install(&ns, b"as it was\n").unwrap();
+        mock::fail_next_submit(libkern::KError::IoError.as_i32());
+        assert!(install(&ns, b"a longer database, whose write-back failed\n").is_err());
+        install(&ns, b"short\n").unwrap();
+        assert_eq!(read(&ns, USERS), b"short\n");
+    }
+
+    #[test]
+    fn a_database_past_a_page_is_refused_as_such() {
+        let ns = fresh();
+        install(&ns, b"as it was\n").unwrap();
+        let past = [b'x'; PAGE + 1];
+        assert_eq!(install(&ns, &past), Err(&b"the new database is larger than a page"[..]));
+        assert_eq!(read(&ns, USERS), b"as it was\n");
+    }
+
+    /// **A size that cannot be read is said so**, not taken for a leftover's: here `users.new` is
+    /// bound without `INSPECT`.
+    #[test]
+    fn a_size_refused_is_not_called_a_leftover() {
+        let ns = fresh();
+        install(&ns, b"as it was\n").unwrap();
+        let made: Handle<File, MapReadWrite> =
+            block_on(fs::create(&ns, USERS_NEW, 0, Rights::MAP_READ | Rights::MAP_WRITE)).unwrap();
+        ns.unbind(USERS_NEW).unwrap();
+        let no_inspect = Rights::MAP_READ | Rights::MAP_WRITE | Rights::TRANSFER | Rights::DUPLICATE;
+        let raw = libkern::RawHandle(mock::with_rights(made.raw().0, no_inspect));
+        // SAFETY: the mock's new handle, which nothing else holds.
+        let blind = unsafe { Handle::<File, MapReadWrite>::from_raw(raw, Rights::empty()) };
+        ns.bind(USERS_NEW, &blind).unwrap();
+        drop((made, blind));
+        assert_eq!(install(&ns, b"new\n"), Err(&b"users.new's size could not be read"[..]));
+        assert_eq!(read(&ns, USERS), b"as it was\n");
     }
 
     /// **A write-back that fails leaves the file as it was**, and nothing open or mapped, as the
