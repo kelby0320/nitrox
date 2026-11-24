@@ -223,9 +223,9 @@ mod tests {
         (buf, n)
     }
 
-    /// **A suffix over `MAX_SUFFIX` opens no directory session**, though it names one, and is
-    /// refused `TooLarge`; one of `MAX_SUFFIX` opens one. Cut to its first 1,024 bytes, the longer
-    /// named `eeee`, a sibling of the 80-byte name it asked for.
+    /// **A suffix one byte over `MAX_SUFFIX` opens no directory session**, though it names one,
+    /// and is refused `TooLarge`; one of `MAX_SUFFIX` opens one. Cut to its first 1,024 bytes, the
+    /// longer named `eeee`, a sibling of `eeeee`, which it asked for.
     #[test]
     fn a_suffix_past_the_longest_opens_no_directory() {
         use crate::test_support::RwImage;
@@ -242,11 +242,11 @@ mod tests {
         }
         let parent = vol.resolve_dir(&path).unwrap();
         vol.mkdir_at(parent, b"eeee", 0).unwrap();
-        vol.mkdir_at(parent, &[b'e'; 80], 0).unwrap();
+        vol.mkdir_at(parent, b"eeeee", 0).unwrap();
         path.push(b'/');
         let cut = vol.resolve_dir(&[&path[..], b"eeee"].concat()).unwrap();
-        path.extend_from_slice(&[b'e'; 80]);
-        assert_eq!(path.len(), MAX_SUFFIX + 76);
+        path.extend_from_slice(b"eeeee");
+        assert_eq!(path.len(), MAX_SUFFIX + 1);
         assert_eq!(vol.resolve_dir(&path[..MAX_SUFFIX]), Ok(cut), "its first bytes name `eeee`");
         let request = |suffix: &[u8]| {
             let mut body = [0u8; 2048];

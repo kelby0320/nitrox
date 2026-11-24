@@ -297,21 +297,26 @@ fn a_rename_of_the_longest_suffixes_is_made_and_one_past_refused() {
     assert_eq!(vol.calls.borrow().len(), 1, "nothing more reached the volume");
 }
 
-/// **A truncate that ends a file's id has the kernel forget it, then frees it, then answers**:
-/// FAT's truncate to nothing, whose freed clusters the next allocation may take.
+/// A forwarded truncate of `/f` to `size`, as the kernel sends one.
+fn truncate(id: u64, size: u32) -> Vec<u8> {
+    let mut body = [0u8; 64];
+    let n = resolve_request(&mut body, 0, RESOLVE_FILE_LAZY | RESOLVE_TRUNCATE, b"f").unwrap();
+    body[n..n + 4].copy_from_slice(&size.to_le_bytes());
+    let mut req = [0u8; 128];
+    let len = encode(&mut req, OP_NS_RESOLVE, id, 0, &body[..n + 4], 0).unwrap();
+    req[..len].to_vec()
+}
+
+/// **A truncate that ends a file's id has the kernel forget it, frees it, and answers after the
+/// forget**: FAT's truncate to nothing, whose freed clusters the next allocation may take.
 #[test]
-fn a_truncate_to_nothing_is_forgotten_then_released_then_answered() {
+fn a_truncate_to_nothing_is_forgotten_freed_and_answered() {
     let sendable = Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::TRANSFER;
     let dev = own::<Resource, ReadWrite>(mock::with_rights(mock::device(), sendable));
     let (serve_end, kernel) = pair();
     let vol = Spy { file: true, orphan: Some(42), ..Spy::default() };
     let mut s = state(serve_end, dev.as_ref(), None);
-    let mut body = [0u8; 64];
-    let n = resolve_request(&mut body, 0, RESOLVE_FILE_LAZY | RESOLVE_TRUNCATE, b"f").unwrap();
-    body[n..n + 4].copy_from_slice(&0u32.to_le_bytes());
-    let mut req = [0u8; 128];
-    let len = encode(&mut req, OP_NS_RESOLVE, 5, 0, &body[..n + 4], 0).unwrap();
-    s.forwarded(&vol, &req[..len]);
+    s.forwarded(&vol, &truncate(5, 0));
     let (forget, _) = take(&kernel);
     let m = decode(forget.payload()).unwrap();
     assert_eq!((m.op, m.body), (OP_FILE_FORGET, &42u64.to_le_bytes()[..]));
@@ -319,6 +324,31 @@ fn a_truncate_to_nothing_is_forgotten_then_released_then_answered() {
     let m = decode(reply.payload()).unwrap();
     assert_eq!((m.request_id, m.is_error(), brought.len()), (5, false, 1), "the file as it now is");
     assert_eq!(*vol.calls.borrow(), ["truncate 2 0", "release 42"]);
+}
+
+/// **No path frees a file the kernel has not forgotten**: with the kernel gone, a truncate that
+/// ends an id, a rename over a file and a session's unlink of its last name each leave it unfreed,
+/// since a block freed could be another file's while the kernel still writes it.
+#[test]
+fn no_path_frees_a_file_the_kernel_has_not_forgotten() {
+    let dev = own::<Resource, ReadWrite>(mock::device());
+    let (serve_end, kernel) = pair();
+    drop(kernel);
+    let vol = Spy { file: true, renames: true, orphan: Some(42), ..Spy::default() };
+    let mut s = state(serve_end, dev.as_ref(), None);
+    s.forwarded(&vol, &truncate(5, 0));
+    s.forwarded(&vol, &rename(6, b"c", RENAME_REPLACE));
+    let (mine, client) = pair();
+    let raw = mine.raw().0;
+    s.sessions.0[0] = Some(Session { ch: mine, dir: 7 });
+    let mut body = [0u8; 64];
+    let n = librsproto::file::name_request(&mut body, b"u").unwrap();
+    let mut req = [0u8; 128];
+    let len = encode(&mut req, librsproto::OP_FILE_UNLINK, 4, 0, &body[..n], 0).unwrap();
+    send(&client, &req[..len], &mut Carried::new());
+    s.serve_session(&mut Inbox(Msg::new()), &vol, raw);
+    assert!(!decode(take(&client).0.payload()).unwrap().is_error(), "the unlink answered");
+    assert_eq!(*vol.calls.borrow(), ["truncate 2 0", "rename_path! /a /c", "unlink u"]);
 }
 
 /// A touch stamps the file it names and is never answered, a malformed one too: nothing waits on

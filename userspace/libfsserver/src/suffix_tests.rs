@@ -80,6 +80,15 @@ fn a_resolve_is_served_at_the_longest_suffix_and_refused_past_it() {
     }
 }
 
+/// **A directory opens at the longest suffix, and not one byte past it**: the walk is handed the
+/// suffix where it lies, so no copy's panic stands in for the bound.
+#[test]
+fn a_directory_opens_at_the_longest_suffix_and_not_past_it() {
+    let vol = Spy::default();
+    assert_eq!(directory_open(&vol, &resolve_of(&suffix(MAX_SUFFIX), 0, None)), Some((3, Ok(7))));
+    assert_eq!(directory_open(&vol, &resolve_of(&suffix(MAX_SUFFIX + 1), 0, None)), None);
+}
+
 /// **A resolve's size change reaches the volume at the longest suffix, and not past it**, where
 /// the resolve that follows refuses it.
 #[test]

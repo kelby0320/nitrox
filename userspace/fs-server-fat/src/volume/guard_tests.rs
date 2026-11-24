@@ -76,8 +76,8 @@ fn a_long_name_with_a_part_out_of_place_is_dropped() {
     }
 }
 
-/// **A rewrite reaches at most a name's slots**: the longest name's 21, and refuses one more
-/// before it reads or writes any.
+/// **A rewrite reaches at most a name's slots**: the longest name's 21, and refuses one more,
+/// rewriting none.
 #[test]
 fn a_rewrite_reaches_a_names_slots_and_no_further() {
     let img = mformat(16, &["-c", "4"]);
