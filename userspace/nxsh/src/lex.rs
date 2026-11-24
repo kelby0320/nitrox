@@ -43,6 +43,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+mod lookahead;
+
 /// Which language the next token is read in. See the module docs (D1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -279,28 +281,6 @@ impl<'a> Lexer<'a> {
             self.prev = Some(t.tok.clone());
         }
         Ok(t)
-    }
-
-    /// After a peeked token, is there **nothing left that could be its right operand**?
-    ///
-    /// Lookahead over the raw source: horizontal whitespace and comments are skipped, then
-    /// the answer is yes at end of input, at a newline, and at each closer (`|`, `)`, `]`,
-    /// `}`, `,`). It exists for a bare `/` (see [`Parser::starts_an_argument`]) and does
-    /// **not** skip newlines: a binary operator at end of line is mid-production under D2.
-    pub fn no_operand_follows(&self) -> bool {
-        let mut i = self.pos;
-        loop {
-            match self.at(i) {
-                b' ' | b'\t' | b'\r' => i += 1,
-                b'#' => {
-                    while i < self.src.len() && self.at(i) != b'\n' {
-                        i += 1;
-                    }
-                }
-                _ => break,
-            }
-        }
-        matches!(self.at(i), 0 | b'\n' | b'|' | b')' | b']' | b'}' | b',')
     }
 
     /// Tokenize the whole input in [`Mode::Expr`], for tests and diagnostics.

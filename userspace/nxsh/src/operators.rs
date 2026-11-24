@@ -12,6 +12,8 @@ pub enum Takes {
     Nothing,
     /// As it needs. `sum`, `min`, `max`, `avg` are here: `sum size` must keep reading `size`.
     Words,
+    /// Paths, read as a builtin's are, in word mode: `open hello.txt` names a file.
+    Paths,
 }
 
 /// An operator's family, as `help` lists them and the page heads them.
@@ -276,7 +278,7 @@ pub const OPERATORS: &[Operator] = &[
     op("abs", NUMBER, "abs", "Without its sign.", "-3 | abs", "3\n"),
     op(
         "open",
-        (Group::InAndOut, Takes::Words, false),
+        (Group::InAndOut, Takes::Paths, false),
         "open PATH...",
         "Files read as one stream: a .tsm as itself, a .txt a line a row.",
         "1..4 | map { |n| {n: n} } | save ./n.tsm\nopen ./n.tsm | sum n",
@@ -284,7 +286,7 @@ pub const OPERATORS: &[Operator] = &[
     ),
     op(
         "save",
-        (Group::InAndOut, Takes::Words, true),
+        (Group::InAndOut, Takes::Paths, true),
         "save PATH",
         "The value written to PATH: a table as .tsm, or a line a row as .txt.",
         "[\"one\", \"two\"] | save ./words.txt\nopen ./words.txt",

@@ -370,6 +370,10 @@ refuse a larger one.
 absorbs `cat`'s job entirely (§10a); "open these paths as one stream" is a more natural reading of
 what `cat` was ever doing than a second, near-identical verb would be.
 
+**Their paths are words**, read as an external program's and `cd`'s are: `open hello.txt` and
+`save Documents/out.txt` name files, where an expression would read a field access and a division.
+A block's `{` ends them, so `for line in open log.txt { … }` reads one file.
+
 ## 5. Functions
 
 ### 5a. Scoping and nesting

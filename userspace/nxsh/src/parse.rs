@@ -34,6 +34,7 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 use crate::operators::{self, Takes};
 
 mod names;
+mod paths;
 
 /// How the operator called `name` reads its arguments, if it is one.
 fn takes(name: &str) -> Option<Takes> {
@@ -1035,6 +1036,9 @@ impl<'a> Parser<'a> {
         if takes == Some(Takes::Nothing) {
             return Ok(args);
         }
+        if takes == Some(Takes::Paths) {
+            return self.path_args();
+        }
         self.in_op_args += 1;
         loop {
             match self.peek()? {
@@ -1076,39 +1080,10 @@ impl<'a> Parser<'a> {
     /// Word-mode arguments to an external program (§5b, D1).
     fn word_args(&mut self) -> Result<Vec<Arg>> {
         let mut args = Vec::new();
-        loop {
-            let s = self.lx.peek(Mode::Word)?;
-            match s.tok {
-                Tok::Pipe
-                | Tok::OrOr
-                | Tok::AndAnd
-                | Tok::Newline
-                | Tok::Eof
-                | Tok::RParen
-                | Tok::RBrace
-                | Tok::RBracket => return Ok(args),
-                Tok::Flag(f) => {
-                    self.lx.bump(Mode::Word)?;
-                    args.push(Arg::Flag(f, None));
-                }
-                Tok::ShortFlags(f) => {
-                    self.lx.bump(Mode::Word)?;
-                    args.push(Arg::ShortFlags(f));
-                }
-                Tok::Word(w) => {
-                    self.lx.bump(Mode::Word)?;
-                    args.push(Arg::Positional(Expr::Word(w)));
-                }
-                Tok::Str(v) => {
-                    self.lx.bump(Mode::Word)?;
-                    args.push(Arg::Positional(Expr::Str(v)));
-                }
-                Tok::LParen => {
-                    args.push(Arg::Positional(self.expr()?));
-                }
-                _ => return Ok(args),
-            }
+        while let Some(arg) = self.word_arg()? {
+            args.push(arg);
         }
+        Ok(args)
     }
 
     fn pattern(&mut self) -> Result<Pattern> {

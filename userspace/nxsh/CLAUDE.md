@@ -75,8 +75,9 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
 - **A bareword argument means different things per operator.** `sort size` names a column;
   `display files` names a binding. Arguments are kept unevaluated and each operator
   decides, because only the operator knows.
-- **A builtin's argument is a path, not an expression.** `cd ..` and `cd /system` both
-  choke in expression mode, where `..` is a range and `/system` a division.
+- **A builtin's argument is a path, not an expression**, and so are `open`'s and `save`'s
+  (`Takes::Paths`). `cd ..` and `cd /system` both choke in expression mode, where `..` is a range
+  and `/system` a division; `open hello.txt` read a field access.
 - **`run_line` is a block, and must be treated as one.** `exec` deliberately does nothing
   for `Stmt::Def` — definitions are registered by `hoist_defs`, which only ran from
   `exec_block`. So a whole script hoisted and a REPL line did not: a `def` typed at a
