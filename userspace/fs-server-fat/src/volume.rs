@@ -969,6 +969,8 @@ mod crash_tests;
 #[cfg(test)]
 mod failure_tests;
 #[cfg(test)]
+mod guard_tests;
+#[cfg(test)]
 mod hostile_tests;
 #[cfg(test)]
 mod serve_tests;

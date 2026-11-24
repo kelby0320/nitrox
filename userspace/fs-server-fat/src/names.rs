@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn what_a_fat_can_name() {
-        for ok in ["a", "README.TXT", "a long name.tar.gz", ".hidden", "naïve"] {
+        for ok in ["a", "README.TXT", "a long name.tar.gz", ".hidden", "naïve", "~tilde", " leading"] {
             assert!(valid(ok.as_bytes()), "{ok}");
         }
         for bad in [
@@ -253,6 +253,8 @@ mod tests {
             ">",
             "back\\slash",
             "tab\tname",
+            "unit\u{1f}separator",
+            "del\u{7f}",
             "trailing ",
             "trailing.",
         ] {
