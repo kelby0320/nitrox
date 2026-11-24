@@ -39073,3 +39073,20 @@ changed.
 - **Of the two guards the plan took for equivalent mutations, one is not.** The tail's leading-zero
   check is, and goes. The FSInfo hint's check at load keeps a hint outside the volume from being
   written back at the unmount, and a test holds it.
+
+## 2026-11-24 — Before Phase 7: Part H's Miri, and Part H done
+
+**Part H is done**: H.10 merged, #468, and what Miri reports at Part H's end is triaged
+([`what-the-bash-left.md`](planning/what-the-bash-left.md) § Miri at Part H's end), on
+`pre-phase-7/part-h-miri` from `main` at `087fd0c5`.
+
+- **The kernel and nineteen userspace targets**, the job's targets whose code Part H changed,
+  measured from #459's merge. All ran under Stacked Borrows, and the five where Part H added
+  `unsafe` under Tree Borrows as well.
+- **No undefined behaviour in either model**: 2,646 tests pass, eighteen ignored with their
+  reasons, none new. The kernel's integer-to-pointer casts are at 38 sites, as at Part E's end.
+- **Part H's new `unsafe` is all in tests**: the kernel's MSI programming, two counting
+  allocators, and `from_raw` in three crates' tests. auth-service's, which the job leaves out, ran
+  by name.
+- **H.9's allocator runs under Miri without a reason**, as H.9 built it, where the plan gave it
+  one.
