@@ -461,6 +461,9 @@ mod tests {
     }
 }
 
+#[cfg(test)]
+mod maxima_tests;
+
 /// Truncation and corruption drivers shared by the modules' parser tests.
 #[cfg(test)]
 pub(crate) mod fuzz {
