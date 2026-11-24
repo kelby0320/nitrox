@@ -17,7 +17,8 @@ servers speak one protocol and a fix to it is a fix to both:
 - **`serve.rs`** — the pure request→reply core for a forwarded resolve or range read, which
   resolve opens a directory session, and a session's requests, generic over `Volume`, and the one
   `FsError`→`KError` mapping. It touches no syscalls, so it is host-tested —
-  **through each server's volume**, in that server's crate, against an image its own tools built.
+  **through each server's volume**, in that server's crate, against an image its own tools built;
+  and its bounds in its own, through a volume that records what reaches it (`session_tests`' `Spy`).
   A grow's reply marks what the grow added `UNWRITTEN` (`serve_grown`, Phase 6 Part H.4), which
   `Volume::grow_file` makes true by answering the size it grew from, past which everything reads
   as zero.

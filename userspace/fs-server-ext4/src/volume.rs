@@ -223,8 +223,9 @@ mod tests {
         (buf, n)
     }
 
-    /// **A suffix over `MAX_SUFFIX` opens no directory session**, and is refused `TooLarge`: cut to
-    /// its first 1,024 bytes it named `eeee`, a sibling of the 80-byte name it asked for.
+    /// **A suffix over `MAX_SUFFIX` opens no directory session**, though it names one, and is
+    /// refused `TooLarge`; one of `MAX_SUFFIX` opens one. Cut to its first 1,024 bytes, the longer
+    /// named `eeee`, a sibling of the 80-byte name it asked for.
     #[test]
     fn a_suffix_past_the_longest_opens_no_directory() {
         use crate::test_support::RwImage;
@@ -239,16 +240,25 @@ mod tests {
             }
             path.extend_from_slice(&[c; 254]);
         }
-        vol.mkdir_at(vol.resolve_dir(&path).unwrap(), b"eeee", 0).unwrap();
+        let parent = vol.resolve_dir(&path).unwrap();
+        vol.mkdir_at(parent, b"eeee", 0).unwrap();
+        vol.mkdir_at(parent, &[b'e'; 80], 0).unwrap();
         path.push(b'/');
         let cut = vol.resolve_dir(&[&path[..], b"eeee"].concat()).unwrap();
         path.extend_from_slice(&[b'e'; 80]);
         assert_eq!(path.len(), MAX_SUFFIX + 76);
         assert_eq!(vol.resolve_dir(&path[..MAX_SUFFIX]), Ok(cut), "its first bytes name `eeee`");
-        let mut body = [0u8; 2048];
-        let n = resolve_request(&mut body, 0x8000, 0, &path).unwrap();
-        let mut req = [0u8; 4096];
-        let len = encode(&mut req, OP_NS_RESOLVE, 3, 0, &body[..n], 0).unwrap();
+        let request = |suffix: &[u8]| {
+            let mut body = [0u8; 2048];
+            let n = resolve_request(&mut body, 0x8000, 0, suffix).unwrap();
+            let mut req = [0u8; 4096];
+            let len = encode(&mut req, OP_NS_RESOLVE, 3, 0, &body[..n], 0).unwrap();
+            (req, len)
+        };
+        let (req, len) = request(&path[..MAX_SUFFIX]);
+        assert_eq!(directory_open(&vol, &req[..len]), Some((3, Ok(cut))));
+        let (req, len) = request(&path);
+        assert!(vol.resolve_dir(&path).is_ok(), "the whole suffix names a directory");
         assert_eq!(directory_open(&vol, &req[..len]), None);
         let (mut content, mut reply) = ([0u8; ext4::MAX_FILE], [0u8; 4096]);
         let Served::Error { reply_len } = serve(&vol, &req[..len], &mut content, &mut reply) else { panic!() };

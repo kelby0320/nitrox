@@ -14,10 +14,11 @@ use std::vec::Vec;
 #[derive(Default)]
 pub(crate) struct Spy {
     pub(crate) calls: RefCell<Vec<String>>,
-    /// The id an unlink, or a rename over a file, leaves without a name.
+    /// The id an unlink, a rename over a file, or a truncate leaves without a name.
     pub(crate) orphan: Option<u64>,
-    entries: usize,
-    /// Whether every path is a file of five bytes, rather than a directory.
+    pub(crate) entries: usize,
+    /// Whether every path is a file of five bytes, rather than a directory: a range read is given
+    /// all it asks.
     pub(crate) file: bool,
     /// Whether a rename by path succeeds, rather than finding nothing.
     pub(crate) renames: bool,
@@ -80,17 +81,20 @@ impl Volume for Spy {
         }
         Err(FsError::NotFound)
     }
-    fn read_file_range(&self, _: &[u8], _: u64, _: usize, _: &mut [u8]) -> Result<usize, FsError> {
-        Err(FsError::NotFound)
+    fn read_file_range(&self, path: &[u8], _: u64, len: usize, _: &mut [u8]) -> Result<usize, FsError> {
+        self.log("read_range", std::format!("{} {len}", path.len()).as_bytes());
+        if self.file { Ok(len) } else { Err(FsError::NotFound) }
     }
     fn create_file(&self, _: &[u8], _: &[u8], _: i64) -> Result<(), FsError> {
         Err(FsError::NotFound)
     }
-    fn grow_file(&self, _: &[u8], _: usize, _: i64) -> Result<u64, FsError> {
+    fn grow_file(&self, path: &[u8], size: usize, _: i64) -> Result<u64, FsError> {
+        self.log("grow", std::format!("{} {size}", path.len()).as_bytes());
         Err(FsError::NotFound)
     }
-    fn truncate_file(&self, _: &[u8], _: usize, _: i64) -> Result<Option<u64>, FsError> {
-        Err(FsError::NotFound)
+    fn truncate_file(&self, path: &[u8], size: usize, _: i64) -> Result<Option<u64>, FsError> {
+        self.log("truncate", std::format!("{} {size}", path.len()).as_bytes());
+        if self.file { Ok(self.orphan) } else { Err(FsError::NotFound) }
     }
     fn resolve_dir(&self, _: &[u8]) -> Result<u64, FsError> {
         match self.walk {
@@ -137,7 +141,8 @@ impl Volume for Spy {
         self.log("touch", id.to_string().as_bytes());
         Ok(())
     }
-    fn release(&self, _: u64, _: i64) -> Result<(), FsError> {
+    fn release(&self, id: u64, _: i64) -> Result<(), FsError> {
+        self.log("release", id.to_string().as_bytes());
         Ok(())
     }
 }
