@@ -317,4 +317,15 @@ mod tests {
         let n = resolve_reply(&mut b, OBJECT_KIND_FILE, 9).unwrap();
         refuses_every_prefix(&b[..n], |x| parse_resolve_reply(x).is_some());
     }
+
+    /// **A suffix and a base are a `u16` long at most**: one past is refused, not wrapped.
+    #[test]
+    fn a_suffix_or_a_base_one_past_its_field_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; past.len() + 64];
+        assert_eq!(resolve_request(&mut out, 0, 0, &at), Some(RESOLVE_REQUEST_PREFIX_LEN + at.len()));
+        assert_eq!(resolve_request(&mut out, 0, 0, &past), None);
+        assert_eq!(subnamespace_reply(&mut out, 0, &at), Some(SUBNAMESPACE_PREFIX_LEN + at.len()));
+        assert_eq!(subnamespace_reply(&mut out, 0, &past), None);
+    }
 }

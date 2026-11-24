@@ -136,8 +136,9 @@ holder can already map `/system/users` writable.
 | `Unsupported` | `Authenticate`, or any other op, on an admin session |
 
 **A write is atomic.** The new file is written to `/system/users.new`, synced, then renamed over
-`/system/users`. A leftover `users.new`, from a write that died, is cut to nothing first. The
-service's copy in memory changes only once the rename has held. A new password gets a fresh
+`/system/users`. A leftover `users.new`, from a write that died, is cut to nothing first, and a
+write whose new copy is not its own size, a leftover's tail kept, fails `IoError`. The service's
+copy in memory changes only once the rename has held. A new password gets a fresh
 16-byte salt from the kernel's entropy source and `libcrypto`'s `DEFAULT_ITERATIONS`; each record
 keeps its own count.
 

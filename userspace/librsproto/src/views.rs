@@ -738,4 +738,51 @@ mod tests {
         let n = build_decide(&mut b, b"admin", b"date").unwrap();
         refuses_every_prefix(&b[..n], |x| parse_decide(x).is_some());
     }
+
+    /// **Each field is its width long at most**: a `u16` for an outcome's reason, a request's
+    /// strings and argument count, a row's, a decide's and a reply's count, a byte for an account's
+    /// strings. One past is refused, where a wrapped length would tell of fewer bytes than follow.
+    #[test]
+    fn a_field_one_past_its_width_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; 2 * past.len() + 64];
+        let started = |out: &mut [u8], reason: &[u8]| build_outcome(out, Outcome::Started, reason);
+        assert_eq!(started(&mut out, &at), Some(OUTCOME_PREFIX_LEN + at.len()));
+        assert_eq!(started(&mut out, &past), None, "a reason");
+        let request = |out: &mut [u8], view: &[u8], args: &[&[u8]]| build_request(out, 0, view, b"p", args, b"", None);
+        assert!(request(&mut out, &at, &[&at]).is_some());
+        assert_eq!(request(&mut out, &past, &[]), None, "a view");
+        assert_eq!(request(&mut out, b"v", &[&past]), None, "an argument");
+        let mut many = vec![0u8; 5 * past.len() + 64];
+        let empty: Vec<&[u8]> = vec![b""; past.len()];
+        assert!(request(&mut many, b"v", &empty[..at.len()]).is_some(), "u16::MAX arguments");
+        assert_eq!(request(&mut many, b"v", &empty), None, "and one more");
+        assert_eq!(build_decide(&mut out, &at, &at), Some(4 + 2 * at.len()));
+        assert_eq!(build_decide(&mut out, &past, b"p"), None, "a decide's view");
+        assert_eq!(build_decide(&mut out, b"v", &past), None, "a decide's program");
+
+        let row = |view, run| Row { view, run, password: false };
+        let rows = |out: &mut [u8], each: &[Row<'_>]| {
+            let mut w = 2;
+            out[..2].fill(0);
+            each.iter().all(|r| push_row(out, &mut w, r).is_some())
+        };
+        assert!(rows(&mut out, &[row(&at, &at)]));
+        assert!(!rows(&mut out, &[row(&past, b"")]), "a row's view");
+        assert!(!rows(&mut out, &[row(b"", &past)]), "a row's run");
+        assert!(rows(&mut many, &vec![row(b"", b""); at.len()]), "u16::MAX rows");
+        assert!(!rows(&mut many, &vec![row(b"", b""); past.len()]), "and one more");
+
+        let account = |name, home| AccountRow { name, home, sessions: 0, administers: false };
+        let accounts = |out: &mut [u8], each: &[AccountRow<'_>]| {
+            let mut w = 2;
+            out[..2].fill(0);
+            each.iter().all(|r| push_account(out, &mut w, r).is_some())
+        };
+        assert!(accounts(&mut out, &[account(&at[..255], &at[..255])]));
+        assert!(!accounts(&mut out, &[account(&at[..256], b"")]), "a name of 256 bytes");
+        assert!(!accounts(&mut out, &[account(b"", &at[..256])]), "a home of 256 bytes");
+        assert!(accounts(&mut many, &vec![account(b"", b""); at.len()]), "u16::MAX accounts");
+        assert!(!accounts(&mut many, &vec![account(b"", b""); past.len()]), "and one more");
+    }
 }

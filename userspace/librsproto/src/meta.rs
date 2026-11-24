@@ -182,4 +182,13 @@ mod tests {
         let n = ready(&mut b, b"fs-server").unwrap();
         refuses_every_prefix(&b[..n], |x| parse_ready(x).is_some());
     }
+
+    /// **A server's name is a `u16` long at most**: one past is refused, not wrapped.
+    #[test]
+    fn a_server_name_one_past_its_field_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; past.len() + 64];
+        assert_eq!(ready(&mut out, &at), Some(READY_PREFIX_LEN + at.len()));
+        assert_eq!(ready(&mut out, &past), None);
+    }
 }

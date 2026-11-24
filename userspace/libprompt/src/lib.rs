@@ -16,6 +16,8 @@ pub mod ipc;
 
 #[cfg(test)]
 mod ipc_tests;
+#[cfg(test)]
+mod scrub_tests;
 
 use alloc::vec::Vec;
 use libkern::scrub;

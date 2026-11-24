@@ -13,11 +13,16 @@ librsproto = { path = "../librsproto", features = ["io"] }
 # Part D.1). `core` only, so this server stays free of `alloc`.
 libusers = { path = "../libusers" }
 
+[dev-dependencies]
+# `install` tested against libos's model of the kernel.
+libos = { path = "../libos", features = ["mock"] }
+
 # A library + binary split (mirroring fs-server-ext4/profile-server): the library
 # holds the host-testable credential logic (user-DB parse + PBKDF2 verify + the
-# Auth serve path); the binary is the bare-target resource server. `cargo xtask
-# test` runs `cargo test -p auth-service --lib`; the `#![no_main]` bin can't build
-# on host. Alloc-free — fixed buffers in `_start`'s frame, no `#[global_allocator]`.
+# Auth serve path) and the file's install; the binary is the bare-target resource
+# server. `cargo xtask test` runs `cargo test -p auth-service --lib`; the `#![no_main]`
+# bin can't build on host. Alloc-free — fixed buffers in `_start`'s frame, no
+# `#[global_allocator]`.
 [lib]
 name = "auth_service"
 path = "src/lib.rs"

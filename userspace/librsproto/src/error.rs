@@ -83,6 +83,18 @@ mod tests {
         assert_eq!(error_body(&mut [0u8; ERROR_BODY_LEN], -42, 0, b"x"), Some(ERROR_BODY_LEN), "the code alone");
     }
 
+    /// **A message is cut to what its `u16` length carries**, however large the buffer: a wrapped
+    /// length would tell of fewer bytes than follow.
+    #[test]
+    fn a_message_is_cut_to_its_lengths_width() {
+        let msg = std::vec![b'a'; 65_536];
+        let mut buf = std::vec![0u8; ERROR_BODY_LEN + msg.len() + 16];
+        let n = error_body(&mut buf, -42, 0, &msg[..65_535]).unwrap();
+        assert_eq!(parse_error(&buf[..n]).unwrap().msg, &msg[..65_535], "its width, whole");
+        let n = error_body(&mut buf, -42, 0, &msg).unwrap();
+        assert_eq!((n, parse_error(&buf[..n]).unwrap().msg), (ERROR_BODY_LEN + 65_535, &msg[..65_535]));
+    }
+
     #[test]
     fn empty_message_ok() {
         let mut buf = [0u8; 16];

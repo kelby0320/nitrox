@@ -593,4 +593,65 @@ mod tests {
         let t = read(&disk).unwrap();
         assert_eq!(t.partitions()[0].name(), &long[..36]);
     }
+
+    /// The table's front, `blocks` long, as [`build`] writes it for [`two_partitions`].
+    fn front(blocks: usize) -> Vec<u8> {
+        let (mut front, mut back) = (vec![0u8; FRONT_BYTES], vec![0u8; BACK_BYTES]);
+        build(DISK, GUID, &two_partitions(), &mut front, &mut back).expect("build");
+        front.resize(blocks * BLOCK, 0);
+        front
+    }
+
+    /// `front` with header field `at` set to `value`, both checksums made again over what the
+    /// header then says, so only the field decides how it reads.
+    fn resealed(mut front: Vec<u8>, at: usize, value: &[u8]) -> Vec<u8> {
+        let h = BLOCK;
+        front[h + at..h + at + value.len()].copy_from_slice(value);
+        let field = |f: &[u8], at: usize| u32::from_le_bytes(f[h + at..h + at + 4].try_into().unwrap()) as usize;
+        let start = (u64::from_le_bytes(front[h + 72..h + 80].try_into().unwrap()) as usize).checked_mul(BLOCK);
+        let end = start.and_then(|s| s.checked_add(field(&front, 80) * field(&front, 84)));
+        if let Some(entries) = start.zip(end).and_then(|(s, e)| front.get(s..e)) {
+            let crc = crc32(entries);
+            front[h + 88..h + 92].copy_from_slice(&crc.to_le_bytes());
+        }
+        let size = field(&front, 12).min(BLOCK);
+        front[h + 16..h + 20].fill(0);
+        let crc = crc32(&front[h..h + size]);
+        front[h + 16..h + 20].copy_from_slice(&crc.to_le_bytes());
+        front
+    }
+
+    /// **A header with a valid checksum is still read only as far as its fields allow**: unguarded,
+    /// a field here would slice past a buffer and panic the storage service, or read as a table
+    /// the header does not describe.
+    #[test]
+    fn a_resealed_header_is_read_only_within_its_bounds() {
+        let blocks = FRONT_BYTES / BLOCK;
+        let read_with = |at, value: &[u8]| read(&resealed(front(blocks), at, value)).map(|t| t.count);
+        assert_eq!(read_with(80, &128u32.to_le_bytes()), Ok(2), "the table as built");
+        for (size, read_as) in
+            [(91u32, Err(ReadError::Unsupported)), (92, Ok(2)), (512, Ok(2)), (513, Err(ReadError::Unsupported))]
+        {
+            assert_eq!(read_with(12, &size.to_le_bytes()), read_as, "a header of {size} bytes");
+        }
+        for len in [8u32, 127, 129] {
+            assert_eq!(read_with(84, &len.to_le_bytes()), Err(ReadError::Unsupported), "entries of {len} bytes");
+        }
+        assert_eq!(read_with(80, &0u32.to_le_bytes()), Err(ReadError::Unsupported), "no entries");
+        assert_eq!(read_with(72, &3u64.to_le_bytes()), Err(ReadError::Truncated), "an array past the buffer");
+        assert_eq!(read_with(72, &(1u64 << 55).to_le_bytes()), Err(ReadError::Unsupported), "a start that wraps");
+        let last = (usize::MAX / BLOCK) as u64;
+        assert_eq!(read_with(72, &last.to_le_bytes()), Err(ReadError::Unsupported), "an end that wraps");
+    }
+
+    /// **At most 1024 entries are read**, a buffer holding 1025 refused all the same.
+    #[test]
+    fn a_header_of_1024_entries_is_read_and_one_of_1025_is_not() {
+        let entries = |count: u32| {
+            let blocks = 2 + (count as usize * ENTRY_LEN).div_ceil(BLOCK);
+            read(&resealed(front(blocks), 80, &count.to_le_bytes())).map(|t| t.count)
+        };
+        assert_eq!(entries(1024), Ok(2));
+        assert_eq!(entries(1025), Err(ReadError::Unsupported));
+    }
 }

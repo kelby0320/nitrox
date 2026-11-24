@@ -240,6 +240,34 @@ mod tests {
         assert_eq!(tr.next().unwrap().unwrap(), Item::End(0));
     }
 
+    /// **A table is rows, then its end**: one ended by an error record, or by an unknown tag, is a
+    /// decode error, and the reader, which takes an error record, refuses the unknown tag.
+    #[test]
+    fn a_table_ended_by_an_error_record_or_an_unknown_tag_is_refused() {
+        let schema = Schema::new().field("x", TypeTag::Int, TypeModifiers::NONE);
+        let ended_by = |tail: &[u8]| {
+            let mut buf = Vec::new();
+            let mut tw = TableWriter::new(&mut buf);
+            tw.write_schema(StreamFlags::NONE, &schema).unwrap();
+            tw.write_row(&[Value::Int(1)]).unwrap();
+            buf.extend_from_slice(tail);
+            buf.extend_from_slice(&[REC_TERMINATOR, 0, 0, 0, 0]);
+            buf
+        };
+        let mut error = Vec::new();
+        WireErrorRecord { code: -13, message: String::from("bad"), field_name: String::new() }
+            .encode(&mut error)
+            .unwrap();
+        assert_eq!(crate::wire::Table::decode(&ended_by(&error)), Err(WireError::BadRecordTag(REC_ERROR)));
+        assert_eq!(crate::wire::Table::decode(&ended_by(&[0x7F])), Err(WireError::BadRecordTag(0x7F)));
+        assert_eq!(crate::wire::Table::decode(&ended_by(&[])).map(|t| t.rows.len()), Ok(1));
+        let unknown = ended_by(&[0x7F]);
+        let mut tr = TableReader::new(&unknown).unwrap();
+        assert_eq!(tr.next().unwrap().unwrap(), Item::Row(vec![Value::Int(1)]));
+        assert_eq!(tr.next(), Some(Err(WireError::BadRecordTag(0x7F))));
+        assert!(tr.next().is_none());
+    }
+
     #[test]
     fn schema_mismatch_is_caught() {
         let schema = Schema::new().field("a", TypeTag::Int, TypeModifiers::NONE).field(

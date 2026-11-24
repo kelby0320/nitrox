@@ -2,9 +2,9 @@
 //!
 //! Pure, `#![no_std]`, no-`alloc`: verify a `(username, password)` against the user database, and
 //! decide what an administrator's request does to it, answering the `Auth` rsproto category
-//! (`docs/spec/rsproto-auth-ops.md`). No syscalls — the bare-target server (`src/main.rs`) supplies
+//! (`docs/spec/rsproto-auth-ops.md`). No syscalls but [`install`]'s — the server supplies
 //! the database's bytes, the buffers, and a salt from the kernel's entropy source, and does the
-//! writing. Under `cargo test` it builds as host `std`.
+//! writing, through [`install`]. Under `cargo test` it builds as host `std`.
 //!
 //! **The database's format is `libusers`'**: a `passwd`-style line file,
 //! `name:salt_hex:iterations:verifier_hex:home`, whose `verifier` is
@@ -12,6 +12,8 @@
 //! `userspace/auth-service/CLAUDE.md`.
 
 #![cfg_attr(not(test), no_std)]
+
+pub mod install;
 
 use libkern::KError;
 use librsproto::RS_MAX_BODY;
@@ -245,6 +247,19 @@ mod tests {
         let r = parse_authenticate_reply(&reply[..n]).unwrap();
         assert!(!r.is_authenticated());
         assert_eq!(r.result, AUTH_RESULT_DENIED);
+    }
+
+    /// **An empty password is a wrong one** for an account that exists, as the check decides and
+    /// as a client's request is answered.
+    #[test]
+    fn an_empty_password_is_denied() {
+        use librsproto::auth::{AUTH_RESULT_DENIED, build_authenticate_request, parse_authenticate_reply};
+        let db = db_line("alice", "hunter2", b"\x10\x20\x30\x40", "/home/alice");
+        assert_eq!(authenticate(db.as_bytes(), b"alice", b""), AuthOutcome::Denied);
+        let (mut req, mut reply) = ([0u8; 128], [0u8; 128]);
+        let rn = build_authenticate_request(&mut req, b"alice", b"").unwrap();
+        let n = serve_authenticate(&req[..rn], db.as_bytes(), &mut reply).unwrap();
+        assert_eq!(parse_authenticate_reply(&reply[..n]).unwrap().result, AUTH_RESULT_DENIED);
     }
 
     #[test]

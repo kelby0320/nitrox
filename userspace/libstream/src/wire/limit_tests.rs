@@ -1,5 +1,39 @@
 use super::*;
 use alloc::vec;
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::cell::Cell;
+
+std::thread_local! {
+    static LARGEST: Cell<usize> = const { Cell::new(0) };
+}
+
+/// The system's allocator, noting the largest block this thread asks for: a reservation's
+/// witness, where a host that grants a huge one lazily would pass a reader without its cap.
+struct Largest;
+
+// SAFETY: each call is the system allocator's, made with the caller's own arguments.
+unsafe impl GlobalAlloc for Largest {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        let _ = LARGEST.try_with(|n| n.set(n.get().max(layout.size())));
+        // SAFETY: the caller's layout, passed on.
+        unsafe { System.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: the caller's block and layout, passed on.
+        unsafe { System.dealloc(ptr, layout) }
+    }
+}
+
+#[global_allocator]
+static ALLOC: Largest = Largest;
+
+/// The largest block asked for on this thread while `f` ran.
+fn largest_in(f: impl FnOnce()) -> usize {
+    LARGEST.with(|n| n.set(0));
+    f();
+    LARGEST.with(Cell::get)
+}
 
 fn list_of(v: Value) -> Value {
     Value::List(Arc::from(vec![v]))
@@ -220,4 +254,17 @@ fn a_chain_of_records_is_held_to_the_depth() {
     write_value(&mut buf, &chain(MAX_DEPTH)).unwrap();
     assert_eq!(decode(&buf, TypeTag::Record), Ok(chain(MAX_DEPTH)));
     assert_eq!(write_value(&mut Vec::new(), &chain(MAX_DEPTH + 1)), Err(WireError::TooLarge));
+}
+
+/// **A count is a claim, not an allocation**: a list and a schema claiming four billion items end
+/// at their bytes, reserving no more than the cap allows.
+#[test]
+fn a_count_of_four_billion_ends_at_the_bytes() {
+    let claim = 4_000_000_000u32.to_le_bytes();
+    let list = largest_in(|| assert_eq!(decode(&claim, TypeTag::List), Err(WireError::UnexpectedEof), "a list"));
+    assert!(list <= SCHEMA_FIELD_HINT_CAP * size_of::<Value>(), "a list reserved {list} bytes");
+    let schema = [&claim[..], &[1, 0, b'x', TypeTag::Int.to_u8(), 0]].concat();
+    let decoded = || Schema::decode(&mut ByteSource::new(&schema)).map(|_| ());
+    let fields = largest_in(|| assert_eq!(decoded(), Err(WireError::UnexpectedEof), "a schema"));
+    assert!(fields <= SCHEMA_FIELD_HINT_CAP * size_of::<FieldDef>(), "a schema reserved {fields} bytes");
 }

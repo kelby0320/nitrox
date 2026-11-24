@@ -591,4 +591,33 @@ mod tests {
         assert_eq!(walk(&b[..n]), Some(2));
         assert_eq!(walk(&b[..n - 1]), Some(1), "a cut-off second entry is dropped");
     }
+
+    /// **A length is its field's width, and no more**: one past is refused, where a wrapped length
+    /// would tell the reader of fewer bytes than follow.
+    #[test]
+    fn a_name_one_past_its_field_is_refused() {
+        let (at, past) = (vec![b'a'; 65_535], vec![b'a'; 65_536]);
+        let mut out = vec![0u8; 2 * past.len() + 64];
+        assert_eq!(name_request(&mut out, &at), Some(2 + at.len()));
+        assert_eq!(name_request(&mut out, &past), None);
+        assert_eq!(rename_request(&mut out, &at, &at), Some(4 + 2 * at.len()));
+        assert_eq!(rename_request(&mut out, &past, b"b"), None, "the old name");
+        assert_eq!(rename_request(&mut out, b"b", &past), None, "the new name");
+        assert_eq!(read_range_request(&mut out, 0, 0, &at), Some(READ_RANGE_REQUEST_PREFIX_LEN + at.len()));
+        assert_eq!(read_range_request(&mut out, 0, 0, &past), None);
+        let mut w = DirReplyWriter::new(&mut out).unwrap();
+        assert!(w.push(2, DIRENT_KIND_FILE, 0, 0, 0, &at[..255]));
+        assert!(!w.push(3, DIRENT_KIND_FILE, 0, 0, 0, &at[..256]), "an entry's name of 256 bytes");
+    }
+
+    /// **A listing is the entries its header counts**: bytes after them are not read as more.
+    #[test]
+    fn entries_past_the_count_are_not_read() {
+        let mut b = [0u8; 128];
+        let mut w = DirReplyWriter::new(&mut b).unwrap();
+        assert!(w.push(2, DIRENT_KIND_DIR, 0, 0, 0, b"a") && w.push(3, DIRENT_KIND_DIR, 0, 0, 0, b"b"));
+        let n = w.finish(0);
+        super::put_u16(&mut b, 8, 1);
+        assert_eq!(parse_read_dir_reply(&b[..n]).map(|(_, it)| it.count()), Some(1));
+    }
 }
