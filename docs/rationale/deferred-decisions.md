@@ -1416,6 +1416,18 @@ pulled**, or Part F's Files, which reads from sticks as a matter of course.
 
 ### Filesystems
 
+**The storage service is up but not serving while it reads its disks —
+`TODO(storage-start-unserved)`.** Since 2026-11-24 it answers Ready, and mints sessions'
+endpoint, before it reads a disk (sup-1 in [`bug-bash.md`](../planning/bug-bash.md)), so on a slow
+stick a session can be running while it reads and mounts. Its control channel is read only by the
+main loop, so a shutdown asked meanwhile waits for the reads: past `service-mgr`'s 60 s
+`stop_timeout` for it the shutdown goes on, and what it mounts after is not unmounted. Its
+endpoints' rings are four deep, so a fifth resolve queued meanwhile is refused `WouldBlock`, and a
+caller with no deadline waits. Both are bounded, and only a slow stick at boot meets them, which
+before lost the service for the boot (#470's review, finding 5, not booted). The shape: look at
+the control channel between devices, and the rings as deep as the kernel's eight forwarded
+lookups. Trigger: a slow stick met at boot, or a gate that holds the reads.
+
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
 (IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
 and reschedule IPIs, and every registered device handler — is configured with **IST0, i.e.

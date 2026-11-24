@@ -2,6 +2,7 @@
 
 use super::*;
 
+/// Twice the kernel's 8 forwarded lookups a registration holds: only a direct sender meets it.
 const KEPT_MAX: usize = 16;
 
 impl Service {
@@ -19,21 +20,22 @@ impl Service {
                 Ok(Some(m)) if kept.len() == KEPT_MAX => fail(serve, m.op, m.request_id, KError::WouldBlock),
                 Ok(Some(m)) => kept.push(m),
                 Ok(None) => {}
-                Err(()) => break,
+                Err(()) => self.stop(CLOSED, 1),
             }
         }
         kept
     }
 
     /// Read each device the boot holds, as its server would, and mount what the boot's rules say.
+    // TODO(storage-start-unserved): a shutdown or a fifth resolve meanwhile waits for this.
     pub(super) fn read_and_mount(&mut self, held: Vec<(DeviceRecord, Node)>) {
+        Line::new().s(b"storage-service: ").u(held.len() as u64).s(b" block device(s)").end();
         for (record, node) in held {
             let io = DeviceIo::new(&node, &record, &self.scratch);
             self.devices.push(Device { found: probe_record(&io, &record), record });
             self.nodes.push((record.id, node));
         }
-        // A mount hands its server a duplicate of the node; the service keeps every node, for an
-        // administrator's mount and for an unmount's flush.
+        // Every node is kept, mounted or not, for an administrator's mount and an unmount's flush.
         let mut plan = automount(&self.devices, &self.init, self.live, self.init_known);
         plan.truncate(MAX_MOUNTS);
         for (id, node) in &self.nodes {

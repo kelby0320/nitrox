@@ -87,7 +87,7 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
 4. **It answers `Meta::Ready` before it reads a disk**, and `service-mgr` binds it at
    `/svc/storage` (`init` did until administration Part E.1a). Bring-up waits on the Ready: read
    first, a slow stick held the boot and, past `service-mgr`'s 30 s, lost the service for it
-   (sup-1, until 2026-11-24). It mints the session endpoint `service-mgr` asks for next, within
+   (until 2026-11-24). It mints the session endpoint `service-mgr` asks for next, within
    that ask's 5 s (`librsproto::meta::DERIVE_TIMEOUT_NS`), and keeps anything else asked for step 7.
 5. **It reads each device** (§4), and each disk's partition table.
 6. **It mounts what it can serve** (§6), and keeps every device's node, mounted or not.
@@ -551,7 +551,9 @@ device it is about, a device read again planned as an arrival, and each `note`.
   runs the chain on every mount it made, last first and without the held check, then exits; `init`
   does the same for its own mounts on the terminal channel's `Finish`. `service-mgr`'s shutdown
   sends both (Part E.4b), when a person runs `with power shutdown` (Part E.4d). `check-shutdown`
-  gates it for `init`'s root. A machine turned off without one is still left not clean.
+  gates it for `init`'s root. A machine turned off without one is still left not clean. **So
+  does its root endpoint's peer going** (2026-11-24), which ends the service with code 1: a mount
+  is not left behind it, and while it waits for the session endpoint's ask, nothing is read.
 - **An ext4 its server would refuse reads as "no filesystem"**, not as "ext4, which this system
   cannot serve". Nothing distinguishes the two until a person needs to be told why a disk did not
   mount. A FAT does say (Phase 6 Part E).

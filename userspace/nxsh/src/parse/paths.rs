@@ -3,8 +3,7 @@
 use super::*;
 
 impl Parser<'_> {
-    /// `open`'s and `save`'s paths, read as `cd` reads its own: `hello.txt` is a path in word
-    /// mode, where expression mode reads a field access. A block's `{` and a list's `,` end them.
+    /// `open`'s and `save`'s paths, words as `cd`'s are: a block's `{` or a list's `,` ends them.
     pub(super) fn path_args(&mut self) -> Result<Vec<Arg>> {
         let mut args = Vec::new();
         while !matches!(self.lx.next_byte(), b'{' | b',') {

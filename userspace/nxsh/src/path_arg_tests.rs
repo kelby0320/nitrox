@@ -61,7 +61,6 @@ fn a_parenthesised_path_ends_at_its_paren() {
     assert_eq!(count(host(), "open (format(\"{}.txt\", \"b\")) | count"), "1", "computed, as `cd`'s is");
 }
 
-/// **A `(` read twice leaves no nesting behind**, after `open`'s, `cd`'s and an external's.
 #[test]
 fn a_parenthesised_argument_leaves_the_next_line_its_own() {
     let host = || MockHost::new().with_file("/p/a.txt", "1\n2\n").with_file("/p/b.txt", "3\n");
@@ -81,7 +80,6 @@ fn a_parenthesised_argument_leaves_the_next_line_its_own() {
     assert_eq!(stages, 2, "an external's parenthesised argument ends at its paren too");
 }
 
-/// **A comment after a lone `/` leaves it the root path**, skipped as a space is.
 #[test]
 fn a_comment_after_a_lone_slash_leaves_it_a_path() {
     for src in ["list / # the root", "list /\t# the root\nlist /home"] {

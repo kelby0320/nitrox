@@ -91,6 +91,8 @@ const REPLAY_WAIT_NS: u64 = 2_000_000_000;
 const MAX_SESSION_ENDPOINTS: usize = 4;
 /// Mounts at once. Each keeps its server's control channel in the wait set, to see it exit.
 const MAX_MOUNTS: usize = 8;
+const CLOSED: &[u8] = b"storage-service: forwarding endpoint closed: everything it mounted is unmounted, exiting\n";
+const STOPPED: &[u8] = b"storage-service: asked to stop: everything it mounted is unmounted, exiting\n";
 /// Admin endpoints at once. The view broker asks for one at boot; the second is headroom.
 const MAX_ADMIN_ENDPOINTS: usize = 2;
 /// Admin sessions open at once: a `disk --mount` or `--unmount` is one, briefly.
@@ -157,7 +159,6 @@ fn recv_request(ch: &Chan) -> Result<Option<Message>, ()> {
     Ok(recv(ch)?.map(|(m, _)| m))
 }
 
-/// What request `m` asks for, if it is a resolve.
 fn asked(m: &Message) -> Asked<'_> {
     match parse_resolve_request(&m.body) {
         Some(r) if m.op == OP_NS_RESOLVE => suffix::parse(r.suffix),
@@ -662,10 +663,9 @@ impl Service {
         Ok(())
     }
 
-    /// **A shutdown's unmount**: every mount this service made, last mounted first, by the chain
-    /// without its held check, each outcome said (the QEMU gates match it) — then exit. `init`'s
-    /// own mounts are `init`'s to unmount.
-    fn shut_down(&mut self) -> ! {
+    /// **The service's end**: every mount it made unmounted, last first, by the chain without its
+    /// held check, each outcome said (the gates match it), then `said` and exit with `code`.
+    fn stop(&mut self, said: &[u8], code: i32) -> ! {
         while let Some(x) = self.mounted.last() {
             let label = x.label.clone();
             let result = self.unmount(&label, false);
@@ -682,8 +682,8 @@ impl Service {
                     .end();
             }
         }
-        log::write(b"storage-service: asked to stop: everything it mounted is unmounted, exiting\n");
-        libos::exit(0);
+        log::write(said);
+        libos::exit(code);
     }
 
     fn open_dir(&mut self, reply_to: &Chan, request_id: u64, listing: Listing) {
@@ -919,7 +919,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         log::write(b"storage-service: Ready send FAIL\n");
         libos::exit(1);
     }
-    Line::new().s(b"storage-service: ").u(records.len() as u64).s(b" block device(s)").end();
     let mut s = Service {
         root,
         subscription: Some(subscription),
@@ -998,14 +997,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
                 // the kernel keeps a peer-closed channel signalled, so going round again would spin
                 // a CPU.
                 if !s.serve_resolve(&serve_end, false) {
-                    log::write(b"storage-service: forwarding endpoint closed\n");
-                    libos::exit(1);
+                    s.stop(CLOSED, 1);
                 }
             } else if s.subscription.as_ref().is_some_and(is) {
                 s.serve_subscription();
             } else if control.as_ref().is_some_and(is) {
                 if control::recv(&mut control) == Control::Op(CTRL_OP_SHUTDOWN) {
-                    s.shut_down();
+                    s.stop(STOPPED, 0);
                 }
             } else if let Some(i) = s.session_ends.iter().position(|e| is(e)) {
                 // Every holder of this endpoint has let it go, its bindings included.
