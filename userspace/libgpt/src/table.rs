@@ -621,8 +621,9 @@ mod tests {
         front
     }
 
-    /// **A header with a valid checksum is still read only as far as its fields allow**: each
-    /// field here, unguarded, would slice past a buffer and panic the storage service.
+    /// **A header with a valid checksum is still read only as far as its fields allow**: unguarded,
+    /// a field here would slice past a buffer and panic the storage service, or read as a table
+    /// the header does not describe.
     #[test]
     fn a_resealed_header_is_read_only_within_its_bounds() {
         let blocks = FRONT_BYTES / BLOCK;
