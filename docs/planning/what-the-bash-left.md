@@ -785,21 +785,29 @@ Where it departs from the above:
 
 **Built 2026-11-23**, a commit a finding, every mutation each names failing a test but one, which
 cannot. Where it departs from the above:
-- **proto-12 holds the whole class**: every length cap in `librsproto`, the storage, auth, meta
-  and log encoders' too, and a listing read to its count. The log append's `u32` message cap is
-  not tested, its boundary a 4 GiB message.
+- **proto-12 holds the whole class**: every length cap in `librsproto` at its width and one past,
+  the storage, auth, meta, log and views encoders' and the error body's too, and a listing read to
+  its count; and each named maximum, the clipboard's, the desktop's and the surface's, at itself
+  and one past, by its writer and its reader.
+  - Untested: three `u32` lengths, a log message's, a view request's environment and
+    `reply_object`'s, each a 4 GiB boundary.
+  - The clipboard session's check on a copy is an equivalent mutation: the encoder it calls
+    refuses the same.
 - **proto-17 holds the stream bitmap as well**, as the bash named it: its old case's handle count
   decided it.
 - **proto-6 holds the array's checked start and end**, and **sec-14 the iteration count's
   multiply** beside its add.
-- **proto-11's row cap is an equivalent mutation**: it counts fields already decoded, each at
-  least four bytes of input.
+- **proto-11's test counts what is reserved**, through a test allocator, where a host granting
+  the claim lazily would pass a reader without its caps. **Its row cap is an equivalent
+  mutation**: it counts fields already decoded, each at least four bytes of input.
 - **sec-9's known answers are OpenSSL's**, an implementation independent of this one: NIST's file
   would be a download.
 - **sec-15 runs under Miri**: the allocator, its blocks zeroed when made, reads only byte buffers.
   Read whole, a block holding a struct's padding is uninitialised, as Miri found.
 - **sec-13's install asks `INSPECT`**, and a write-back that fails is held to leave the file as it
-  was. The model cannot fail a file's create or a rename.
+  was. The next install's truncate cuts what that left, and each refusal names its step: a size
+  that cannot be read, a leftover's tail, a database past a page. The model cannot fail a file's
+  create or a rename.
 
 ### H.10 The filesystems' guards, held
 

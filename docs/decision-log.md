@@ -39046,8 +39046,8 @@ H.8 merged, #466. H.9 on `pre-phase-7/h9-parser-guards`, as
   makes no syscalls but `install`'s.
 - **Each parser's guard is held by an input only it decides** (proto-6, proto-11, proto-12,
   proto-17): a GPT header resealed with a field out of bounds, a count of four billion in four
-  bytes, every `librsproto` length cap at its width and one past, a stream's unknown bit and
-  record tag.
+  bytes, every `librsproto` length cap at its width and one past and each named maximum at itself,
+  a stream's unknown bit and record tag.
 - **So is each guard on the credential path** (sec-7 to sec-9, sec-14, sec-15): a compare's every
   bit, an empty password, SHA-256's padding and HMAC's key boundaries, the user database's fields,
   and a password's four scrubs, seen through a test allocator that counts what is freed holding one.

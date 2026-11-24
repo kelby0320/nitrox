@@ -1363,7 +1363,8 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Restored. tests. Medium. **Later.**
   Fixed in `a437bbf2`: a list and a schema claiming four billion items end `UnexpectedEof`; fails
   without it: the list's cap and the schema's, each aborting the run on a 128 GB reservation. The
-  row's cap counts fields already decoded, so its removal is an equivalent mutation.
+  row's cap counts fields already decoded, so its removal is an equivalent mutation. Since
+  `cb042a44` the test counts what is reserved, so a host that grants the claim lazily fails it too.
 - [x] **proto-12** `userspace/librsproto/src/file.rs:333` — `DirEntryIter`'s truncated-entry
   guard (`body.len() < end`) and its `remaining == 0` stop, plus the name-length limits (u8::MAX
   in the dir-entry writer, u16::MAX in the name and rename encoders), are untested. A Readdir
@@ -1375,7 +1376,12 @@ Found 29, refuted by a boot 0, reported 18 (11 were duplicates, merged).
   Fixed in `ac228366`: every length cap in `librsproto` held at its width and one past, the name
   and rename encoders, the resolve suffix and the subnamespace base among them, and a listing read
   to its count; fails without it: each cap loosened by one, the count stop taken out, and the log
-  reply's three checks dropped. The truncated entry was already held.
+  reply's three checks dropped. The truncated entry was already held. The views' and the error
+  body's caps, which that sweep missed, are held in `d9f748ec`, and each named maximum, the
+  clipboard's, the desktop's and the surface's, at itself and one past by writer and reader in
+  `b9e99256`. Untested: three `u32` lengths, a log message's, a view request's environment and
+  `reply_object`'s, each a 4 GiB boundary; and the clipboard session's own check on a copy, an
+  equivalent mutation, as the encoder it calls refuses the same.
 - [x] **proto-13** `kernel/src/syscall/table.rs:2589` — `block_map` calls
   `runs.try_reserve(header.run_count as usize)` before the body is checked to hold that many
   runs. `run_count` is a server-chosen u32, but a reply body carries at most (3980-32)/24 = 164
@@ -1698,7 +1704,9 @@ Found 19, refuted by a boot 0, reported 15 (four were duplicates, merged).
   failed install, then a boot-time reload. error-paths. Low. **Later.**
   Fixed in `6420f365`, once `install` moved into the library (`56a779aa`): a created `users.new`
   that is not the new database's size, a leftover's tail kept, fails the install and leaves the
-  file as it was; fails without it: `a_leftover_the_truncate_did_not_cut_fails_the_install`.
+  file as it was; fails without it: `a_leftover_the_truncate_did_not_cut_fails_the_install`. In
+  `971512e8` the truncate, which lets an install recover after a write that died, is held, and a
+  size that cannot be read is refused as such rather than as a leftover's tail.
 
 - [x] **sec-14** `userspace/libusers/src/lib.rs:374` — Three parser bounds on user-database input
   have no test: odd-length hex, u32 overflow in the iterations field, and an empty home field.
