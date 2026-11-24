@@ -126,14 +126,14 @@ impl Interp {
         let _ = self.bind("$args", v, false, false);
     }
 
-    /// The paths named by `raw` for `open` and `save`: words are tilde-expanded, strings and
-    /// names are taken as written.
-    pub(crate) fn path_args(&self, raw: &[&Expr]) -> core::result::Result<Vec<String>, EvalError> {
+    /// The paths named by `raw` for `open` and `save`, as `cd` reads its own: words are
+    /// tilde-expanded, strings taken as written, and anything else evaluated and rendered.
+    pub(crate) fn path_args(&mut self, raw: &[&Expr]) -> core::result::Result<Vec<String>, EvalError> {
         raw.iter()
-            .filter_map(|e| match e {
-                Expr::Word(w) => Some(self.expand_tilde(w).map(Cow::into_owned)),
-                Expr::Ident(n) | Expr::Str(n) => Some(Ok(n.clone())),
-                _ => None,
+            .map(|e| match e {
+                Expr::Word(w) => self.expand_tilde(w).map(Cow::into_owned),
+                Expr::Str(s) => Ok(s.clone()),
+                other => Ok(self.eval(other)?.render()),
             })
             .collect()
     }

@@ -49,4 +49,42 @@ fn a_dotted_path_a_quoted_one_and_a_following_block_are_read_as_before() {
     assert_eq!(count(host(), src), "3");
     let e = run(host(), "for line in open { 1 }").expect_err("no path");
     assert_eq!(e.message, "`open` needs at least one path", "the brace is the block's");
+    let call = "def f(a, b) { b }\nf([1] | save \"x.txt\", 3)";
+    assert_eq!(count(host(), call), "3", "and a `,` after a path is its list's");
+}
+
+#[test]
+fn a_parenthesised_path_ends_at_its_paren() {
+    let host = || MockHost::new().with_file("/p/a.txt", "1\n2\n").with_file("/p/b.txt", "3\n");
+    assert_eq!(count(host(), "open ./a.txt (\"b.txt\") | count"), "3");
+    assert_eq!(count(host(), "let f = \"b.txt\"\nopen a.txt (f) | count"), "3");
+    assert_eq!(count(host(), "open (format(\"{}.txt\", \"b\")) | count"), "1", "computed, as `cd`'s is");
+}
+
+/// **A `(` read twice leaves no nesting behind**, after `open`'s, `cd`'s and an external's.
+#[test]
+fn a_parenthesised_argument_leaves_the_next_line_its_own() {
+    let host = || MockHost::new().with_file("/p/a.txt", "1\n2\n").with_file("/p/b.txt", "3\n");
+    assert_eq!(count(host(), "open ./a.txt (\"b.txt\")\nopen ./a.txt | count"), "2");
+    let nested = "let n = (open ./a.txt (\"b.txt\")\n)\nn | count";
+    assert_eq!(count(host(), nested), "3", "inside a `(`, the depth it was read at is kept");
+    let calls = |src: &str| match &parse_script(src).expect("parses").stmts[..] {
+        [_, _] => 2,
+        other => other.len(),
+    };
+    assert_eq!(calls("cd y (\"x\")\ncd z"), 2);
+    assert_eq!(calls("^echo y (\"x\")\n^echo z"), 2);
+    let stages = match &parse_script("^echo y (\"x\") | count").expect("parses").stmts[..] {
+        [crate::ast::Stmt::Expr(crate::ast::Expr::Pipeline(stages))] => stages.len(),
+        other => panic!("not one pipeline: {other:?}"),
+    };
+    assert_eq!(stages, 2, "an external's parenthesised argument ends at its paren too");
+}
+
+/// **A comment after a lone `/` leaves it the root path**, skipped as a space is.
+#[test]
+fn a_comment_after_a_lone_slash_leaves_it_a_path() {
+    for src in ["list / # the root", "list /\t# the root\nlist /home"] {
+        assert!(parse_script(src).is_ok(), "{src} should parse");
+    }
 }

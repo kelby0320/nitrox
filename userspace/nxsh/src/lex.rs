@@ -225,7 +225,7 @@ pub struct Lexer<'a> {
     pending: Option<Spanned>,
     pending_mode: Mode,
     pending_start: usize,
-    pending_line: u32,
+    pending_line_and_depth: (u32, u32),
     /// Nesting depth of `(` and `[` only. `{` is excluded on purpose: blocks need their
     /// newlines (D2).
     depth: u32,
@@ -246,7 +246,7 @@ impl<'a> Lexer<'a> {
             pending: None,
             pending_mode: Mode::Expr,
             pending_start: 0,
-            pending_line: 1,
+            pending_line_and_depth: (1, 0),
             depth: 0,
             after_match_op: false,
             prev: None,

@@ -4,10 +4,10 @@ use super::*;
 
 impl Parser<'_> {
     /// `open`'s and `save`'s paths, read as `cd` reads its own: `hello.txt` is a path in word
-    /// mode, where expression mode reads a field access. A block's `{` ends them.
+    /// mode, where expression mode reads a field access. A block's `{` and a list's `,` end them.
     pub(super) fn path_args(&mut self) -> Result<Vec<Arg>> {
         let mut args = Vec::new();
-        while !self.lx.opens_a_block() {
+        while !matches!(self.lx.next_byte(), b'{' | b',') {
             let Some(arg) = self.word_arg()? else { break };
             args.push(arg);
         }
@@ -21,7 +21,8 @@ impl Parser<'_> {
             Tok::ShortFlags(f) => Arg::ShortFlags(f),
             Tok::Word(w) => Arg::Positional(Expr::Word(w)),
             Tok::Str(v) => Arg::Positional(Expr::Str(v)),
-            Tok::LParen => return Ok(Some(Arg::Positional(self.expr()?))),
+            // The parenthesised value alone: a `|` after its `)` is the pipeline's next stage.
+            Tok::LParen => return Ok(Some(Arg::Positional(self.primary()?))),
             _ => return Ok(None),
         };
         self.lx.bump(Mode::Word)?;

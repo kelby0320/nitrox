@@ -9,14 +9,15 @@ impl Lexer<'_> {
             if self.pending_mode == mode {
                 return Ok(p.clone());
             }
+            // Where the held token was read, its depth too: a `(` read again counts once.
             self.pos = self.pending_start;
-            self.line = self.pending_line;
+            (self.line, self.depth) = self.pending_line_and_depth;
             self.pending = None;
         }
-        let start_line = self.line;
+        let start = (self.line, self.depth);
         let tok = self.scan(mode)?;
         self.pending_mode = mode;
-        self.pending_line = start_line;
+        self.pending_line_and_depth = start;
         self.pending = Some(tok.clone());
         self.pending_start = tok.start;
         Ok(tok)
@@ -39,10 +40,10 @@ impl Lexer<'_> {
         matches!(self.at(self.past_space(self.pos)), 0 | b'\n' | b'|' | b')' | b']' | b'}' | b',')
     }
 
-    /// Whether the next token is a `{`, which begins no word-mode argument.
-    pub fn opens_a_block(&self) -> bool {
+    /// The byte the next token starts at, from a token already held if there is one.
+    pub fn next_byte(&self) -> u8 {
         let from = if self.pending.is_some() { self.pending_start } else { self.pos };
-        self.at(self.past_space(from)) == b'{'
+        self.at(self.past_space(from))
     }
 
     fn past_space(&self, mut i: usize) -> usize {
