@@ -401,7 +401,7 @@ impl BlockWriter for Counting<'_> {
 }
 
 /// **The write path batches**: a 1 MiB grow — 256 clusters, 2,048 sectors — costs sixteen 64 KiB
-/// zeroing writes, the FAT's sectors once per copy, and the entry: about twenty, not hundreds.
+/// zeroing writes, the FAT's sectors once per copy, and the entry: nineteen, not hundreds.
 #[test]
 fn a_one_mebibyte_grow_costs_a_handful_of_writes() {
     let img = mformat(64, &["-F", "-c", "8"]);
@@ -412,7 +412,7 @@ fn a_one_mebibyte_grow_costs_a_handful_of_writes() {
     counting.writes.set(0);
     fat.grow_file(b"/big.bin", 1 << 20, NOW).unwrap();
     let writes = counting.writes.get();
-    assert!(writes <= 24, "a 1 MiB grow took {writes} writes");
+    assert_eq!(writes, 19, "a 1 MiB grow's writes");
     let mut runs = [BlockRun::default(); 64];
     assert_eq!(fat.map_file(b"/big.bin", &mut runs).unwrap().runs, 1, "one run, on a fresh volume");
     fat.mark_clean().unwrap();

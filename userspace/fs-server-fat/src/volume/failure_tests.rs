@@ -38,8 +38,8 @@ fn under(base: &Rc<Vec<u8>>, mode: Mode, n: u64) -> Failing {
 }
 
 /// **Run `change` on `base` with each of its writes failing once in turn, refused and landed**,
-/// until a run fails none, checking each image: one the change succeeded on has `takes` fewer
-/// clusters free. **A removal that fails may lose clusters**, since it writes its entry before it
+/// until a run fails none, checking each image, and that the mount's FAT cache holds only what the
+/// device does: one the change succeeded on has `takes` fewer clusters free. **A removal that fails may lose clusters**, since it writes its entry before it
 /// frees, and so may a change whose undo cannot be written: those images are held to the crash
 /// tests' rule, which allows that, and no more.
 fn each_write_failing(
@@ -58,6 +58,11 @@ fn each_write_failing(
             let disk = under(base, how, n);
             let fat = Fat::new(&disk);
             let out = change(&fat);
+            let g = *fat.geometry().unwrap();
+            assert!(
+                fat.cache.borrow().as_on(&disk.image, &g),
+                "{what}, write {n} {how:?}: the cache is not the device"
+            );
             assert!(!how.undoable() || !Volume::refusing_changes(&fat), "{what}, write {n} {how:?}: refusing");
             let failed = disk.writes.get() > n;
             if !failed {

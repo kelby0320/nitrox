@@ -465,3 +465,6 @@ mod tests {
 #[cfg(test)]
 #[path = "session_tests.rs"]
 pub(crate) mod session_tests;
+#[cfg(test)]
+#[path = "suffix_tests.rs"]
+mod suffix_tests;

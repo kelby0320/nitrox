@@ -141,12 +141,14 @@ fn a_grows_reply_marks_the_sectors_it_added_and_they_read_zero() {
     assert!(later.iter().all(|r| r.3 == 0), "{later:?}");
 }
 
+/// **A file in 64 fragments is served, a run each, and one in 65 refused `TooLarge`**: the most
+/// runs a reply holds, and one past it.
 #[test]
-fn a_file_in_more_than_64_fragments_is_refused_too_large() {
+fn a_file_in_64_fragments_is_served_and_one_in_65_refused_too_large() {
     let img = mformat(64, &["-c", "8"]);
     let host = scratch("frag");
     std::fs::create_dir_all(&host).unwrap();
-    let srcs: Vec<String> = (0..140)
+    let srcs: Vec<String> = (0..260)
         .map(|i| {
             let p = host.join(format!("f{i:03}"));
             std::fs::write(&p, pattern(4096, 2)).unwrap();
@@ -156,12 +158,17 @@ fn a_file_in_more_than_64_fragments_is_refused_too_large() {
     let mut args: Vec<&str> = srcs.iter().map(String::as_str).collect();
     args.push("::");
     mtools("mcopy", &img, &args);
-    let odd: Vec<String> = (1..140).step_by(2).map(|i| format!("::f{i:03}")).collect();
+    let odd: Vec<String> = (1..260).step_by(2).map(|i| format!("::f{i:03}")).collect();
     mtools("mdel", &img, &odd.iter().map(String::as_str).collect::<Vec<_>>());
     let _ = std::fs::remove_dir_all(&host);
-    put(&img, "huge.bin", &pattern(100 * 4096, 3));
+    put(&img, "f64.bin", &pattern(64 * 4096, 3));
+    put(&img, "f65.bin", &pattern(65 * 4096, 4));
     let disk = FileImage::open(&img);
-    assert_eq!(resolve(&Fat::new(&disk), b"huge.bin").err(), Some(KError::TooLarge.as_i32()));
+    let fat = Fat::new(&disk);
+    let b = resolve(&fat, b"f64.bin").unwrap();
+    assert_eq!(b.runs.len(), 64);
+    assert!(b.runs.iter().all(|r| r.2 == 8), "a cluster a run: {:?}", b.runs);
+    assert_eq!(resolve(&fat, b"f65.bin").err(), Some(KError::TooLarge.as_i32()));
 }
 
 #[test]

@@ -356,4 +356,24 @@ mod tests {
         c.read_meta(6 * BLOCK as u64, &mut tail).unwrap();
         assert_eq!(dev.taken(), (2, 0), "and not kept");
     }
+
+    /// **A freed range lets go of every block it touches, and of no other**: FAT's clusters need not
+    /// start on a block, so a range may end, or start, inside one.
+    #[test]
+    fn forget_lets_go_of_each_block_a_range_touches() {
+        let dev = Device::new(8 * BLOCK);
+        let mut store = Box::new(Store::<8>::new());
+        let c = MetaCache::new(&dev, &mut store);
+        let b = BLOCK as u64;
+        let after_forget = |offset: u64, len: u64| {
+            for k in 0..6 {
+                c.read_meta(k * b, &mut [0u8; 1]).unwrap();
+            }
+            c.forget(offset, len);
+            (0..6).filter(|&k| c.holds(k * b)).collect::<Vec<_>>()
+        };
+        assert_eq!(after_forget(b + 512, b), [0, 3, 4, 5], "ending inside block 2");
+        assert_eq!(after_forget(b, b), [0, 2, 3, 4, 5], "ending where block 2 starts");
+        assert_eq!(after_forget(4 * b + 512, 512), [0, 1, 2, 3, 5], "inside block 4");
+    }
 }

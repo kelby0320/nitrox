@@ -14,7 +14,9 @@ flush walk and the hot-plug window. Group E fixed 2026-10-25: a process's exit, 
 thread in place now, and the deadline heap's slots. On 2026-10-27 ten later findings moved to
 Part I with the safety survey's defects that repeat them. Part H detailed 2026-11-19: four of its
 fifty found fixed by later work, and ticked, and sched-10's last mutation planned. H.1 fixed
-fs-9 and fs-11 2026-11-20, and H.2 sup-3, 4, 8, 10, 11, 14, 15 and 16 the same day.** Part D of
+fs-9 and fs-11 2026-11-20, and H.2 sup-3, 4, 8, 10, 11, 14, 15 and 16 the same day; H.3 to H.9
+fixed theirs by 2026-11-23, sec-4 and sup-6 deferred past Phase 7 (the maintainer's call), and
+H.10 the filesystems' test gaps 2026-11-24.** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -823,7 +825,7 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   passes over a reserved one, and any failure inside it gives back what it took; fails without it:
   `an_allocation_passes_over_a_reserved_entry`.
 
-- [ ] **fs-13** `userspace/libfsserver/src/serve.rs:78` — The MAX_SUFFIX bound in `resolve()` and
+- [x] **fs-13** `userspace/libfsserver/src/serve.rs:78` — The MAX_SUFFIX bound in `resolve()` and
   `serve_read_range()`, and the `.min(content.len())` clamp on the read length, are untested. A
   suffix of 1025 bytes or more returns TooLarge today. If the bound were lost, `path_buf[1..1+len]`
   would panic and the server would hang. Adjacent defect: `try_resolve_directory` (server.rs:381)
@@ -833,6 +835,18 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   deleting either `req.suffix.len() > MAX_SUFFIX` check, or the `.min(content.len())`, left
   libfsserver, fs-server-fat and fs-server-ext4 `--lib` all green. The truncation was found by
   reading. Lens: tests. medium. **Later.**
+  Held in `dfbdbbb0`: a resolve, a range read, a resolve's size change and a rename each serve a
+  suffix of `MAX_SUFFIX` and refuse one byte more before the volume sees it, and a range read asks
+  for no more than the content buffer, each failing with its bound removed or moved by one:
+  `a_range_read_is_served_at_the_longest_suffix_and_refused_past_it`,
+  `a_resolve_is_served_at_the_longest_suffix_and_refused_past_it`,
+  `a_size_change_reaches_the_volume_at_the_longest_suffix_only`,
+  `a_range_read_is_cut_to_the_content_buffer` and
+  `a_rename_of_the_longest_suffixes_is_made_and_one_past_refused`. `directory_open`'s bound, which
+  `a_suffix_past_the_longest_opens_no_directory` left untested since its path named nothing, is
+  held there at 1,024 and 1,025 bytes, each naming a directory, and by
+  `a_directory_opens_at_the_longest_suffix_and_not_past_it`: it copies nothing, so no panic stands
+  in for it (#468's review).
 
 - [x] **fs-14** `userspace/fs-server-fat/src/volume.rs:706` — FAT's `rmdir_at` NotEmpty check, the
   `is_dir` refusal in `unlink_at`, `names::valid` in `mkdir_at` and in rename, and the `grow_file`
@@ -857,13 +871,15 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   Written with fs-8 in `14fbd440`: `the_allocator_keeps_to_the_filesystem_and_to_its_counts`,
   failing with each of the three guards removed.
 
-- [ ] **fs-16** `userspace/libfsserver/src/cache.rs:195` — `MetaCache::forget` has no test for a
+- [x] **fs-16** `userspace/libfsserver/src/cache.rs:195` — `MetaCache::forget` has no test for a
   freed range whose end is not 4 KiB-aligned, and the rounding of the end of the range is
   unchecked. FAT's data region need not start on a 4 KiB boundary. If a freed cluster ends mid-block
   and the partial block stays cached, the kernel writes file data there behind the server's back. A
   later `read_meta` of that block (reused as metadata) then sees stale bytes. Demonstrated:
   changing `(offset + len).div_ceil(BLOCK)` to `(offset + len) / BLOCK` left libfsserver,
   fs-server-ext4 and fs-server-fat `--lib` green. Lens: tests. low. **Later.**
+  Held in `dfbdbbb0`: `forget_lets_go_of_each_block_a_range_touches`, failing with the end rounded
+  down, the start rounded up, or the block a range ends at let go.
 
 - [x] **fs-17** `userspace/libfsserver/src/server.rs:329` — `maybe_grow` notes only
   `FsError::ReadOnly`. Every other create, grow or truncate failure falls through, and the resolve
@@ -2558,12 +2574,21 @@ before it is fixed.
   Fixed in `07fbbf55`: a directory's chain is walked to its `MAX_SLOTS` reach, and `within` climbs
   at most a path's 512 components; fails without it:
   `a_loop_in_a_directory_is_refused_within_a_directorys_reach`.
-- [ ] **pr365-7** `userspace/fs-server-fat/src/volume/write_tests.rs:411` — test gap: `writes <= 24`
+- [x] **pr365-7** `userspace/fs-server-fat/src/volume/write_tests.rs:411` — test gap: `writes <= 24`
   is loose against the 19 writes a 1 MiB grow records, so the FAT flush could lose its batching
   unseen. T1-25. Tests. Low. **Later.**
-- [ ] **pr365-8** `userspace/libfsserver/src/server.rs:419` — test gap: the truncate-to-zero arm,
+  Held in `f81f3564`: the count is exactly nineteen, which an unneeded write of the entry fails
+  and `<= 24` let through.
+- [x] **pr365-8** `userspace/libfsserver/src/server.rs:419` — test gap: the truncate-to-zero arm,
   `forget_then_release`, is tested at no level; a gate step emptying a file on the FAT stick would
   catch a leak. T1-14. Tests. Low. **Later.**
+  Held in `dfbdbbb0`: `a_truncate_to_nothing_is_forgotten_freed_and_answered`, through the loop over
+  libos's model and a recording volume, failing with the forget dropped or the ended id lost; and
+  `a_file_is_kept_when_the_kernel_cannot_be_asked_to_forget_it` now requires no release, which
+  releasing whatever the forget's answer fails. That a file is freed only once forgotten is held on
+  each path that frees one, a truncate, a rename over a file and a session's unlink, by
+  `no_path_frees_a_file_the_kernel_has_not_forgotten`, which a release made before the forget fails
+  (#468's review).
 - [x] **pr365-9** `docs/spec/rsproto-namespace-ops.md:160` — "a page must lie within one run … that
   one the kernel cannot check, and each server guarantees it" is wrong both ways: `block_map` could
   check a page's alignment against the runs, and ext4 with blocks under a page does not guarantee
@@ -2573,7 +2598,7 @@ before it is fixed.
   block size the kernel learns at mount, but runs are in the reply's `block_size` (FAT's are
   512-byte sectors). T2-15. Docs. Low. **Fix.**
   Fixed in `b87075a6`.
-- [ ] **pr365-11** — the trials' other test gaps, each a mutation that passed the suite at
+- [x] **pr365-11** — the trials' other test gaps, each a mutation that passed the suite at
   `55e6bd18`, not yet run against `main`: no device write made to fail (T1-13); the volume-label
   filter (T1-23); `fat_label`'s fallbacks (T1-24); the 64-run limit at its neighbour (T1-26); the
   chunker's last chunk (T1-27); and eight of FAT's guards (T2-17 to T2-24: the second FAT copy on
@@ -2581,6 +2606,25 @@ before it is fixed.
   bound, the FSInfo hint, FAT32's reserved nibble, DEL in a name). Tests. Low.
   **Later**: each run against `main` as a mutation in Part H first.
   T1-24 held in `2b5c929e`: fails without it: `a_fat_with_its_type_string_cleared_is_found_with_fats_own_label` and `a_fat_with_4k_sectors_gives_its_label`.
+  T1-27 and T2-17 were held by tests written since: the chunker's span by
+  `a_transfer_is_submitted_to_the_device_through_the_scratch`, the second copy on eviction by
+  `a_change_bigger_than_the_fat_cache_evicts_and_stays_clean`. The other ten held in `f81f3564`,
+  each failing with its mutation:
+  - T1-13 by the change sweep, which holds the mount's FAT cache to the device after every failed
+    write; dropping the flush's error was already held by it, and allocation's give-back by
+    `a_grow_stopped_at_any_write_loses_no_cluster`;
+  - T1-23 `the_volume_label_is_not_a_name`;
+  - T1-26 `a_file_in_64_fragments_is_served_and_one_in_65_refused_too_large`;
+  - T2-18 by the garbage test, which takes each ordinal and flag pair in turn;
+  - T2-19 `a_long_name_with_a_part_out_of_place_is_dropped`;
+  - T2-20 `a_numeric_tail_is_found_up_to_a_full_directory`, the search now bounded by
+    `MAX_SLOTS` and counted in walks, and its leading-zero check gone, an equivalent mutation;
+  - T2-21 `a_rewrite_reaches_a_names_slots_and_no_further`;
+  - T2-22 `a_mount_allocates_from_the_hint_its_unmount_wrote` and
+    `a_hint_outside_the_volume_is_not_written_back`: the load's check is no equivalent mutation,
+    as without it the unmount writes such a hint back;
+  - T2-23 `a_grow_keeps_fat32s_reserved_bits`;
+  - T2-24 by DEL in `what_a_fat_can_name`.
 - [x] **pr365-12** — the trials' other doc claims, not yet read against `main`: `Meta::Unmount`'s
   "recorded clean" where FAT keeps a volume found dirty (T1-16); `error-codes.md` pointing at the
   deleted `fs_kerror` (T1-18); `File::Forget`'s list missing a truncate to zero (T1-19);

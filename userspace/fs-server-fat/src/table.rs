@@ -66,6 +66,15 @@ impl Cache {
         }
     }
 
+    /// Whether every sector held is the device's first FAT's.
+    #[cfg(test)]
+    pub(crate) fn as_on<R: BlockReader>(&self, r: &R, g: &Geometry) -> bool {
+        self.slots.iter().filter(|s| s.sector != u32::MAX).all(|s| {
+            let mut d = [0u8; SECTOR as usize];
+            r.read_at(g.fat_byte(0) + s.sector as u64 * SECTOR as u64, &mut d).is_ok() && d == s.data
+        })
+    }
+
     fn hit(&mut self, sector: u32) -> Option<usize> {
         self.clock = self.clock.wrapping_add(1);
         let i = self.slots.iter().position(|s| s.sector == sector)?;

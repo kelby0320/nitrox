@@ -192,8 +192,9 @@ fn garbage_in_any_structure_is_an_error_never_a_panic() {
                     // An ordinal past a name's end, at its start, in its middle, or none — with
                     // the last-part flag or not, and the bits above it, since an entry whose first
                     // byte is `0` ends the directory before anything reads it as a long name.
-                    let ord = [0u8, 0, 1, 2, 20, 21, 31][rng.below(7) as usize];
-                    e[0] = ord | [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0][rng.below(6) as usize];
+                    // Each pair in turn: a draw missed the one that panicked.
+                    let pair = seed as usize / 3;
+                    e[0] = [0u8, 1, 2, 20, 21, 31][pair % 6] | [0x00, 0x20, 0x40, 0x60, 0x80, 0xA0][pair / 6 % 6];
                     e[11] = dir::ATTR_LONG;
                     e[12] = 0;
                     e[13] = before[13];

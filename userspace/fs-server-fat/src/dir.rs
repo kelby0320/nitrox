@@ -534,7 +534,9 @@ pub fn name_entries<R: BlockReader>(
 }
 
 /// **A short name for `name` no entry of `dir` has**: its basis with the lowest numeric tail free.
-/// Found a thousand tails a pass, so a directory is read once for any but a crowded basis.
+/// Found a thousand tails a pass, so a directory is read once for any but a crowded basis. **No
+/// tail past [`MAX_SLOTS`] is needed**: a directory holds no more entries, so one of as many tails
+/// is free unless every entry is one, and then there is no room for another.
 fn unique_short<R: BlockReader>(
     r: &R,
     g: &Geometry,
@@ -546,7 +548,7 @@ fn unique_short<R: BlockReader>(
     let (b, bn, e, en) = names::basis(name);
     let (base, ext) = (&b[..bn], &e[..en]);
     let mut lo = 1;
-    while lo < 1_000_000 {
+    while lo <= MAX_SLOTS {
         let mut used = [0u64; (WINDOW / 64) as usize];
         walk_slots(r, g, cache, dir, 0, |_, ent| {
             if ent[0] != DELETED && ent[11] & 0x3F != ATTR_LONG {
@@ -573,7 +575,7 @@ fn tail_of(short: &[u8; 11], base: &[u8], ext: &[u8]) -> Option<u32> {
     let digits = &short[tilde + 1..8];
     let len = digits.iter().position(|&c| c == b' ').unwrap_or(digits.len());
     let digits = &digits[..len];
-    if digits.is_empty() || digits[0] == b'0' || !digits.iter().all(u8::is_ascii_digit) {
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
         return None;
     }
     let n = digits.iter().fold(0u32, |n, &d| n * 10 + (d - b'0') as u32);
