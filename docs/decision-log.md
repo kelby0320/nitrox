@@ -39052,3 +39052,25 @@ H.8 merged, #466. H.9 on `pre-phase-7/h9-parser-guards`, as
   bit, an empty password, SHA-256's padding and HMAC's key boundaries, the user database's fields,
   and a password's four scrubs, seen through a test allocator that counts what is freed holding one.
 
+
+## 2026-11-24 — Before Phase 7: H.10, the filesystems' guards held
+
+H.9 merged, #467. H.10 on `pre-phase-7/h10-fs-guards`, as
+[`what-the-bash-left.md`](planning/what-the-bash-left.md) § H.10 plans it: tests, and one bound
+changed.
+
+- **A suffix is held to `MAX_SUFFIX` on each path that copies it** (fs-13): a resolve, a range
+  read, a resolve's size change, a rename and a directory open each take the longest and refuse
+  one byte more, and a range read asks for no more than the server's buffer.
+- **The metadata cache lets go of every block a freed range touches** (fs-16), and **a truncate
+  that ends a file's id has the kernel forget it before it is freed** (pr365-8), each held.
+- **Each of FAT's guards from PR #365's trials is held by an input only it decides** (pr365-7,
+  pr365-11): an exact write count, a label, 64 runs and 65, each long-name ordinal and every part's
+  checks, a rewrite's reach, the next-free hint, the reserved bits and DEL; and after every failed
+  write, the mount's FAT cache is what the device holds.
+- **FAT's numeric tail is searched up to `MAX_SLOTS`**, where it ran to a million: a directory
+  holds no more entries, so one of as many tails is free unless every entry is one, and then there
+  is no room for another.
+- **Of the two guards the plan took for equivalent mutations, one is not.** The tail's leading-zero
+  check is, and goes. The FSInfo hint's check at load keeps a hint outside the volume from being
+  written back at the unmount, and a test holds it.

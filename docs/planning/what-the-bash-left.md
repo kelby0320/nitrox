@@ -1,7 +1,7 @@
 # What the bash left
 
 **Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
-2026-11-23, H.5 folded into it; H.6 to H.9 built 2026-11-23.** Part H of
+2026-11-23, H.5 folded into it; H.6 to H.9 built 2026-11-23; H.10 built 2026-11-24.** Part H of
 [`pre-phase-7.md`](pre-phase-7.md): the findings of the bug bash triaged **later**, which
 [`bug-bash.md`](bug-bash.md) records, checked against `main` and fixed, each with a test that fails
 without it.
@@ -839,6 +839,21 @@ cannot. Where it departs from the above:
   reached, rather than a constant only 2,048 colliding names could show.
 
 **Gates:** `check-storage`, `check-media` and `check-copy`.
+
+**Built 2026-11-24**, in two commits, libfsserver's and FAT's, every mutation each names failing a
+test. Where it departs from the above:
+- **fs-13 holds `directory_open`'s bound as well.** Its test refused a suffix whose whole path
+  named nothing, so the walk found nothing with the bound or without it. The path now names a
+  directory, and one of `MAX_SUFFIX` opens a session.
+- **The FSInfo hint's check at load is held, not commented**: it is no equivalent mutation.
+  Without it, an unmount that allocated nothing writes back a hint outside the volume, where it now
+  writes the first cluster.
+- **T1-13 is held for every change**: the change sweep holds the mount's FAT cache to the device
+  after each failed write.
+- **The 64-run limit is held at 64 and 65**, its test moved from 71.
+- **The numeric tail's bound is `MAX_SLOTS` itself**: a full root of one basis is `TooLarge`
+  after 64 walks, and the test counts the walks.
+- **T1-27 and T2-17**, held by tests written since, are named in `bug-bash.md`.
 
 ### Miri at Part H's end
 
