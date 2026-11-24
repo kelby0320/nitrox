@@ -843,8 +843,10 @@ cannot. Where it departs from the above:
 **Built 2026-11-24**, in two commits, libfsserver's and FAT's, every mutation each names failing a
 test. Where it departs from the above:
 - **fs-13 holds `directory_open`'s bound as well.** Its test refused a suffix whose whole path
-  named nothing, so the walk found nothing with the bound or without it. The path now names a
-  directory, and one of `MAX_SUFFIX` opens a session.
+  named nothing, so the walk found nothing with the bound or without it. A suffix of `MAX_SUFFIX`
+  naming a directory now opens a session, and one byte more naming another does not.
+- **pr365-8 holds the order on every path that frees a file**: with the kernel gone, a truncate,
+  a rename over a file and a session's unlink each leave it unfreed.
 - **The FSInfo hint's check at load is held, not commented**: it is no equivalent mutation.
   Without it, an unmount that allocated nothing writes back a hint outside the volume, where it now
   writes the first cluster.

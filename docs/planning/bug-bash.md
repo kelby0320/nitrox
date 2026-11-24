@@ -844,7 +844,9 @@ Found 29, refuted by a boot 0, reported 19 (29 findings merged as duplicates int
   `a_range_read_is_cut_to_the_content_buffer` and
   `a_rename_of_the_longest_suffixes_is_made_and_one_past_refused`. `directory_open`'s bound, which
   `a_suffix_past_the_longest_opens_no_directory` left untested since its path named nothing, is
-  held there now that the path names a directory.
+  held there at 1,024 and 1,025 bytes, each naming a directory, and by
+  `a_directory_opens_at_the_longest_suffix_and_not_past_it`: it copies nothing, so no panic stands
+  in for it (#468's review).
 
 - [x] **fs-14** `userspace/fs-server-fat/src/volume.rs:706` — FAT's `rmdir_at` NotEmpty check, the
   `is_dir` refusal in `unlink_at`, `names::valid` in `mkdir_at` and in rename, and the `grow_file`
@@ -2580,10 +2582,13 @@ before it is fixed.
 - [x] **pr365-8** `userspace/libfsserver/src/server.rs:419` — test gap: the truncate-to-zero arm,
   `forget_then_release`, is tested at no level; a gate step emptying a file on the FAT stick would
   catch a leak. T1-14. Tests. Low. **Later.**
-  Held in `dfbdbbb0`: `a_truncate_to_nothing_is_forgotten_then_released_then_answered`, through the
-  loop over libos's model and a recording volume, failing with the forget dropped or the ended id
-  lost; and `a_file_is_kept_when_the_kernel_cannot_be_asked_to_forget_it` now requires no release,
-  which releasing whatever the forget's answer fails.
+  Held in `dfbdbbb0`: `a_truncate_to_nothing_is_forgotten_freed_and_answered`, through the loop over
+  libos's model and a recording volume, failing with the forget dropped or the ended id lost; and
+  `a_file_is_kept_when_the_kernel_cannot_be_asked_to_forget_it` now requires no release, which
+  releasing whatever the forget's answer fails. That a file is freed only once forgotten is held on
+  each path that frees one, a truncate, a rename over a file and a session's unlink, by
+  `no_path_frees_a_file_the_kernel_has_not_forgotten`, which a release made before the forget fails
+  (#468's review).
 - [x] **pr365-9** `docs/spec/rsproto-namespace-ops.md:160` — "a page must lie within one run … that
   one the kernel cannot check, and each server guarantees it" is wrong both ways: `block_map` could
   check a page's alignment against the runs, and ext4 with blocks under a page does not guarantee

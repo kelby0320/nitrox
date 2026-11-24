@@ -39052,7 +39052,6 @@ H.8 merged, #466. H.9 on `pre-phase-7/h9-parser-guards`, as
   bit, an empty password, SHA-256's padding and HMAC's key boundaries, the user database's fields,
   and a password's four scrubs, seen through a test allocator that counts what is freed holding one.
 
-
 ## 2026-11-24 — Before Phase 7: H.10, the filesystems' guards held
 
 H.9 merged, #467. H.10 on `pre-phase-7/h10-fs-guards`, as
