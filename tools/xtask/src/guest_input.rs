@@ -36,6 +36,7 @@ fn click_with(qmp: &mut Qmp, session: &mut Session, button: &str, x: i32, y: i32
         }
         qmp.pointer = None;
         println!("  note: the press did not land at ({x}, {y}) on attempt {attempt}/{ATTEMPTS}");
+        // TODO(click-near-miss): a press off its point may have hit and acted, and this loses it.
         session.skip_to_end()?;
     }
     Err(format!(

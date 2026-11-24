@@ -16,7 +16,9 @@ Part I with the safety survey's defects that repeat them. Part H detailed 2026-1
 fifty found fixed by later work, and ticked, and sched-10's last mutation planned. H.1 fixed
 fs-9 and fs-11 2026-11-20, and H.2 sup-3, 4, 8, 10, 11, 14, 15 and 16 the same day; H.3 to H.9
 fixed theirs by 2026-11-23, sec-4 and sup-6 deferred past Phase 7 (the maintainer's call), and
-H.10 the filesystems' test gaps 2026-11-24.** Part D of
+H.10 the filesystems' test gaps 2026-11-24. Checked against the Definition of done 2026-11-24:
+sup-1 and laptop-3 fixed, gate-2 and drv-17 found fixed since, and gate-1, laptop-1 and laptop-2
+deferred past Phase 7 (the maintainer's call).** Part D of
 [`pre-phase-7.md`](pre-phase-7.md) fills it: the bugs found on the laptop, what PR #365's two
 trial reviews found that `main` still has, and each `/bug-bash` run, a section a subsystem.
 
@@ -49,8 +51,11 @@ reproduced before it is fixed.
   the laptop's runs 3 and 4. The QEMU dry runs of Phase 6 Part H may reproduce it if run from
   `nxterm`; those recorded were typed on serial, which never passes through it, so trying that
   comes first. Unverified. **Fix**, reproduced first.
+  **Deferred** past Phase 7, unreproduced, the maintainer's call (2026-11-24):
+  `deferred-decisions.md` § Userspace.
 - [ ] **laptop-2** `userspace/desktop-shell` — the Applications menu's search clears while typing,
   now and then. A reliable way to make it happen comes first. Unverified. **Fix**, reproduced first.
+  **Deferred** past Phase 7, unreproduced, the maintainer's call (2026-11-24), with laptop-1.
 
 ### Found detailing Part C — main at 226a54f6, 2026-10-19
 
@@ -124,6 +129,7 @@ A gate failed on a branch that changes only docs. It is the gate's own defect.
     ends a dialog.
   - Demonstrated: the transcript of PR #385's CI, run 39291063887, job 118191523426. Tests.
     Medium: it fails CI on branches that touch none of it. **Fix.**
+  - **Deferred** past Phase 7 to `TODO(click-near-miss)`, the maintainer's call (2026-11-24).
 
 ### Found building Part C.1 — branch pre-phase-7/part-c1-paths at 2116dbcf, 2026-10-19
 
@@ -1952,7 +1958,7 @@ sched-6's sizing cause.
 Lenses: logic, error-paths, trust-boundary, tests; returned nothing: none.
 Found 21, refuted by a boot 0, reported 16.
 
-- [ ] **sup-1** `userspace/storage-service/src/main.rs:1437` — storage-service sends `Meta::Ready`
+- [x] **sup-1** `userspace/storage-service/src/main.rs:1437` — storage-service sends `Meta::Ready`
   only after it has probed every device and auto-mounted every filesystem, but service-mgr gives
   the whole startup the same 30 s (`READY_TIMEOUT_NS`, counted from spawn). A slow disk or
   fs-server therefore makes service-mgr fail the storage service for the whole boot. A USB stick
@@ -1971,6 +1977,11 @@ Found 21, refuted by a boot 0, reported 16.
   carried closed)" and "forwarding endpoint closed", and the gate failed. A natural 30 s stall
   from a real stick rests on the code-read USB deadline and was not booted. Lenses: logic,
   error-paths, trust-boundary (three reviewers found it independently). High. **Fix.**
+  Fixed in `918055aa`, the maintainer's design: storage answers Ready once it has read
+  `init.toml`, before any device, and mints the session endpoint `service-mgr` asks for next
+  within that ask's 5 s, keeping what else is asked until its mounts are made. Fails without it:
+  `check-storage --kvm` with a 35 s sleep before the first read, which failed "sent no Ready
+  within 30 s"; with Ready first alone, "gave no session-endpoint". With both, the gate passes.
 
 - [x] **sup-2** `userspace/storage-service/src/lib.rs:95` — the `gpt-partuuid` matching in
   `source_device` reads the disk's table through libgpt and compares libgpt's entry name with the
@@ -2640,7 +2651,7 @@ before it is fixed.
 
 A gate failed on a branch that changes nothing it watches.
 
-- [ ] **gate-2** `kernel/src/sched/exit.rs:252` — `report_stranded_fault` prints through
+- [x] **gate-2** `kernel/src/sched/exit.rs:252` — `report_stranded_fault` prints through
   `emergency_writer()`, which bypasses `SERIAL`'s lock, so its line interleaves byte by byte with
   a `sys_kprint` on another CPU, and a gate waiting for that print's line never sees it.
   - `emergency_writer` is for the panic and exception handlers (`serial.rs:147-150`), where the
@@ -2654,13 +2665,16 @@ A gate failed on a branch that changes nothing it watches.
   - Demonstrated: once in three `check-display --kvm` runs at `886332bb` with two test files
     added; the other two, and the full set at `b22a391c`, passed. Any gate whose line meets a
     stranded fault's report can fail the same way. Tests. Low: it fails CI now and then on
-    branches that touch none of it. Untriaged.
+    branches that touch none of it. **Fix**, the maintainer's call (2026-11-24).
+  - Found fixed in `f38d94a9` (#407, 2026-10-29): the report, now `report_unwaited_fault`, is
+    written under `SERIAL` with `kprintln!`. That commit's control: forced to report on every
+    boot, it prints whole and the boot passes.
 
 ### Found on the laptop — main at c5e59d4d, 2026-10-25
 
 Found by the maintainer at the laptop's prompt after reinstalling, not by a run.
 
-- [ ] **laptop-3** `userspace/nxsh/src/paths.rs:131` — `open` and `save` take no relative path
+- [x] **laptop-3** `userspace/nxsh/src/paths.rs:131` — `open` and `save` take no relative path
   with a `.` or a `/` in it, so neither takes a plain file name: `open hello.txt` fails, as does
   §4's own example, `open a.txt b.txt`.
   - Their arguments are lexed in expression mode, where `.` and `/` are operators: `hello.txt`
@@ -2676,13 +2690,17 @@ Found by the maintainer at the laptop's prompt after reinstalling, not by a run.
   - Demonstrated on the laptop at `c5e59d4d`, and by a temporary host test: the tokens
     `Ident("Documents")` and `Word("/hello.txt")`; `open hello.txt` and `save out.txt` refused for
     want of a path; `save Documents/out.txt` refused for the format of `/p/Documents`; and
-    `open ./Documents/hello.txt` read the file. Logic. Medium. Untriaged.
+    `open ./Documents/hello.txt` read the file. Logic. Medium. **Fix**, the maintainer's call
+    (2026-11-24).
+  - Fixed in `beb06757`: `open` and `save` read their paths in word mode, as `cd` does, and a
+    block's `{` ends them. Fails without it: `path_arg_tests`' four ("needs at least one path";
+    "no such file: `/p/Documents`").
 
 ### Found addressing PR #402's review — main at 861bf250, 2026-10-28
 
 A host test failed once in 300 runs of the full kernel suite, on a branch that changes none of it.
 
-- [ ] **drv-17** `kernel/src/dpc.rs:66` — host tests share the one global DPC queue, so one test's
+- [x] **drv-17** `kernel/src/dpc.rs:66` — host tests share the one global DPC queue, so one test's
   DPCs are dropped or run by another's, and `io::block`'s tests fail now and then.
   - Every test that completes an IRP goes through `DPC_QUEUE`: the block layer's
     (`io/block.rs:695-885`), AHCI's and xHCI storage's. Each calls `dpc::init`, which replaces
@@ -2704,4 +2722,8 @@ A host test failed once in 300 runs of the full kernel suite, on a branch that c
   - Which test frees an IRP whose DPC is still queued is not pinned down. No kernel caller is
     shown to: a kernel `Dpc` outlives its queued reference by design (`:30`).
   - Tests. Low: it fails CI now and then on branches that touch none of it, and the crash shows a
-    test can run another test's freed DPC. Untriaged.
+    test can run another test's freed DPC. **Fix**, the maintainer's call (2026-11-24).
+  - Found fixed the day after it was filed, 2026-10-29: `aa9a89e2` took out `dpc::init`, which
+    emptied the queue under another test, and `2d06cd54` (#406's review) holds every test that
+    drains the queue or completes an IRP to `dpc::exclusive()`. Its reproduction now passes:
+    `io::block dpc` 0 of 1,000 runs, the kernel suite 0 of 300.

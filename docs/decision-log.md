@@ -39090,3 +39090,26 @@ changed.
   by name.
 - **H.9's allocator runs under Miri without a reason**, as H.9 built it, where the plan gave it
   one.
+
+## 2026-11-24 — Before Phase 7: the Definition of done checked, and what it found
+
+Part H done, #469 merged. [`pre-phase-7.md`](planning/pre-phase-7.md) § Definition of done,
+checked against `main` (§ Checked 2026-11-24), met all but four of its items. The maintainer's
+calls on those four:
+
+- **Comments at 0.15 of code in every crate: a guideline, not a rule.** Seventeen userspace crates
+  are over it, 337 lines in all, beside the kernel and `xtask`. A comment that reads verbose or
+  needless is cut; one that carries a why stays. CI's budget on a branch's new comments stands.
+- **CI's wall clock about 6 minutes: deferred past Phase 7.** The last 59 green runs took a median
+  of 7.6 minutes (`deferred-decisions.md` § Testing and CI).
+- **Part D's findings marked fix: sup-1 fixed, the other three deferred past Phase 7.**
+  - sup-1, a slow stick at boot losing the storage service for the boot. The fix, by the
+    maintainer's design: storage answers Ready once it has read `init.toml`, before it reads a
+    disk, and mints the session endpoint `service-mgr` asks for next within that ask's 5 s,
+    now `librsproto::meta::DERIVE_TIMEOUT_NS`. Ready first alone was not enough: a boot with
+    a slow first read lost sessions' `/storage` at the 5 s instead.
+  - gate-1, a near miss's click (`TODO(click-near-miss)`), and laptop-1 and laptop-2, never
+    reproduced, are deferred.
+- **The three filed after the triage: fix all three.** laptop-3, `open` and `save` refusing a
+  plain file name, is fixed: they read their paths in word mode, as `cd` does. gate-2 and drv-17
+  were found fixed since, both on 2026-10-29, and are ticked with their commits.

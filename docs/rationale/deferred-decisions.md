@@ -2385,6 +2385,12 @@ Until then the five pages say a failed run writes no rows, and `list` shows what
 a person losing track of what a failed destructive run did, or the shell's failure display being
 reworked.
 
+**Two bugs the laptop showed, never reproduced** (laptop-1 and laptop-2 in
+[`bug-bash.md`](../planning/bug-bash.md)): `nxterm`'s output appearing only once the pointer
+moves, and the Applications menu's search clearing while it is typed. Deferred past Phase 7, the
+maintainer's call (2026-11-24): each needs a way to make it happen first. Trigger: either seen
+again, on the laptop or in a gate.
+
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Runtime libraries
@@ -2636,6 +2642,20 @@ thread. Fix shape when taken: route to a live CPU, and re-route (or broadcast) o
 is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware bring-up,
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
+
+**A click that lands near its point is taken for a miss — `TODO(click-near-miss)`.** The gates'
+`click_at` confirms a press by the compositor's line at its exact point; on any other it skips the
+transcript and clicks again. A press a few pixels off, still on its target, has acted, and what
+it printed is lost: `check-login --kvm` once waited 45 s for `nxedit`'s line after a Discard
+landed at x=266 for 223 (gate-1 in [`bug-bash.md`](../planning/bug-bash.md)). Deferred past
+Phase 7, the maintainer's call (2026-11-24). Trigger: a gate failing on it again.
+
+**CI's wall clock is past six minutes.** Measured 2026-11-24 over the last 59 green runs: a median
+of 7.6 minutes, and 6.8 on the 25 where the runners' install of QEMU took under two minutes (it
+took over two on the other 34). The build job alone has a median of 6.7, its host tests 3.5 to 5
+of it, where B.3 left the whole at 5.7. The Definition of done's "about 6 minutes"
+([`pre-phase-7.md`](../planning/pre-phase-7.md)) is deferred past Phase 7, the maintainer's call
+(2026-11-24). Trigger: a run's wall clock past ten minutes as a rule, or CI's next pass.
 
 ~~**`libkern` mock-syscall test mode.**~~ **Built 2026-11-03, in libos rather than libkern**
 (pre-Phase-7 Part E.2): libos's `sys` seam selects a model of the kernel under its own tests, and

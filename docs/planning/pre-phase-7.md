@@ -20,7 +20,8 @@ J.9 to J.11 2026-11-11, J.12 to J.15 2026-11-12, and Part J done 2026-11-13; E.6
 same day, G.4 to G.6 2026-11-18, and G.7 2026-11-19, and Miri at its end the same day; Part G done
 2026-11-19; Part H detailed 2026-11-19, H.1 to H.3 built 2026-11-20, and H.4 rescoped and built
 2026-11-23, and H.6 to H.9 the same day; H.10 built 2026-11-24, and Miri at its end the same day;
-Part H done 2026-11-24.** Each later part gets its detail pass when it is next.
+Part H done 2026-11-24; the Definition of done checked 2026-11-24, and its gaps fixed or deferred
+(the maintainer's calls).** Each later part gets its detail pass when it is next.
 Ten parts, A–J, in the order below: Part I between D and E, and **Part J between Part E's two
 halves** (the maintainer's call, 2026-11-02). Part E is the syscall-surface consolidation, planned
 separately in [`syscall-surface.md`](syscall-surface.md).
@@ -1137,3 +1138,32 @@ several branches at once, which waits on the gates leaving this machine.
   fixed, its layers marked plan in Part E's plan or built in Part J, and no raw syscall outside
   `libkern` and `libos`, or each exception agreed with the maintainer (`eshell`'s, `libheap`'s and
   the test harness's deliberate refusals are agreed).
+
+### Checked 2026-11-24
+
+On `main` at #469's merge, with Part H done. Where an item was not met, the maintainer's call:
+- **The review**: met. The workflow reviews a PR from the author's session, #468 the last, and a
+  review's findings each get a row in `.claude/review-outcomes.tsv`, #468's four among them.
+- **CI's checks**: met. `ci.yml` runs `rustfmt`, `clippy`, `check-comments` on the branch's diff,
+  and `check-size`.
+- **No file over 5,000 lines**: met. The longest Rust file is 4,118, `nxsh`'s `eval.rs`.
+- **Comments at 0.15 of code in every crate**: not met, and the ratio is a guideline, the
+  maintainer's call. Seventeen userspace crates are over it, 337 lines in all, beside the kernel
+  and `xtask`, which B.4 left over. CI holds only a branch's new comments to it, which is how
+  they grew. A comment that reads verbose or needless is cut when its code is next touched; one
+  that carries a why stays, over the ratio or not.
+- **CI's wall clock about 6 minutes**: not met, and deferred past Phase 7, the maintainer's call.
+  The last 59 green runs took a median of 7.6 minutes, 6.8 where the runners' install of QEMU was
+  quick; the build job alone 6.7 (`deferred-decisions.md` § Testing and CI).
+- **Part D's findings**: four marked fix were open. sup-1, a slow stick losing the storage service
+  for the boot, is fixed here (the maintainer's design: storage answers Ready, and mints the
+  session endpoint, before it reads a disk). gate-1, laptop-1 and laptop-2 are deferred past
+  Phase 7, the maintainer's call. Of three filed after the triage, laptop-3 is fixed here, and
+  gate-2 and drv-17 were found fixed since, each ticked with its commit.
+- **Parts E to H**: met. **Part I**: met. Its items marked fix were fixed by 2026-11-01, its
+  plan items went into Parts E and J, and `check-syscalls` holds every raw syscall to the four
+  agreed entries.
+
+**Miri over the fixes**, the job's targets they change (`nxsh`, `storage-service`, `service-mgr`
+and `librsproto`), 2026-11-24: 752 tests pass and three are ignored with their reasons, with no
+undefined behaviour.
