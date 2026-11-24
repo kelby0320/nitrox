@@ -101,6 +101,10 @@ pub fn parse_fs_setup(payload: &[u8]) -> u8 {
 /// Fixed prefix of a `ReadyMessage` (before the server name).
 pub const READY_PREFIX_LEN: usize = 4;
 
+/// How long, from a server's Ready, `service-mgr` waits for the endpoint it mints for sessions; the
+/// storage service, which answers its Ready before it reads a disk, waits as long for the ask.
+pub const DERIVE_TIMEOUT_NS: u64 = 5_000_000_000;
+
 /// Write a `ReadyMessage` body (`server_name` is informational; the endpoint is `handles[0]`).
 pub fn ready(out: &mut [u8], server_name: &[u8]) -> Option<usize> {
     if server_name.len() > u16::MAX as usize {

@@ -82,13 +82,18 @@ through the service ([`namespace-and-resource-servers.md`](namespace-and-resourc
    queued an `Arrived` per disk, partition and RAM disk, each carrying the service's own duplicate
    of the device's node, then `Settled` ([`device-manager.md`](device-manager.md) §4). The
    subscription stays open for the life of the service; closing it would free the class.
-3. **It reads each device** (§4), and each disk's partition table.
-4. **It reads `/initramfs/etc/init.toml`** and matches each of `init`'s mounts to its device (§5).
-5. **It mounts what it can serve** (§6), and keeps every device's node, mounted or not.
-6. **It says what it found**, a line per device, then answers `Meta::Ready`, and `service-mgr`
-   binds it at `/svc/storage` (`init` did until administration Part E.1a). A resolve there is
-   continued twice — into `service-mgr`'s registry, then into a mount's namespace — two of the
-   four continuations the kernel allows.
+3. **It reads `/initramfs/etc/init.toml`** and matches each of `init`'s mounts to its device by
+   the device's record (§5).
+4. **It answers `Meta::Ready` before it reads a disk**, and `service-mgr` binds it at
+   `/svc/storage` (`init` did until administration Part E.1a). Bring-up waits on the Ready: read
+   first, a slow stick held the boot and, past `service-mgr`'s 30 s, lost the service for it
+   (sup-1, until 2026-11-24). It mints the session endpoint `service-mgr` asks for next, within
+   that ask's 5 s (`librsproto::meta::DERIVE_TIMEOUT_NS`), and keeps anything else asked for step 7.
+5. **It reads each device** (§4), and each disk's partition table.
+6. **It mounts what it can serve** (§6), and keeps every device's node, mounted or not.
+7. **It answers what it kept, says what it found**, a line per device, **and serves**. A resolve
+   at `/svc/storage` is continued twice — into `service-mgr`'s registry, then into a mount's
+   namespace — two of the four continuations the kernel allows.
 
 On a `test-qemu` boot the log reads, the RAM disk being the test image's scratch filesystem and the
 last two the USB stick's disk and partition

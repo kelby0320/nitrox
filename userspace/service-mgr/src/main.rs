@@ -28,6 +28,7 @@ use libos::{
     CanLookup, Carried, Channel, Deadline, File, Handle, MapRead, Msg, Namespace, Notify, NsMutable, NsReadOnly, Only,
     Process, Ref, Signalled, Spawn, WaitSet, block_on, time,
 };
+use librsproto::meta::DERIVE_TIMEOUT_NS;
 use librsproto::server;
 use service_mgr::bringup::{self, Entry, Failed, Step};
 use service_mgr::handoff::{Clock, hand_on, recv_handoff, send_handle};
@@ -1671,9 +1672,6 @@ impl Mgr {
         self.supervisors = bring_up_login_chain(&self.root, chain);
     }
 }
-
-/// How long a server has to answer for an endpoint it mints for sessions.
-const DERIVE_TIMEOUT_NS: u64 = 5_000_000_000;
 
 /// How long to wait for a service named in another's `after` to finish.
 ///

@@ -81,19 +81,6 @@ fn run_live_steps(s: &mut Session) -> R<()> {
     // And read through it: `fs-server-ext4` once sent Ready before reading the superblock, so a
     // zeroed partition printed `mounted`.
     s.expect("init: /system/current-generation = nitrox-rootfs generation 1")?;
-    s.expect("storage-service: a live boot")?;
-    // And the stick is passed over, read from the whole transcript (the service reports every
-    // device before it says what kind of boot this is).
-    if !s.transcript().lines().any(|l| {
-        l.contains("storage-service: blk-")
-            && l.contains("(disk QEMU QEMU HARDDISK (")
-            && l.contains("; on the disk the machine started from, passed over")
-    }) {
-        return Err("the storage service did not pass over the stick the machine started from".into());
-    }
-    println!("  ok: the stick is a disk, flagged as the one the machine started from, and passed over");
-    // No session on this boot holds a disk; absence rots silently, so it is asserted both ways at
-    // the end.
     s.expect("desktop-session-mgr: greeter presented")?;
     let took = s.matched_at().saturating_duration_since(mounted);
     if took > LIVE_MOUNT_TO_GREETER {
@@ -107,6 +94,18 @@ fn run_live_steps(s: &mut Session) -> R<()> {
         .into());
     }
     println!("  ok: mount to greeter in {} ms, within {} ms", took.as_millis(), LIVE_MOUNT_TO_GREETER.as_millis());
+    // Storage answers Ready before it reads a disk, so its report and the greeter race.
+    s.line_since(0, "storage-service: a live boot", |_| true, std::time::Duration::from_secs(45))?;
+    if !s.transcript().lines().any(|l| {
+        l.contains("storage-service: blk-")
+            && l.contains("(disk QEMU QEMU HARDDISK (")
+            && l.contains("; on the disk the machine started from, passed over")
+    }) {
+        return Err("the storage service did not pass over the stick the machine started from".into());
+    }
+    println!("  ok: the stick is a disk, flagged as the one the machine started from, and passed over");
+    // No session on this boot holds a disk; absence rots silently, so it is asserted both ways at
+    // the end.
 
     // 4. A login writes, and reads back. The prompt is searched for in the whole transcript, not
     // with `expect`: the serial column's `nitrox login:` and the greeter start together and the

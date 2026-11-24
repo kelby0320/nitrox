@@ -5,14 +5,13 @@
 //!    `Arrived` per disk, partition and RAM disk, each carrying this service's own duplicate of the
 //!    device's node, then `Settled`. `service-mgr` spawns this service straight after the manager,
 //!    so it owns the class from boot on and nothing else can take the disks.
-//! 2. **Read what is there**: each device as its server would read it, and each disk's partition
-//!    table, for `init.toml`'s UUID sources.
-//! 3. **Read `init.toml`**, and match each of `init`'s mounts to its device. Those are reported
+//! 2. **Read `init.toml`**, and match each of `init`'s mounts to its device. Those are reported
 //!    and never mounted here. A root on a RAM disk makes this a live boot.
+//! 3. **Answer `Meta::Ready`**, before a disk is read ([`start`]), bound at `/svc/storage`; then
+//!    **read** each device as its server would, and each disk's partition table.
 //! 4. **Mount what it can serve**: each gets the server for its kind spawned over it and a
 //!    namespace of its own with that server bound at `/`, and is named by its label.
-//! 5. **Serve.** Mint a forwarding endpoint and answer `Meta::Ready`; `service-mgr` binds it at
-//!    `/svc/storage`. `info` is a directory session, `info/<name>.tsm` a table as a fresh
+//! 5. **Serve.** `info` is a directory session, `info/<name>.tsm` a table as a fresh
 //!    read-only memory object, `fs` a directory of labels, and `fs/<label>/…` a `SUBNAMESPACE`
 //!    reply: the kernel continues the resolve in the mount's namespace, so nothing passes through
 //!    this service. `session-endpoint` mints an endpoint on which only `info`, `fs`, `info/media`
@@ -53,7 +52,7 @@ use libos::{
 };
 use librsproto::devices::{OP_DEVICES_ARRIVED, OP_DEVICES_DEPARTED, OP_DEVICES_SETTLED, parse_arrived, parse_departed};
 use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE, parse_read_dir_request};
-use librsproto::meta::{FS_SETUP_READ_ONLY, fs_setup};
+use librsproto::meta::{DERIVE_TIMEOUT_NS, FS_SETUP_READ_ONLY, fs_setup};
 use librsproto::namespace::parse_resolve_request;
 use librsproto::server;
 use librsproto::storage::{
@@ -74,6 +73,7 @@ mod disks;
 mod media;
 mod mounting;
 mod report;
+mod start;
 use disks::*;
 use mounting::*;
 use report::report;
@@ -155,6 +155,14 @@ fn recv(ch: &Chan) -> Result<Option<(Message, Carried)>, ()> {
 /// this service carries a handle it wants, and one kept would be kept for good.
 fn recv_request(ch: &Chan) -> Result<Option<Message>, ()> {
     Ok(recv(ch)?.map(|(m, _)| m))
+}
+
+/// What request `m` asks for, if it is a resolve.
+fn asked(m: &Message) -> Asked<'_> {
+    match parse_resolve_request(&m.body) {
+        Some(r) if m.op == OP_NS_RESOLVE => suffix::parse(r.suffix),
+        _ => Asked::Unknown,
+    }
 }
 
 /// Refuse request `op` with `err` and no reason.
@@ -273,16 +281,16 @@ impl Service {
     /// Answer one forwarded resolve on `from`, the endpoint at `/svc/storage` or, when `session`, a
     /// session endpoint. `false` if that endpoint has gone.
     fn serve_resolve(&mut self, from: &Chan, session: bool) -> bool {
-        let m = match recv_request(from) {
-            Ok(Some(m)) => m,
-            Ok(None) => return true,
+        match recv_request(from) {
+            Ok(Some(m)) => self.answer_resolve(from, &m, session),
+            Ok(None) => {}
             Err(()) => return false,
-        };
-        let asked = match parse_resolve_request(&m.body) {
-            Some(r) if m.op == OP_NS_RESOLVE => suffix::parse(r.suffix),
-            _ => Asked::Unknown,
-        };
-        let asked = if session { session_only(asked) } else { asked };
+        }
+        true
+    }
+
+    fn answer_resolve(&mut self, from: &Chan, m: &Message, session: bool) {
+        let asked = if session { session_only(asked(m)) } else { asked(m) };
         match asked {
             Asked::Directory => self.open_dir(from, m.request_id, Listing::Tables),
             Asked::Mounts => self.open_dir(from, m.request_id, Listing::Mounts),
@@ -304,7 +312,6 @@ impl Service {
             Asked::Watch => self.open_watch(from, m.request_id),
             Asked::Unknown => fail(from, OP_NS_RESOLVE, m.request_id, KError::NotFound),
         }
-        true
     }
 
     /// Answer with a session endpoint. **Minted only on the root endpoint**: [`session_only`]
@@ -872,14 +879,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         refuse(control.as_ref(), KError::OutOfMemory, b"no scratch buffer to read the disks through");
     };
 
-    let mut devices = Vec::new();
-    let mut nodes = Vec::new();
-    for (record, node) in held {
-        let io = DeviceIo::new(&node, &record, &scratch);
-        devices.push(Device { found: probe_record(&io, &record), record });
-        nodes.push((record.id, node));
-    }
-    let records: Vec<DeviceRecord> = devices.iter().map(|d| d.record).collect();
+    let records: Vec<DeviceRecord> = held.iter().map(|(record, _)| *record).collect();
 
     let init_list: Option<Vec<InitMount>> = match read_manifest(&root) {
         Ok(m) => Some(init_mounts(&m, &records)),
@@ -911,32 +911,24 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
     }
     let live = live_boot(init_list.as_deref().unwrap_or(&[]), &records);
 
-    // A mount hands its server a duplicate of the node; the service keeps every node, for an
-    // administrator's mount and for an unmount's flush.
-    let mut plan = automount(&devices, &init, live, known);
-    plan.truncate(MAX_MOUNTS);
-    let mut mounted = Vec::new();
-    for (id, node) in &nodes {
-        let Some(p) = plan.iter().find(|p| p.device == *id) else {
-            continue;
-        };
-        match mount(&root, p, node) {
-            Ok(m) => mounted.push(m),
-            Err(why) => {
-                Line::new().s(b"storage-service: ").untrusted(p.label.as_bytes()).s(b" did not mount: ").s(why).end()
-            }
-        }
+    let Ok((client_end, serve_end)) = Chan::pair(4) else {
+        log::write(b"storage-service: channel create FAIL\n");
+        libos::exit(1);
+    };
+    if !control.as_ref().is_some_and(|c| server::ready(c, b"storage-service", client_end)) {
+        log::write(b"storage-service: Ready send FAIL\n");
+        libos::exit(1);
     }
-
+    Line::new().s(b"storage-service: ").u(records.len() as u64).s(b" block device(s)").end();
     let mut s = Service {
         root,
         subscription: Some(subscription),
-        devices,
-        nodes,
+        devices: Vec::new(),
+        nodes: Vec::new(),
         init,
         init_known: known,
         live,
-        mounted,
+        mounted: Vec::new(),
         scratch,
         session_ends: Vec::new(),
         media_sessions: Vec::new(),
@@ -947,8 +939,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         dirs: Vec::new(),
         rescan: Rescan::default(),
     };
+    let asked = s.mint_before_reading(&serve_end);
+    s.read_and_mount(held);
+    for m in &asked {
+        s.answer_resolve(&serve_end, m, false);
+    }
     let mounts = s.all_mounts();
-    Line::new().s(b"storage-service: ").u(s.devices.len() as u64).s(b" block device(s)").end();
     for d in &s.devices {
         report(d, &mounts, &s.devices);
     }
@@ -956,15 +952,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, arg0: u64) -> !
         log::write(b"storage-service: a live boot: the root is on a RAM disk, so internal disks mount read-only\n");
     } else {
         log::write(b"storage-service: not a live boot\n");
-    }
-
-    let Ok((client_end, serve_end)) = Chan::pair(4) else {
-        log::write(b"storage-service: channel create FAIL\n");
-        libos::exit(1);
-    };
-    if !control.as_ref().is_some_and(|c| server::ready(c, b"storage-service", client_end)) {
-        log::write(b"storage-service: Ready send FAIL\n");
-        libos::exit(1);
     }
     loop {
         let signalled = {
