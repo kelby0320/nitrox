@@ -1,7 +1,8 @@
 # What the bash left
 
 **Status: detailed 2026-11-19; H.1, H.2 and H.3 built 2026-11-20; H.4 rescoped and built
-2026-11-23, H.5 folded into it; H.6 to H.9 built 2026-11-23; H.10 built 2026-11-24.** Part H of
+2026-11-23, H.5 folded into it; H.6 to H.9 built 2026-11-23; H.10 built 2026-11-24, and Miri at
+Part H's end the same day; Part H done 2026-11-24.** Part H of
 [`pre-phase-7.md`](pre-phase-7.md): the findings of the bug bash triaged **later**, which
 [`bug-bash.md`](bug-bash.md) records, checked against `main` and fixed, each with a test that fails
 without it.
@@ -861,6 +862,35 @@ test. Where it departs from the above:
 
 Over the job's targets that Part H changes, the kernel among them, and any target a sub-part adds
 to the job. The test allocator of H.9 carries its reason under Miri.
+
+**Run 2026-11-24, at `087fd0c5`**: the kernel and the nineteen of the job's userspace targets
+whose code Part H changed, under Stacked Borrows through `cargo xtask miri`, side by side: the
+kernel in 86 minutes, the nineteen in 59. Where Part H added `unsafe`, under Tree Borrows as well,
+in 32 minutes.
+- **The nineteen**, measured from #459's merge, `018a6a54`: `libkern`, `libos`, `librsproto`,
+  `libstream`, `libfsserver`, `libcrypto`, `libusers`, `libsession`, `libprompt`, `libinittoml`,
+  `init`, `service-mgr`, `device-mgr`, `storage-service`, `view-broker`, `profile-server`,
+  `input-server`, `desktop-session-mgr` and `nxsh`. Each changed in code, not only in comments.
+  No sub-part added a target to the job.
+- **No undefined behaviour in either model.** 2,646 tests pass, the kernel's 1,366 and the
+  nineteen's 1,280; eighteen are ignored with their reasons, none new in Part H. The kernel's
+  integer-to-pointer casts are at 38 sites, as at Part E's end, and each line is older than Part H;
+  the one in userspace is `libos`'s mapping.
+- **Part H's new `unsafe` is all in tests**, and each ran under both models:
+  - the kernel's `program_msi` in `pci::tests`, 28 tests;
+  - the counting allocators of `libprompt`'s scrub tests and `libstream`'s limit tests;
+  - `from_raw` in `libsession`'s authentication tests and `service-mgr`'s route tests;
+  - `from_raw` in an auth-service install test. The job leaves auth-service out for its key
+    derivations; its six install tests derive none, and ran by name in seconds.
+- **H.9's allocator needs no reason under Miri**, where this plan gave it one: as H.9 built it,
+  its blocks zeroed when made, it reads only byte buffers. `libprompt`'s 18 tests pass in both
+  models, in two minutes and in fifteen.
+- **CI's nightly job was green on each of its five runs since Part H began**, the last at #467's
+  merge, `1a298b7d`. #468 changed `libfsserver` alone among the job's targets.
+- **Not run**, as the job leaves them out: `fs-server-ext4`, `fs-server-fat` and `libgpt`, which
+  Part H changed and gave no `unsafe`, and auth-service but for its install tests.
+
+Part H's condition is met: H.10 merged, #468, and what Miri reports is triaged.
 
 ### What Part H does not do
 
