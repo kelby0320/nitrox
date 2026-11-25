@@ -1416,6 +1416,18 @@ pulled**, or Part F's Files, which reads from sticks as a matter of course.
 
 ### Filesystems
 
+**The storage service is up but not serving while it reads its disks —
+`TODO(storage-start-unserved)`.** Since 2026-11-24 it answers Ready, and mints sessions'
+endpoint, before it reads a disk (sup-1 in [`bug-bash.md`](../planning/bug-bash.md)), so on a slow
+stick a session can be running while it reads and mounts. Its control channel is read only by the
+main loop, so a shutdown asked meanwhile waits for the reads: past `service-mgr`'s 60 s
+`stop_timeout` for it the shutdown goes on, and what it mounts after is not unmounted. Its
+endpoints' rings are four deep, so a fifth resolve queued meanwhile is refused `WouldBlock`, and a
+caller with no deadline waits. Both are bounded, and only a slow stick at boot meets them, which
+before lost the service for the boot (#470's review, finding 5, not booted). The shape: look at
+the control channel between devices, and the rings as deep as the kernel's eight forwarded
+lookups. Trigger: a slow stick met at boot, or a gate that holds the reads.
+
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
 (IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
 and reschedule IPIs, and every registered device handler — is configured with **IST0, i.e.
@@ -2385,6 +2397,12 @@ Until then the five pages say a failed run writes no rows, and `list` shows what
 a person losing track of what a failed destructive run did, or the shell's failure display being
 reworked.
 
+**Two bugs the laptop showed, never reproduced** (laptop-1 and laptop-2 in
+[`bug-bash.md`](../planning/bug-bash.md)): `nxterm`'s output appearing only once the pointer
+moves, and the Applications menu's search clearing while it is typed. Deferred past Phase 7, the
+maintainer's call (2026-11-24): each needs a way to make it happen first. Trigger: either seen
+again, on the laptop or in a gate.
+
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Runtime libraries
@@ -2636,6 +2654,20 @@ thread. Fix shape when taken: route to a live CPU, and re-route (or broadcast) o
 is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware bring-up,
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
+
+**A click that lands near its point is taken for a miss — `TODO(click-near-miss)`.** The gates'
+`click_at` confirms a press by the compositor's line at its exact point; on any other it skips the
+transcript and clicks again. A press a few pixels off, still on its target, has acted, and what
+it printed is lost: `check-login --kvm` once waited 45 s for `nxedit`'s line after a Discard
+landed at x=266 for 223 (gate-1 in [`bug-bash.md`](../planning/bug-bash.md)). Deferred past
+Phase 7, the maintainer's call (2026-11-24). Trigger: a gate failing on it again.
+
+**CI's wall clock is past six minutes.** Measured 2026-11-24 over the last 59 green runs: a median
+of 7.6 minutes, and 6.8 on the 25 where the runners' install of QEMU took under two minutes (it
+took over two on the other 34). The build job alone has a median of 6.7, its host tests 3.5 to 5
+of it, where B.3 left the whole at 5.7. The Definition of done's "about 6 minutes"
+([`pre-phase-7.md`](../planning/pre-phase-7.md)) is deferred past Phase 7, the maintainer's call
+(2026-11-24). Trigger: a run's wall clock past ten minutes as a rule, or CI's next pass.
 
 ~~**`libkern` mock-syscall test mode.**~~ **Built 2026-11-03, in libos rather than libkern**
 (pre-Phase-7 Part E.2): libos's `sys` seam selects a model of the kernel under its own tests, and

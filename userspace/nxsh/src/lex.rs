@@ -43,6 +43,8 @@
 use alloc::string::String;
 use alloc::vec::Vec;
 
+mod lookahead;
+
 /// Which language the next token is read in. See the module docs (D1).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum Mode {
@@ -223,7 +225,7 @@ pub struct Lexer<'a> {
     pending: Option<Spanned>,
     pending_mode: Mode,
     pending_start: usize,
-    pending_line: u32,
+    pending_line_and_depth: (u32, u32),
     /// Nesting depth of `(` and `[` only. `{` is excluded on purpose: blocks need their
     /// newlines (D2).
     depth: u32,
@@ -244,63 +246,11 @@ impl<'a> Lexer<'a> {
             pending: None,
             pending_mode: Mode::Expr,
             pending_start: 0,
-            pending_line: 1,
+            pending_line_and_depth: (1, 0),
             depth: 0,
             after_match_op: false,
             prev: None,
         }
-    }
-
-    /// The next token without consuming it, read in `mode`.
-    pub fn peek(&mut self, mode: Mode) -> Result<Spanned> {
-        if let Some(p) = &self.pending {
-            if self.pending_mode == mode {
-                return Ok(p.clone());
-            }
-            self.pos = self.pending_start;
-            self.line = self.pending_line;
-            self.pending = None;
-        }
-        let start_line = self.line;
-        let tok = self.scan(mode)?;
-        self.pending_mode = mode;
-        self.pending_line = start_line;
-        self.pending = Some(tok.clone());
-        self.pending_start = tok.start;
-        Ok(tok)
-    }
-
-    /// Consume and return the next token, read in `mode`.
-    pub fn bump(&mut self, mode: Mode) -> Result<Spanned> {
-        let t = self.peek(mode)?;
-        self.pending = None;
-        if t.tok != Tok::Eof {
-            self.after_match_op = t.tok == Tok::Match_ || matches!(&t.tok, Tok::Ident(n) if n == "capture");
-            self.prev = Some(t.tok.clone());
-        }
-        Ok(t)
-    }
-
-    /// After a peeked token, is there **nothing left that could be its right operand**?
-    ///
-    /// Lookahead over the raw source: horizontal whitespace and comments are skipped, then
-    /// the answer is yes at end of input, at a newline, and at each closer (`|`, `)`, `]`,
-    /// `}`, `,`). It exists for a bare `/` (see [`Parser::starts_an_argument`]) and does
-    /// **not** skip newlines: a binary operator at end of line is mid-production under D2.
-    pub fn no_operand_follows(&self) -> bool {
-        let mut i = self.pos;
-        loop {
-            match self.at(i) {
-                b' ' | b'\t' | b'\r' => i += 1,
-                b'#' => {
-                    while i < self.src.len() && self.at(i) != b'\n' {
-                        i += 1;
-                    }
-                }
-                _ => break,
-            }
-        }
-        matches!(self.at(i), 0 | b'\n' | b'|' | b')' | b']' | b'}' | b',')
     }
 
     /// Tokenize the whole input in [`Mode::Expr`], for tests and diagnostics.

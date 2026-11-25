@@ -556,6 +556,16 @@ fn check_servers_are_service_mgrs(transcript: &[u8]) -> R<()> {
             return Err(format!("`{line}` is not in the transcript: no route to it for sessions").into());
         }
     }
+    // Storage mints sessions' endpoint before it reads a disk: two of its own lines, in its order.
+    let at = |want: &dyn Fn(&str) -> bool| text.lines().position(|l| want(l.trim_end()));
+    let minted = at(&|l| l == "storage-service: a session endpoint minted");
+    let reading = at(&|l| l.starts_with("storage-service: ") && l.ends_with(" block device(s)"));
+    if !matches!((minted, reading), (Some(m), Some(r)) if m < r) {
+        return Err(format!(
+            "storage-service read its disks (line {reading:?}) before it minted sessions' endpoint (line {minted:?})"
+        )
+        .into());
+    }
     println!("xtask: service-mgr bound all {} servers, and init none of them ✓", SERVICE_MGR_SERVERS.len());
     Ok(())
 }
