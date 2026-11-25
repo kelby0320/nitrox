@@ -39113,3 +39113,30 @@ calls on those four:
 - **The three filed after the triage: fix all three.** laptop-3, `open` and `save` refusing a
   plain file name, is fixed: they read their paths in word mode, as `cd` does. gate-2 and drv-17
   were found fixed since, both on 2026-10-29, and are ticked with their commits.
+
+## 2026-11-24 — Phase 7's details pass: our own `std`, waits on an address, and ripgrep
+
+Pre-Phase-7 done, #470 merged. [`phase-7-portable-runtime.md`](planning/phase-7-portable-runtime.md)
+is detailed, in eight parts, on `main` at `7713078f`. The maintainer's calls:
+
+- **`std` is patched, in a toolchain of our own**, the pinned nightly with its `rust-src`
+  changed. Its `std/build.rs` gives any `target_os` not on its list, `nitrox` among them,
+  `restricted_std`, which would need `#![feature(restricted_std)]` in every crate using `std`:
+  nothing would build unmodified, and the no-nightly rule would break. The nightly is bumped
+  rarely, so the patch is redone rarely; upstreaming a target and injecting the feature by flag
+  were the other two ways.
+- **Thread-local storage has its own syscall**, `sys_thread_set_tls`.
+- **Locks wait on an address, through `sys_wait`** (a word and its expected value beside the
+  handles) **and a new `sys_wake`**. `std`'s own futex-based locks then run as on Linux, Hermit and
+  Motor OS. An event object each thread parks on was the other proposal: `std` has no `Mutex` or
+  `Condvar` on parking, so we would have written and kept both.
+- **The Definition of done is ripgrep 16.0.0, built unmodified**, tokei the fallback. A Nitrox
+  program run on Linux is dropped: porting to Nitrox is the more useful proof. Read before the
+  choice, ripgrep's 37 crates for our target have a third arm, for an OS neither `unix` nor
+  `windows`, at every gated item the rest of a library calls; some change what a flag does.
+- **Panics abort**, and unwinding is deferred.
+- **`Command` gives a child a copy of its parent's namespace**, with an extension for a narrower.
+- **Dynamic linking is the phase's last part, and may be deferred.**
+- **Ported programs speak bytes, and the shell adapts.** `std` marks each program it links with
+  an ELF note; the shell reads it at launch and puts an adapter stage where a typed pipe meets a
+  byte one, wrapping lines (invalid UTF-8 replaced) or rendering a table as `display` shows it.

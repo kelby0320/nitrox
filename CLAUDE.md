@@ -195,6 +195,6 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phases 0–6 are **complete**, the last (USB) on 2026-10-13; now the work in `docs/planning/pre-phase-7.md`,
-then 7–9: the portable runtime, networking, the browser. Phases are **not renumbered**. The
-current phase is in `docs/decision-log.md`, the slices in `docs/planning/implementation-plan.md`.
+Phases 0–6 are **complete**, the last (USB) on 2026-10-13, and pre-Phase-7 on 2026-11-24; now
+7–9: the portable runtime, networking, the browser. Phases are **not renumbered**. The current
+phase is in `docs/decision-log.md`, the slices in `docs/planning/implementation-plan.md`.
