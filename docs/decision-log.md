@@ -39120,7 +39120,7 @@ Pre-Phase-7 done, #470 merged. [`phase-7-portable-runtime.md`](planning/phase-7-
 is detailed, in eight parts, on `main` at `7713078f`. The maintainer's calls:
 
 - **`std` is patched, in a toolchain of our own**, the pinned nightly with its `rust-src`
-  changed. Its `std/build.rs` gives any JSON target, and any OS not on its list,
+  changed. Its `std/build.rs` gives any `target_os` not on its list, `nitrox` among them,
   `restricted_std`, which would need `#![feature(restricted_std)]` in every crate using `std`:
   nothing would build unmodified, and the no-nightly rule would break. The nightly is bumped
   rarely, so the patch is redone rarely; upstreaming a target and injecting the feature by flag
@@ -39132,8 +39132,8 @@ is detailed, in eight parts, on `main` at `7713078f`. The maintainer's calls:
   `Condvar` on parking, so we would have written and kept both.
 - **The Definition of done is ripgrep 16.0.0, built unmodified**, tokei the fallback. A Nitrox
   program run on Linux is dropped: porting to Nitrox is the more useful proof. Read before the
-  choice, ripgrep's 37 crates for our target each have a third arm for an OS neither `unix` nor
-  `windows`.
+  choice, ripgrep's 37 crates for our target have a third arm, for an OS neither `unix` nor
+  `windows`, at every gated item the rest of a library calls; some change what a flag does.
 - **Panics abort**, and unwinding is deferred.
 - **`Command` gives a child a copy of its parent's namespace**, with an extension for a narrower.
 - **Dynamic linking is the phase's last part, and may be deferred.**
